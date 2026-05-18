@@ -3,7 +3,7 @@
 > Synthesis of the full 19,125-line research corpus (23 dossiers + SYNTHESIS + DESIGN-DECISIONS).
 > This is the capstone: positioning, locked architecture, v0 scope, the parallel build, and how
 > "instant + stable as FastAPI + faster" is *measured*, not claimed.
-> Lives in its own repo `github.com/LeventySeven/Lancelot.git` (`researchfms/` reference dump gitignored). Status: **awaiting user approval to begin the build.**
+> Lives in its own repo `github.com/LeventySeven/Lancelot.git` (`researchfms/` reference dump gitignored). Status: **M0 vertical slice built & green — git tag `m0-green`; all 7 M0 DoD gates pass (`make m0`).** Authoritative spec: `docs/specs/2026-05-19-lancelot-v0-design.md`; M0 plan: `docs/plans/2026-05-19-lancelot-m0-vertical-slice.md`. Next phase: **M1**.
 
 ---
 
@@ -66,7 +66,7 @@ Waves 1–5 (≈6/12/11/7/6 agents in parallel against frozen stubs; collision-f
 
 | M | Gate (objective, automated) |
 |---|---|
-| **M0** | Vertical slice: socket→hyper→tower→matchit→LazyRequest→GIL-choreo→pydantic `dump_json`→200. 7 assertions incl. **negative compile test** (`with_gil{ .await }` must fail to compile), ≤5 allocs/req, GIL released across `.await`, imports under py3.13 *and* py3.13t. Retires fork-#7 risk first. |
+| **M0** ✅ | **Achieved (tag `m0-green`).** Vertical slice: socket→hyper→tower→matchit→LazyRequest→GIL-choreo→pydantic-core→200/404. 7 assertions incl. **negative compile test** (`with_gil{ .await }` must fail to compile — trybuild E0728), ≤5 allocs/req (=5), GIL released across `.await` (proven, 31–49× concurrency), imports under py3.13 *and* py3.14 (free-threaded `*t` = CI-only). Retired fork-#7 risk first. |
 | **M1** | Table-stakes green: FastAPI conformance **v0-subset 100%** (~180–220 files) + **full ≥90%**; byte-exact 422; stability gates 1–6. |
 | **M2** | AI tier: streaming + disconnect→abort + `app.llm.relay()` + MCP + agent loop; conformance ≥90% held; the moat proven by a token-billing-stops-on-disconnect test. |
 | **M3** | Ops/cloud: probes, drain, OTel, `lancelot init`, dual-build wheels, <60MB image, <50ms cold start; conformance ≥95%. |
@@ -84,12 +84,11 @@ Build proceeds in the project repo (`github.com/LeventySeven/Lancelot.git`; buil
 
 ---
 
-## 6. Immediate next steps (pending your approval)
+## 6. Status & next steps
 
-1. **Write the formal design spec** → `Lancelot/docs/specs/2026-05-19-lancelot-v0-design.md` (this plan, formalized + self-reviewed).
-2. **You review the spec.**
-3. On approval → **writing-plans skill** produces the detailed implementation plan from the WBS.
-4. **Build M0 first** (the vertical slice) — proves the thin-real-Rust-core path end-to-end, then fan out Waves 1–5 to hit M1→M4.
+**Done:** (1) formal design spec written & self-reviewed → `docs/specs/2026-05-19-lancelot-v0-design.md`; (2) reviewed/approved; (3) M0 implementation plan derived → `docs/plans/2026-05-19-lancelot-m0-vertical-slice.md`; (4) **M0 built & green** (12-task TDD, tag `m0-green`, `make m0` = all 7 DoD gates) — the thin-real-Rust-core path is proven end-to-end (unchanged `async def` handler on a hyper+tokio+pyo3 core, GIL dropped across the Python `await`, echo over a real SO_REUSEPORT socket).
+
+**Next:** **M1** — table-stakes + FastAPI conformance ≥90% (fan out Waves 1–5 from the WBS to M1→M4). M0 left a tracked M1 carry-forward ledger (`catch_unwind`+supervisor; alloc 5→1–3; real method/path threading; gate/remove test-only exports; exact pydantic-core pin; `router` `.expect`→`PyResult`) — see the spec and project memory; none was an M0 blocker. Implementation errata vs this plan's literal code (pyo3 0.27.2 `attach`/`detach`/`initialize`/`cast`; `extension-module` in pyproject not Cargo.toml; `socket2 ["all"]`; `into_future_with_locals`+`run_until_complete`) are documented in the M0 commits and `gil.rs`/`dispatch.rs`/`service.rs`.
 
 ---
 
@@ -107,6 +106,8 @@ Selective scan of `teardowns/`+`products/`+`core/` (574 lines of findings, ruthl
 
 These are tracked as spec line-items; none move a milestone gate.
 
+**Second mining addendum (folded into spec §11):** an independent 4-domain parallel re-scan of the full `researchfms/` corpus surfaced **11 further** concrete, reimplementable deltas (`products/` returned zero net-new — confirming §7's scan was complete there; `ai_roadmap/`/`shownmedia/` dismissed as noise). They are tracked spec line-items in spec **§11** (cluster A = `app.llm` transport lifecycle; B = agent-serving billing/correctness; standalone = `/metrics` admin-port, `RLIMIT_NOFILE`, OTel content opt-in); spec §8 references both addenda; none moves a milestone gate.
+
 ---
 
-*The only thing between here and a building framework is your go-ahead. Compiled 2026-05-19.*
+*Compiled 2026-05-19. M0 built & green (`m0-green`); the framework is now building — M1 next.*
