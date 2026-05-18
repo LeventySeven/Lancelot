@@ -2,7 +2,7 @@
 
 A fast, modern Python web/AI backend framework — "faster FastAPI", built for startups, web apps, and AI backends (LLM token streaming, agents). Intended architecture: **Rust core + Python API** with FastAPI's ergonomics and Blazeio's allocation discipline.
 
-> Private project. This entire folder is gitignored.
+> Project repo: `github.com/LeventySeven/Lancelot.git`. The 2.4 GB `researchfms/` reference dump (cloned repos, tarballs, teardowns) is gitignored; everything else here is tracked.
 
 ## Status
 

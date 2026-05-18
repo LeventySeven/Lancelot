@@ -8,7 +8,9 @@
 
 **Tech Stack:** Rust (pyo3 0.27, pyo3-async-runtimes 0.27, hyper 1, hyper-util 0.1, http-body-util 0.1, tower 0.5, tokio 1, socket2 0.5, matchit 0.8, bytes 1), maturin, Python 3.13/3.14 + pydantic 2 / pydantic-core, pytest + httpx, trybuild, dhat-rs.
 
-**Scope:** M0 only. M1 (table-stakes + conformance ≥90%), M2 (AI tier), M3 (cloud/ops), M4 (release) get their own plans derived from the WBS waves (`research/deep/09`) after M0 is green. All paths are under `Lancelot/` (gitignored — nothing here is committed to the researchfms repo; "commit" steps below use a **local git repo initialized inside `Lancelot/`** in Task 1).
+**Scope:** M0 only. M1 (table-stakes + conformance ≥90%), M2 (AI tier), M3 (cloud/ops), M4 (release) get their own plans derived from the WBS waves (`research/deep/09`) after M0 is green.
+
+**Repository model (corrected 2026-05-19 — supersedes the original gitignored/nested-local-repo premise):** This project now lives in its own git repository — `github.com/LeventySeven/Lancelot.git`, working tree `/Users/seventyleven/Desktop/Lancelot/`. Throughout this plan `Lancelot/<path>` means **the repo root** (`Lancelot/src/lib.rs` → `./src/lib.rs`, `Lancelot/Cargo.toml` → `./Cargo.toml`, etc.). **Do NOT run `git init` and do NOT create a nested `.git`** — Task 1 Step 7's `git init` is removed; all scaffold/feature commits go to the existing repo. Every `cd Lancelot && git …` step below means *"from the repo root, commit to the existing repo."* The repo-root `.gitignore` already excludes `/target/`, `*.so`, `__pycache__/`, `.venv/`, `*.profraw`, `dhat-heap.json` and `/researchfms/`, so Task 1 Step 6's separate `Lancelot/.gitignore` is **superseded — skip writing it**.
 
 **M0 Definition of Done (the 7 acceptance assertions, verified in Task 12):**
 1. `maturin develop` builds; `import lancelot` works under `python3.13` AND `python3.14` (free-threaded `*t` = CI-only, skipped locally if absent).
@@ -149,7 +151,7 @@ __all__ = ["_ping"]
 __version__ = "0.0.0"
 ```
 
-- [ ] **Step 6: Write `Lancelot/rust-toolchain.toml` and `Lancelot/.gitignore`**
+- [ ] **Step 6: Write `Lancelot/rust-toolchain.toml`**
 
 `rust-toolchain.toml`:
 ```toml
@@ -157,25 +159,17 @@ __version__ = "0.0.0"
 channel = "stable"
 components = ["clippy", "rustfmt"]
 ```
-`.gitignore`:
-```
-/target
-*.so
-__pycache__/
-.venv/
-*.profraw
-dhat-heap.json
-```
+(No `.gitignore` here — the repo-root `.gitignore` already covers `/target`, `*.so`, `__pycache__/`, `.venv/`, `*.profraw`, `dhat-heap.json`. Per the corrected repository model above, this step's old `Lancelot/.gitignore` is superseded.)
 
-- [ ] **Step 7: Init a local git repo INSIDE `Lancelot/` and build**
+- [ ] **Step 7: Scaffold-commit to the existing repo and build**
 
-Run:
+Run (from the repo root — **no `git init`**, the repo already exists):
 ```bash
-cd Lancelot && git init -q && git add -A && git commit -q -m "chore: M0 scaffold"
+git add -A && git commit -q -m "chore: M0 scaffold"
 maturin develop
 python3 -c "import lancelot; print(lancelot._ping())"
 ```
-Expected: prints `lancelot-m0`. (This `Lancelot/.git` is a private local repo; the outer researchfms repo already gitignores `Lancelot/`.)
+Expected: prints `lancelot-m0`. (Commits land in the existing `github.com/LeventySeven/Lancelot.git` repo; there is no nested `.git`.)
 
 - [ ] **Step 8: Commit**
 

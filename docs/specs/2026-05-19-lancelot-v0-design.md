@@ -1,6 +1,6 @@
 # Lancelot v0 — Design Specification
 
-**Date:** 2026-05-19 · **Status:** for user review (brainstorming approval gate) · **Location:** `Lancelot/docs/specs/` (gitignored — never committed, per project rule; the brainstorming skill's "commit the spec" step is overridden by the user's standing "never commit `Lancelot/`" instruction).
+**Date:** 2026-05-19 (repository model corrected & second mining addendum folded in 2026-05-19) · **Status:** for user review (brainstorming approval gate) · **Location:** `docs/specs/` in the project repo `github.com/LeventySeven/Lancelot.git` — **committed**. This supersedes the original "gitignored / never committed" project rule, which applied only while this work lived inside the `researchfms` repo; the project now has its own repository.
 
 **Evidence base:** the 19,125-line research corpus in `Lancelot/research/` (23 source/design/deep dossiers + `SYNTHESIS.md` + `DESIGN-DECISIONS.md`) and `Lancelot/ULTIMATE-PLAN.md`. This spec is the authoritative, self-contained design; it cites the corpus rather than re-deriving it.
 
@@ -9,6 +9,8 @@
 ## 1. Summary, goals, non-goals
 
 **Lancelot** is a Python web/AI backend framework with a Rust core: FastAPI's developer surface, byte-compatible where it touches the wire, running on a hyper+tokio+PyO3 core, with a first-class AI hot path (LLM streaming, agents, MCP) that ties the inbound HTTP stream and the outbound LLM call into one backpressured, cancellation-correct system.
+
+**Positioning (locked):** universal — a *complete* drop-in replacement for **both FastAPI and Robyn**, for **any** web application, not an AI-niche framework. As good as FastAPI for general web/API work (byte-compatible surface, near-zero migration), faster than Robyn and more web-optimized for exactly what FastAPI targets, so that **revolutionary startups and bigtech corporations alike can migrate any application type off FastAPI** (or Robyn) onto Lancelot. The Agentic/AI backend — agentic systems, multi-agent systems, LLM streaming — is the **differentiated headline hot path no pure-Python framework can structurally match**, but it is the standout use case, not the only one: general web universality and the AI hot path are co-equal v0 requirements.
 
 **Goals (v0):** (a) FastAPI-wire-compatible enough that FastAPI's own test suite passes against Lancelot unmodified; (b) measurably faster (≤3 framework allocs/req, GIL-free non-handler lifecycle, <50ms cold start); (c) stable — a 113-guard release gate + a ratcheting conformance CI invariant; (d) AI-native — streaming/agent/MCP/`app.llm` shipped in v0, not bolted on later; (e) cloud-native — probes, drain, OTel, scaffolding shipped in v0.
 
@@ -118,7 +120,7 @@ Thin serial spine (Wave 0, 1 agent freezes interface seams) → 38/46 units fan 
 | M3 | Ops/cloud: probes, drain, OTel, `lancelot init`, dual-build wheels, <60MB, <50ms cold start; conformance ≥95%. |
 | M4 | Release: full conformance ≥99%; 113 stability guards green; benchmark vs FastAPI published. |
 
-The 17 mining-addendum deltas (`ULTIMATE-PLAN §7`) are spec line-items; none move a gate. F3 (codec tagged-union) must land before Wave-1 freezes the codec seam.
+The 17 first-addendum deltas (`ULTIMATE-PLAN §7`) and the 11 second-addendum deltas (§11) are spec line-items; none moves a gate. F3 (codec tagged-union) must land before Wave-1 freezes the codec seam; the §11 Cluster-A `app.llm` transport-lifecycle items must land before Wave-1 freezes the `app.llm` pool seam.
 
 ---
 
@@ -134,8 +136,32 @@ The 17 mining-addendum deltas (`ULTIMATE-PLAN §7`) are spec line-items; none mo
 
 ## 10. Spec self-review
 
-Placeholder scan: none (no TBD/TODO). Internal consistency: architecture (§2) ↔ components (§3) ↔ scope (§7) ↔ gates (§8) aligned; the mining deltas are reconciled into §3 and flagged in §8. Scope: single coherent v0 with explicit out-list — focused enough for one implementation plan (the WBS already decomposes it). Ambiguity: the one reimplementation-ambiguous behavior (lazy request identity) is made explicit in §9 with an enforcing test. **No issues found requiring rework.**
+Placeholder scan: none (no TBD/TODO). Internal consistency: architecture (§2) ↔ components (§3) ↔ scope (§7) ↔ gates (§8) aligned; **both** mining addenda (§7 first, §11 second) are reconciled into §3's existing components and flagged in §8 — no new component, no scope growth, none moves a gate. Scope: single coherent v0 with explicit out-list — focused enough for one implementation plan (the WBS already decomposes it). Ambiguity: the one reimplementation-ambiguous behavior (lazy request identity) is made explicit in §9 with an enforcing test. **No issues found requiring rework.**
 
 ---
 
-*Next on approval: invoke the implementation-planning skill → derive the step-by-step plan from the WBS → build M0 (the vertical slice) → fan out Waves 1–5 to M1→M4. The spec is not committed (gitignored project).*
+## 11. Second mining addendum — `researchfms/` deep-scan deltas (2026-05-19)
+
+Independent 4-domain parallel re-scan of the full `researchfms/` corpus, anti-inflation enforced. `products/` returned **zero** net-new (confirming §7's scan was complete there); `ai_roadmap/` and `shownmedia/` were inspected and dismissed as irrelevant noise. 11 concrete, reimplementable deltas survived: each ≤1 spec line, each lands inside an **already-scoped** §3 component, and **none moves a milestone gate**. Sequencing: Cluster A must land before Wave-1 freezes the `app.llm` pool seam.
+
+**Cluster A — `app.llm` transport lifecycle (the one real coverage gap: the disconnect→abort moat covers a dead *client*, not a stalled *provider*). Into §3 `llm`:**
+- **A1.** Split the pool into a unary client (read/write timeouts) and a **separate streaming client with zeroed read-timeout + bounded max-connection-duration** — else long reasoning / extended-thinking streams die at the unary timeout. `teardowns/BIFROST.md`
+- **A2.** **Idle-timeout reader on the upstream LLM stream** (close cleanly on zero bytes for N s) — detects a hung provider mid-generation; a distinct axis from the inbound idle-timeout and the client-disconnect moat. `teardowns/BIFROST.md`
+- **A3.** **Max-total-stream-duration wall-clock cap** on `app.llm`/`AISSEResponse` — catches trickle-forever streams an idle-timeout never trips. `teardowns/LITELLM.md`
+- **A4.** **TCP keepalive on the `app.llm` dialer** (idle 10s / interval 5s / count 3); treat `ECONNRESET`/`EPIPE` on a pooled connection as stale keep-alive → drop the connection before the (idempotent-only) retry. `teardowns/BIFROST.md`, `core/06`
+
+**Cluster B — agent-serving correctness/billing (at Lancelot's seam — `app.agent`/`app.llm`/`background`; Lancelot serves, does not run, the loop). Into §3 `agent`/`llm`:**
+- **B1.** Persist the inbound turn to `DurableStore` **before** the first `app.llm` upstream call (not only at the first non-partial checkpoint) — a crash between accept and first checkpoint otherwise silently loses the turn. `core/06`
+- **B2.** On HITL/approval resume, convert approved/rejected/auto tool results into input items and continue — **do NOT re-invoke the model** that produced the pending call (re-sampling = a duplicate paid generation; protects the billing moat). `core/12`
+- **B3.** A `background.spawn()`-originated `app.llm` call **bails immediately on 529/overloaded** (no waiting client ⇒ do not burn money/connections). `core/06`
+
+**Standalone — one line each:**
+- **S1.** **`/metrics` binds to an admin port/interface distinct from `$PORT`** (or is auth-gated). Default-on `/metrics` on the public app socket is an unauthenticated endpoint/model-inventory leak — the §7/spec "Prometheus `/metrics` default-on" decision silently *creates* this; a Rust-speed core ships the leak faster. Into §3 `observability`/`cli`. `re_methods/RE_SERVER_SIDE.md` §16
+- **S2.** **`set_ulimit()` (raise `RLIMIT_NOFILE`) at process boot** — `listen(16384)` is moot if fds cap at the default 1024; a load-only failure invisible in tests. Into §3 `socket`/`cli`. `teardowns/VLLM.md`
+- **S3.** **OTel GenAI content-capture is opt-in; by default store content externally and put only an attribute reference on the span** — makes "GenAI spans default-on" safe (PII + span-size blowup on long contexts). Into §3 `observability`. `core/13`
+
+Self-review of this addendum: all 11 reconcile into existing §3 components — no new component, no scope growth, no gate movement; S1 additionally closes an information-disclosure hole the default-on `/metrics` decision opened.
+
+---
+
+*Next on approval: invoke the implementation-planning skill → derive the step-by-step plan from the WBS → build M0 (the vertical slice) → fan out Waves 1–5 to M1→M4. This spec is committed to the project repo (`github.com/LeventySeven/Lancelot.git`).*

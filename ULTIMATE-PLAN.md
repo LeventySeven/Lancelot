@@ -3,13 +3,15 @@
 > Synthesis of the full 19,125-line research corpus (23 dossiers + SYNTHESIS + DESIGN-DECISIONS).
 > This is the capstone: positioning, locked architecture, v0 scope, the parallel build, and how
 > "instant + stable as FastAPI + faster" is *measured*, not claimed.
-> `Lancelot/` is gitignored. Status: **awaiting user approval to begin the build.**
+> Lives in its own repo `github.com/LeventySeven/Lancelot.git` (`researchfms/` reference dump gitignored). Status: **awaiting user approval to begin the build.**
 
 ---
 
 ## 1. What Lancelot is (locked positioning)
 
 **The only Python web framework where unchanged FastAPI-style code runs on a Rust core, *and* the inbound HTTP stream and the outbound LLM call are one backpressured, cancellation-correct, MCP-exposing system.** Near-zero migration cost; an AI hot path no pure-Python framework or bare Rust server can structurally match.
+
+**Universal mandate (locked):** Lancelot is positioned as a *complete* drop-in replacement for **both FastAPI and Robyn**, for **any** application type — as good as FastAPI for general web/API work, faster than Robyn and more web-optimized for exactly what FastAPI targets, so that **revolutionary startups and bigtech corporations alike can migrate any application off FastAPI/Robyn**. The Agentic/AI backend (agentic & multi-agent systems, LLM streaming) is the differentiated headline hot path — the standout use case, not the only one; general web universality and the AI hot path are co-equal v0 requirements.
 
 Two architectural lines decide the market (`design/03 §5`): Rust-core vs pure-Python, and framework vs bare-server. Only **Robyn** sits on the right side of both — and it fumbled the two things that matter (no `Depends()`, catastrophic per-token streaming). That gap is Lancelot's lane. Strategy: **be FastAPI's wire surface byte-compatible, on a Rust core** — Litestar proved that superior design alone loses to FastAPI's gravity.
 
@@ -78,7 +80,7 @@ Regression guard: dropping below the prior milestone's conformance floor blocks 
 
 Maps the proven house Phase-1..4 parallel-agent workflow onto a *build*: Wave-0 agent freezes the spine + interface stubs; subsequent waves dispatch parallel implementation agents each owning one WBS unit writing to non-overlapping files behind frozen seams; each unit ships with its tests; the conformance harness + stability gate run in CI as the objective truth. Same incremental-write discipline, same verify-don't-trust, same auto-relaunch-on-thin.
 
-Build proceeds inside `Lancelot/` (gitignored): `Lancelot/lancelot/` (Python pkg), `Lancelot/src/` (Rust crate), `Lancelot/tests/` + `Lancelot/conformance/` (the dogfood harness), `Lancelot/docs/`, `Cargo.toml`/`pyproject.toml` (maturin dual-build).
+Build proceeds in the project repo (`github.com/LeventySeven/Lancelot.git`; build artifacts gitignored, no nested repo): repo-root `lancelot/` (Python pkg), `src/` (Rust crate), `tests/` + `conformance/` (the dogfood harness), `docs/`, `Cargo.toml`/`pyproject.toml` (maturin dual-build).
 
 ---
 
