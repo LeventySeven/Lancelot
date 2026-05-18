@@ -85,5 +85,19 @@ def compile_validator(fi: FieldInfo) -> ParamValidator:
     return ParamValidator(fi)
 
 
+def collect_errors(items):
+    """items: list of (validator, raw, present) ALREADY in dependency-solve +
+    declared order. Accumulate ALL errors (never fail-fast on the first),
+    preserving the caller's order — the DI solver feeds validators in the
+    deep/01 §0.5 order (sub-deps→path→query→header→cookie→body, declared
+    field order). This helper only flattens; it must NOT re-sort (tests
+    assert list equality, not set equality)."""
+    out = []
+    for v, raw, present in items:
+        _, errs = v.validate(raw, present=present)
+        out.extend(errs)
+    return out
+
+
 def errors_to_422(errors: list) -> tuple[int, bytes]:
     return 422, _json.dumps({"detail": errors}).encode()

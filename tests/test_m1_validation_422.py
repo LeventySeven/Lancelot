@@ -1,8 +1,8 @@
 import json
 import typing
 
-from lancelot.params import extract_field, Required, Path
-from lancelot.validation import compile_validator, errors_to_422
+from lancelot.params import extract_field, Required, Path, Header
+from lancelot.validation import compile_validator, errors_to_422, collect_errors
 
 
 def test_missing_scalar_query_is_byte_exact():
@@ -46,3 +46,11 @@ def test_gt_ctx_type_tracks_declared_type():
     fi_i = extract_field("item_id", typing.Annotated[int, Path(gt=3)], Required)
     _, ei = compile_validator(fi_i).validate("2", present=True)
     assert ei[0]["ctx"] == {"gt": 3}  # int -> 3
+
+
+def test_errors_accumulate_in_bucket_order():
+    q = compile_validator(extract_field("q", int, Required))
+    h = compile_validator(extract_field("h", typing.Annotated[int, Header()], Required))
+    errs = collect_errors([(q, "x", True), (h, "y", True)])
+    assert [e["loc"][0] for e in errs] == ["query", "header"]
+    assert len(errs) == 2  # all accumulated, not fail-fast
