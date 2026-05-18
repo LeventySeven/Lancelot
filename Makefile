@@ -23,3 +23,19 @@ m0:
 	cargo run --bin alloc_probe --features dhat-heap --release; \
 	$(VENV)/python -m pytest tests/ -q; \
 	echo "M0 ACCEPTANCE: all 7 gates green (DoD #1-#7)"
+
+# M1-P1 gates. m1-conformance = the steering metric (ratchet, parity may
+# only rise). m1-spine = the full M1-P1 acceptance.
+.PHONY: m1-conformance m1-spine
+m1-conformance:
+	export PATH="$(HOME)/.cargo/bin:$$PATH"; \
+	$(VENV)/python conformance/ratchet.py
+
+m1-spine:
+	export PATH="$(HOME)/.cargo/bin:$$PATH"; set -e; \
+	$(VENV)/maturin develop; \
+	$(VENV)/python -m pytest tests/test_m1_app.py tests/test_m1_router.py \
+	  tests/test_m1_lifespan.py tests/test_m1_asgi.py tests/test_m1_testclient.py \
+	  tests/test_m1_compat.py tests/test_m1_conformance.py -q; \
+	$(VENV)/python conformance/ratchet.py; \
+	echo "M1-P1 SPINE: green (conformance instrument live)"
