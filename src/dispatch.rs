@@ -79,8 +79,11 @@ pub fn _drive(
 
     // Runs the Python event loop AND the tokio runtime until `driver` resolves;
     // manages the GIL internally (released while the loop selects / tasks await).
-    let (results, wall): (Vec<Vec<u8>>, f64) =
-        pyo3_async_runtimes::tokio::run_until_complete(event_loop, driver)?;
+    // Clone for the call (it consumes the loop); keep the handle to close it
+    // afterwards — an unclosed loop leaks a kqueue + self-pipe fd pair per call.
+    let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), driver);
+    event_loop.call_method0("close")?;
+    let (results, wall): (Vec<Vec<u8>>, f64) = run?;
 
     // Scope 3 (GIL): hand the serialized bytes back to Python.
     let py_results = results
