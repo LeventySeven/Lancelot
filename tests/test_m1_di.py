@@ -81,3 +81,26 @@ def test_three_level_nested_and_use_cache():
     assert res.kwargs == {"r": (4, 3)}
     assert calls == ["l3"]  # use_cache: shared sub-dep invoked ONCE per request
 
+
+def test_dependency_overrides():
+    from lancelot.di import solve
+    from lancelot.requests import Request
+
+    def real():
+        return "real"
+
+    def fake():
+        return "fake"
+
+    def handler(v: str = Depends(real)):
+        return v
+
+    class _App:
+        dependency_overrides = {real: fake}
+        state = None
+
+    plan = compile_dependant(handler)
+    req = Request("GET", "/", {}, {}, {}, {}, b"", _App())
+    res = solve(plan, req)
+    assert res.kwargs == {"v": "fake"}
+

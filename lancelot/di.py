@@ -86,6 +86,24 @@ def _raw_for(fi, request):
     return request.body, bool(request.body)  # body handled at the ASGI seam (T11)
 
 
+_OVERRIDE_PLANS: dict = {}
+
+
+def _resolve_dep(sub: SubDep, request):
+    """Apply request.app.dependency_overrides (deep/01 §4.4). The override's
+    own signature is compiled once (memoized). The use_cache key stays the
+    ORIGINAL dependency (FastAPI caches by the original, not the override)."""
+    ov = getattr(getattr(request, "app", None), "dependency_overrides", None) or {}
+    target = ov.get(sub.call, sub.call)
+    if target is sub.call:
+        return target, sub.plan
+    p = _OVERRIDE_PLANS.get(target)
+    if p is None:
+        p = compile_dependant(target)
+        _OVERRIDE_PLANS[target] = p
+    return target, p
+
+
 def solve(plan: Plan, request, _cache=None) -> SolveResult:
     """Execute-only. Single dependency pass; shared `_cache` keyed by the
     original callable so a diamond sub-dep runs once per request (use_cache).
@@ -97,11 +115,12 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
         if sub.use_cache and sub.call in cache:
             kwargs[sub.param_name] = cache[sub.call]
             continue
-        sr = solve(sub.plan, request, cache)
+        target, subplan = _resolve_dep(sub, request)
+        sr = solve(subplan, request, cache)
         if sr.errors:
             errors.extend(sr.errors)
             continue
-        val = sub.call(**sr.kwargs)
+        val = target(**sr.kwargs)
         if sub.use_cache:
             cache[sub.call] = val
         kwargs[sub.param_name] = val
@@ -150,20 +169,21 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
             if sub.use_cache and sub.call in cache:
                 kwargs[sub.param_name] = cache[sub.call]
                 continue
-            async with solve_async(sub.plan, request, cache, stack) as sr:
+            target, subplan = _resolve_dep(sub, request)
+            async with solve_async(subplan, request, cache, stack) as sr:
                 if sr.errors:
                     errors.extend(sr.errors)
                     continue
-                if _is_gen_dep(sub.call):
+                if _is_gen_dep(target):
                     cm = (
-                        contextlib.asynccontextmanager(sub.call)
-                        if inspect.isasyncgenfunction(sub.call)
+                        contextlib.asynccontextmanager(target)
+                        if inspect.isasyncgenfunction(target)
                         else _sync_gen_cm
                     )
-                    arg = (sub.call,) if cm is _sync_gen_cm else ()
+                    arg = (target,) if cm is _sync_gen_cm else ()
                     val = await stack.enter_async_context(cm(*arg, **sr.kwargs))
                 else:
-                    val = sub.call(**sr.kwargs)
+                    val = target(**sr.kwargs)
             if sub.use_cache:
                 cache[sub.call] = val
             kwargs[sub.param_name] = val
