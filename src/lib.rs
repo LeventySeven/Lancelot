@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 pub use pyo3;
 
 pub mod cpu;
+pub mod ffi;
 pub mod gil;
 pub mod socket;
 
@@ -17,5 +18,6 @@ fn _ping() -> &'static str {
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_ping, m)?)?;
+    m.add_class::<crate::ffi::FnInfo>()?;
     Ok(())
 }
