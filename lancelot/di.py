@@ -2,6 +2,7 @@
 topological plan + interned cache slots, AT REGISTRATION (deep/01 §4, WBS
 U15) — the hot path never introspects a signature. `solve`/`solve_async`
 (Tasks 7-10) are execute-only: into Python only for the N user callables."""
+import contextlib
 import inspect
 import typing
 from dataclasses import dataclass
@@ -112,3 +113,68 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
         else:
             kwargs[fi.name] = value
     return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
+
+
+def _is_gen_dep(call):
+    return inspect.isgeneratorfunction(call) or inspect.isasyncgenfunction(call)
+
+
+@contextlib.asynccontextmanager
+async def _sync_gen_cm(genfn, /, **kw):
+    gen = genfn(**kw)
+    val = next(gen)
+    try:
+        yield val
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+@contextlib.asynccontextmanager
+async def solve_async(plan: Plan, request, _cache=None, _stack=None):
+    """Like solve(), but `yield`-dependencies are entered as (async) context
+    managers on a SHARED AsyncExitStack so their teardown runs AFTER the
+    response, in reverse (LIFO) order — PEP-789 / deep/01 §5. The recursive
+    calls share the owner's stack; only the owner enters/exits it (so
+    teardown happens once, after the `async with solve_async(...)` block)."""
+    own = _stack is None
+    stack = _stack or contextlib.AsyncExitStack()
+    cache = _cache if _cache is not None else {}
+    if own:
+        await stack.__aenter__()
+    try:
+        kwargs, errors = {}, []
+        for sub in plan.dependencies:
+            if sub.use_cache and sub.call in cache:
+                kwargs[sub.param_name] = cache[sub.call]
+                continue
+            async with solve_async(sub.plan, request, cache, stack) as sr:
+                if sr.errors:
+                    errors.extend(sr.errors)
+                    continue
+                if _is_gen_dep(sub.call):
+                    cm = (
+                        contextlib.asynccontextmanager(sub.call)
+                        if inspect.isasyncgenfunction(sub.call)
+                        else _sync_gen_cm
+                    )
+                    arg = (sub.call,) if cm is _sync_gen_cm else ()
+                    val = await stack.enter_async_context(cm(*arg, **sr.kwargs))
+                else:
+                    val = sub.call(**sr.kwargs)
+            if sub.use_cache:
+                cache[sub.call] = val
+            kwargs[sub.param_name] = val
+        for fi in plan.fields:
+            raw, present = _raw_for(fi, request)
+            value, errs = plan.validators[fi.name].validate(raw, present=present)
+            if errs:
+                errors.extend(errs)
+            else:
+                kwargs[fi.name] = value
+        yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
+    finally:
+        if own:
+            await stack.__aexit__(None, None, None)  # teardown AFTER response
