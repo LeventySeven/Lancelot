@@ -19,5 +19,7 @@ fn _ping() -> &'static str {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_ping, m)?)?;
     m.add_class::<crate::ffi::FnInfo>()?;
+    m.add_class::<crate::ffi::Request>()?;
+    m.add_function(wrap_pyfunction!(crate::ffi::request::_test_make_request, m)?)?;
     Ok(())
 }
