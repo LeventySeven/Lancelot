@@ -37,6 +37,10 @@ trybuild = "1"
 [features]
 dhat-heap = ["dep:dhat"]
 
+[[bin]]
+name = "alloc_probe"
+required-features = ["dhat-heap"]
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
