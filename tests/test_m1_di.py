@@ -55,3 +55,29 @@ def test_solve_missing_required_is_422_error():
     assert res.kwargs is None
     assert res.errors == [{"type": "missing", "loc": ["query", "x"],
                            "msg": "Field required", "input": None}]
+
+
+def test_three_level_nested_and_use_cache():
+    from lancelot.di import solve
+
+    calls = []
+
+    def level3():
+        calls.append("l3")
+        return 3
+
+    def level2(a: int = Depends(level3)):
+        return a + 1
+
+    def level1(b: int = Depends(level2), c: int = Depends(level3)):
+        return (b, c)
+
+    def handler(r=Depends(level1)):
+        return r
+
+    plan = compile_dependant(handler)
+    res = solve(plan, _req())
+    assert res.errors == []
+    assert res.kwargs == {"r": (4, 3)}
+    assert calls == ["l3"]  # use_cache: shared sub-dep invoked ONCE per request
+
