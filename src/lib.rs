@@ -8,6 +8,7 @@ pub use pyo3;
 pub mod cpu;
 pub mod ffi;
 pub mod gil;
+pub mod serialize;
 pub mod socket;
 
 #[pyfunction]
@@ -21,5 +22,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::ffi::FnInfo>()?;
     m.add_class::<crate::ffi::Request>()?;
     m.add_function(wrap_pyfunction!(crate::ffi::request::_test_make_request, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::serialize::_to_json, m)?)?;
     Ok(())
 }
