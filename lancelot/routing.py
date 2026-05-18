@@ -24,6 +24,25 @@ class Route:
             rx += f"(?P<{m.group(1)}>[^/]+)" if m else re.escape(part)
         self._rx = re.compile("^" + rx + "$")
 
+        # Registration-time: compile the DI/validation plan ONCE (U15 — the
+        # hot path never re-introspects). Detect a pydantic-model body param
+        # and lift it out of scalar validation (validated single-pass at the
+        # ASGI seam). list[Model]/dataclass bodies are long-tail → P7 ratchet.
+        from lancelot.di import compile_dependant
+        from lancelot.validation import BodyValidator
+
+        self.plan = compile_dependant(
+            self.handler, path_params=set(self._rx.groupindex)
+        )
+        self.body = None
+        for fi in list(self.plan.fields):
+            ann = fi.annotation
+            if isinstance(ann, type) and hasattr(ann, "model_validate_json"):
+                self.body = (fi.name, BodyValidator(ann))
+                self.plan.fields = [f for f in self.plan.fields
+                                    if f.name != fi.name]
+                self.plan.validators.pop(fi.name, None)
+
     def match(self, path: str):
         m = self._rx.match(path)
         return m.groupdict() if m else None

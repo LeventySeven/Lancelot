@@ -84,28 +84,58 @@ async def _http(app, scope, receive, send):
         await _send_json(send, status, body)
         return
 
-    # Drain the request body (ASGI more_body streaming).
+    from urllib.parse import parse_qs
+
+    from lancelot.di import solve_async
+    from lancelot.requests import Request as LRequest
+    from lancelot.validation import errors_to_422
+
+    # Drain the body (ASGI more_body streaming). NOTE: no max-body cap yet —
+    # tracked P-any security carry-forward (the ASGI path is the migration
+    # on-ramp, not the fast path).
+    body = b""
     while True:
         msg = await receive()
         if msg["type"] == "http.disconnect":
             return
+        body += msg.get("body", b"")
         if not msg.get("more_body", False):
             break
 
+    qs = parse_qs(scope.get("query_string", b"").decode())
+    query = {k: v[-1] for k, v in qs.items()}
+    headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
     params = route.match(path) or {}
-    # M1-P1: no DI/validation yet (P2). Bind path params the handler declares.
-    sig = inspect.signature(route.handler)
-    kwargs = {k: v for k, v in params.items() if k in sig.parameters}
-    result = route.handler(**kwargs)
-    if inspect.isawaitable(result):
-        result = await result
+    lreq = LRequest(method, path, query, headers, {}, params, body, scope["app"])
 
-    # Serialize via the SAME pydantic-core seam as the Rust path (no drift).
-    try:
-        out = bytes(_native._to_json(result))
-    except Exception:  # noqa: BLE001 - fallback keeps the spine robust
-        out = _json.dumps(result).encode()
-    await _send_json(send, 200, out)
+    body_value, body_errors = None, []
+    if route.body is not None:
+        bname, bval = route.body
+        if body:
+            body_value, body_errors = bval.validate_json(body)
+        else:
+            body_errors = [{"type": "missing", "loc": ["body", bname],
+                            "msg": "Field required", "input": None}]
+
+    # Handler call + response MUST be inside the solve_async context so
+    # yield-dependency teardown runs AFTER the response (PEP-789, deep/01 §5).
+    async with solve_async(route.plan, lreq) as res:
+        errs = list(res.errors) + body_errors
+        if errs:
+            status, out = errors_to_422(errs)
+            await _send_json(send, status, out)
+            return
+        kwargs = dict(res.kwargs)
+        if route.body is not None:
+            kwargs[route.body[0]] = body_value
+        result = route.handler(**kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        try:
+            out = bytes(_native._to_json(result))
+        except Exception:  # noqa: BLE001 - fallback keeps the spine robust
+            out = _json.dumps(result).encode()
+        await _send_json(send, 200, out)
 
 
 async def _send_json(send, status: int, body: bytes):

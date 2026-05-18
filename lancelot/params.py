@@ -94,7 +94,7 @@ def _scalar_default_marker(annotation) -> Param:
     return Query()  # bare scalar with no marker defaults to Query (deep/01 §1)
 
 
-def extract_field(name: str, annotation, default) -> FieldInfo:
+def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
     marker = None
     real_ann = annotation
     if typing.get_origin(annotation) is typing.Annotated:
@@ -107,7 +107,9 @@ def extract_field(name: str, annotation, default) -> FieldInfo:
         marker = default
         default = marker.default if isinstance(marker, Param) else Required
     if marker is None:
-        marker = _scalar_default_marker(real_ann)
+        # FastAPI rule: a bare scalar whose NAME is a route path placeholder
+        # is implicitly a Path param; otherwise Query (deep/01 §1).
+        marker = Path() if name in path_params else _scalar_default_marker(real_ann)
     eff_default = default
     if isinstance(marker, Param) and marker.default is not Required:
         eff_default = marker.default

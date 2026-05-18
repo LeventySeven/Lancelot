@@ -33,7 +33,7 @@ class Plan:
         return next(f for f in self.fields if f.name == name)
 
 
-def compile_dependant(fn: typing.Callable, _slots=None) -> Plan:
+def compile_dependant(fn: typing.Callable, _slots=None, path_params=()) -> Plan:
     slots = _slots if _slots is not None else [0]
     hints = typing.get_type_hints(fn, include_extras=True)
     sig = inspect.signature(fn)
@@ -49,14 +49,14 @@ def compile_dependant(fn: typing.Callable, _slots=None) -> Plan:
                 if isinstance(m, Depends):
                     dep_marker = m
         if dep_marker is not None:
-            sub = compile_dependant(dep_marker.dependency, slots)
+            sub = compile_dependant(dep_marker.dependency, slots, path_params)
             slot = slots[0]
             slots[0] += 1
             deps.append(
                 SubDep(dep_marker.dependency, sub, dep_marker.use_cache, slot, name)
             )
             continue
-        fi = extract_field(name, ann, default)
+        fi = extract_field(name, ann, default, path_params)
         fields.append(fi)
         validators[name] = compile_validator(fi)
     return Plan(fn, fields, validators, deps, inspect.iscoroutinefunction(fn))
