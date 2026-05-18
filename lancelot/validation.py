@@ -4,17 +4,36 @@ pinned version). The 422 envelope is byte-identical to FastAPI:
 (deep/01 §0). `input` semantics: null for missing bare scalar, raw value for
 coercion fail (deep/01 §0.4)."""
 import json as _json
+import typing
 
+import annotated_types as at
 from pydantic import TypeAdapter
 from pydantic_core import ValidationError
 
 from lancelot.params import FieldInfo
 
+# Constraints expressible as annotated-types metadata. pydantic-core coerces
+# the bound to the field's declared type, so numeric `ctx` tracks int/float
+# automatically (deep/01 §0.3). pattern/max_digits/decimal_places are
+# long-tail — driven by the P7 conformance ratchet, not hardcoded here.
+_CONSTRAINT_TO_AT = {
+    "gt": at.Gt, "ge": at.Ge, "lt": at.Lt, "le": at.Le,
+    "min_length": at.MinLen, "max_length": at.MaxLen, "multiple_of": at.MultipleOf,
+}
+
 
 class ParamValidator:
     def __init__(self, fi: FieldInfo):
         self.fi = fi
-        self._adapter = TypeAdapter(fi.annotation)
+        metas = [
+            _CONSTRAINT_TO_AT[k](v)
+            for k, v in fi.marker.constraints.items()
+            if k in _CONSTRAINT_TO_AT
+        ]
+        ann = fi.annotation
+        if metas:
+            ann = typing.Annotated[tuple([ann, *metas])]
+        self._adapter = TypeAdapter(ann)
 
     def validate(self, raw, *, present: bool):
         """Returns (value, errors). errors == [] on success. `present` is False
