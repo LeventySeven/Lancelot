@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod dispatch;
 pub mod ffi;
 pub mod gil;
+pub mod router;
 pub mod serialize;
 pub mod socket;
 
