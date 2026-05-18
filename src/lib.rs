@@ -7,6 +7,7 @@ pub use pyo3;
 
 pub mod cpu;
 pub mod gil;
+pub mod socket;
 
 #[pyfunction]
 fn _ping() -> &'static str {

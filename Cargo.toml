@@ -24,7 +24,9 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"
 http = "1"
 tower = { version = "0.5", features = ["util"] }
-socket2 = "0.5"
+# `all` feature required for set_reuse_port (plan's bare `socket2 = "0.5"`
+# is a defect — set_reuse_port is gated behind socket2's `all` feature).
+socket2 = { version = "0.5", features = ["all"] }
 matchit = "0.8"
 bytes = "1"
 dhat = { version = "0.3", optional = true }
