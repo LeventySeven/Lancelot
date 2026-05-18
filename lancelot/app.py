@@ -1,6 +1,3 @@
-import asyncio
-import contextlib
-
 from lancelot import _native
 from lancelot.routing import APIRouter, Route, Router
 
@@ -77,23 +74,3 @@ Lancelot = App
 def run(app: "App", host: str = "127.0.0.1", port: int = 8000):
     routes = [(r.method, r.path, r.handler) for r in app.routes]
     _native.run(routes, host, port)
-
-
-@contextlib.contextmanager
-def _run_lifespan_sync(app: "App"):
-    """Drive the app's async lifespan from sync code (TestClient + the ASGI
-    lifespan protocol). Startup exceptions propagate (fail-fast, not a runtime
-    500). No-op if no lifespan was provided."""
-    if app._lifespan is None:
-        yield
-        return
-    loop = asyncio.new_event_loop()
-    try:
-        cm = app._lifespan(app)
-        loop.run_until_complete(cm.__aenter__())  # startup; raises -> fail-fast
-        try:
-            yield
-        finally:
-            loop.run_until_complete(cm.__aexit__(None, None, None))  # shutdown
-    finally:
-        loop.close()

@@ -68,7 +68,9 @@ async def _http(app, scope, receive, send):
     method = scope["method"]
     path = scope["path"]
 
-    # Honor incoming scope['state'] (Starlette TestClient seeds it); expose app.
+    # Expose app as scope['app'] (harness-design §1.3). NOTE: honoring the
+    # incoming scope['state'] (request.state seeding) is DEFERRED to M1-P2,
+    # when Request/DI land — there is no code reading scope['state'] yet.
     scope.setdefault("app", _AppProxy(app))
 
     route, info = app.router.match(method, path)
