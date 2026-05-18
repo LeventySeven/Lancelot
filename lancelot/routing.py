@@ -15,8 +15,14 @@ class Route:
         if not self.name:
             self.name = getattr(self.handler, "__name__", "route")
         # /items/{item_id} -> ^/items/(?P<item_id>[^/]+)$
-        pattern = re.sub(r"{([^}/]+)}", r"(?P<\1>[^/]+)", self.path)
-        self._rx = re.compile("^" + pattern + "$")
+        # B1: literal segments MUST be regex-escaped (a raw '.' or '(' in the
+        # dev's path otherwise matches any char / raises re.error). Split on
+        # the {param} delimiters; escape literals, only params become groups.
+        rx = ""
+        for part in re.split(r"({[^}/]+})", self.path):
+            m = re.fullmatch(r"{([^}/]+)}", part)
+            rx += f"(?P<{m.group(1)}>[^/]+)" if m else re.escape(part)
+        self._rx = re.compile("^" + rx + "$")
 
     def match(self, path: str):
         m = self._rx.match(path)

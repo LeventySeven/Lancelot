@@ -19,6 +19,19 @@ def test_include_router_prefix_and_match():
     assert app.router.match("GET", "/nope") == (None, 404)
 
 
+def test_literal_path_segments_are_escaped():
+    # B1 regression: literal segments must be regex-escaped, not injected raw.
+    from lancelot.routing import Route
+
+    r = Route("GET", "/files/{f}.json", lambda: None)
+    assert r.match("/files/a.json") == {"f": "a"}
+    assert r.match("/files/aXjson") is None  # '.' must be literal, not any-char
+    # regex metachars in a literal segment must NOT raise at registration:
+    r2 = Route("GET", "/x(y)/{z}", lambda: None)
+    assert r2.match("/x(y)/1") == {"z": "1"}
+    assert r2.match("/xqy/1") is None
+
+
 def test_nested_router():
     # The genuine RED for T2: APIRouter.include_router (nested routers).
     inner = APIRouter(prefix="/inner")
