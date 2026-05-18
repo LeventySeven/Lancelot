@@ -20,6 +20,8 @@ venv/
 *.pyd
 *.profraw
 dhat-heap.json
+/dist/
+/wip/
 
 # Secrets
 .env
