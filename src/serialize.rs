@@ -7,7 +7,8 @@ use pyo3::types::PyBytes;
 pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(pc) = py.import("pydantic_core") {
         let out = pc.call_method1("to_json", (value,))?; // -> bytes
-        return Ok(out.downcast::<PyBytes>()?.as_bytes().to_vec());
+        // pyo3 0.27.2 deprecates PyAnyMethods::downcast in favour of Bound::cast.
+        return Ok(out.cast::<PyBytes>()?.as_bytes().to_vec());
     }
     let json = py.import("json")?;
     let s: String = json.call_method1("dumps", (value,))?.extract()?;
