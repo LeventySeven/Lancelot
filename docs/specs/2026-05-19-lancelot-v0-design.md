@@ -114,7 +114,7 @@ Thin serial spine (Wave 0, 1 agent freezes interface seams) → 38/46 units fan 
 
 | M | Gate |
 |---|---|
-| M0 | Vertical slice green: 7 assertions incl. negative-compile-test, ≤5 allocs/req, GIL released across `.await`, imports under py3.13 *and* py3.13t. Retires the build-path risk first. |
+| M0 | Vertical slice green: 7 assertions incl. negative-compile-test, ≤5 allocs/req, GIL released across `.await`, imports under py3.13 *and* py3.14 (free-threaded `*t` = CI-only). Retires the build-path risk first. **Achieved — tag `m0-green`.** |
 | M1 | Table-stakes: conformance v0-subset 100% + full ≥90%; byte-exact 422; stability gates 1–6. |
 | M2 | AI tier: streaming + disconnect→abort + `app.llm` + MCP + agent loop; conformance ≥90% held; token-billing-stops-on-disconnect test passes. |
 | M3 | Ops/cloud: probes, drain, OTel, `lancelot init`, dual-build wheels, <60MB, <50ms cold start; conformance ≥95%. |
