@@ -1,0 +1,26 @@
+# Research-from-materials dump: 2.4GB of cloned repos, tarballs, teardowns,
+# and its own nested .git — reference material, never part of the repo.
+/researchfms/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Rust / maturin build artifacts (generated when M0 build begins)
+/target/
+**/target/
+*.so
+*.pyd
+*.profraw
+dhat-heap.json
+
+# Secrets
+.env
+*.env
