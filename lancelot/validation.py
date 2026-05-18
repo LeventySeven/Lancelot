@@ -65,6 +65,22 @@ def _regenerate(exc: ValidationError, loc_prefix):
     return out
 
 
+class BodyValidator:
+    """Single pydantic-core pass over the raw bytes — NOT json.loads then
+    validate_python (deep/01 §0.3 / spec §2 "one Rust pass"). Malformed JSON
+    surfaces as pydantic-core's own `json_invalid` error (loc=("body",pos),
+    ctx.error) — byte-identical to FastAPI routing.py:427-441."""
+
+    def __init__(self, model):
+        self._adapter = TypeAdapter(model)
+
+    def validate_json(self, raw: bytes):
+        try:
+            return self._adapter.validate_json(raw), []
+        except ValidationError as e:
+            return None, _regenerate(e, ["body"])
+
+
 def compile_validator(fi: FieldInfo) -> ParamValidator:
     return ParamValidator(fi)
 
