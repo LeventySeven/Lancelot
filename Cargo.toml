@@ -40,3 +40,11 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 panic = "unwind"
+
+# Spec §2/§5: the no-await-holding-the-GIL invariant is guarded by BOTH the
+# trybuild negative-compile-test (Task 2) AND a clippy deny-set. The type-level
+# `with_gil` enforcement covers our own GIL scope; this catches any std lock /
+# RefCell guard held across `.await` in later tasks (e.g. the dispatch pump).
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
