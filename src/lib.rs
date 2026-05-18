@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 // consistent version path without taking a direct pyo3 dependency.
 pub use pyo3;
 
+pub mod cpu;
 pub mod gil;
 
 #[pyfunction]
