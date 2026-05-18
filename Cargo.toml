@@ -9,7 +9,14 @@ name = "lancelot"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py311"] }
+# NOTE (deviation from plan Task 1 Step 2, deliberate & required): `extension-module`
+# is intentionally NOT set here. It must apply ONLY to the maturin-built cdylib
+# (Python supplies the CPython symbols at import time); when set unconditionally it
+# makes `cargo test` / `trybuild` / `cargo run --bin alloc_probe` fail to link
+# (undefined __Py_IncRef/__Py_DecRef). maturin re-adds it for the wheel via
+# pyproject.toml `[tool.maturin] features = ["pyo3/extension-module"]`. This is the
+# canonical pyo3+maturin setup; the plan's literal Cargo.toml is a defect.
+pyo3 = { version = "0.27", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }

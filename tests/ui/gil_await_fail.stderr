@@ -1,0 +1,7 @@
+error[E0728]: `await` is only allowed inside `async` functions and blocks
+ --> tests/ui/gil_await_fail.rs:9:32
+  |
+8 |     with_gil(|_py| {
+  |              ----- this is not `async`
+9 |         std::future::ready(()).await; // error: `await` only allowed in async fn/block
+  |                                ^^^^^ only allowed inside `async` functions and blocks
