@@ -12,6 +12,17 @@ class WebSocketDisconnect(Exception):
         super().__init__(f"disconnect {code}")
 
 
+class WebSocketException(Exception):
+    """Starlette/FastAPI-shape: `raise WebSocketException(code=1008,
+    reason=...)` propagates out of a handler; the asgi seam closes the
+    WS with the given code/reason (HTTPException analog for WebSockets)."""
+
+    def __init__(self, code: int, reason: str | None = None):
+        self.code = code
+        self.reason = reason or ""
+        super().__init__(f"WebSocketException(code={code})")
+
+
 class WebSocket:
     def __init__(self, scope, receive, send):
         self.scope = scope

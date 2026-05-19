@@ -284,7 +284,8 @@ async def _ws(app, scope, receive, send):
     from lancelot.di import solve_async
     from lancelot.requests import Request as LRequest
     from lancelot.validation import _wire_json
-    from lancelot.websockets import WebSocket, WebSocketDisconnect
+    from lancelot.websockets import (WebSocket, WebSocketDisconnect,
+                                      WebSocketException)
 
     path = scope["path"]
     scope.setdefault("app", _AppProxy(app))
@@ -318,6 +319,11 @@ async def _ws(app, scope, receive, send):
                 result = await result
     except WebSocketDisconnect:
         return  # client closed mid-handler — nothing to send
+    except WebSocketException as exc:  # FastAPI-shape: close w/ code+reason
+        try:
+            await ws.close(code=exc.code, reason=exc.reason)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001 - never let it escape the ASGI callable
         try:
             await ws.close(code=1011)

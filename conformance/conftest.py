@@ -27,10 +27,11 @@ _fastapi.Form = Form
 _fastapi.File = File
 _fastapi.BackgroundTasks = lancelot.BackgroundTasks
 _fastapi.Request = lancelot.Request
-from lancelot.websockets import WebSocket as _WS, WebSocketDisconnect as _WSD  # noqa: E402
+from lancelot.websockets import WebSocket as _WS, WebSocketDisconnect as _WSD, WebSocketException as _WSE  # noqa: E402
 
 _fastapi.WebSocket = _WS
 _fastapi.WebSocketDisconnect = _WSD
+_fastapi.WebSocketException = _WSE
 import lancelot.responses as _lresp  # noqa: E402
 
 for _rn in ("Response", "JSONResponse", "HTMLResponse", "PlainTextResponse"):
