@@ -8,6 +8,10 @@ class Item(pydantic.BaseModel):
     name: str
 
 
+def _route(app, path):
+    return next(r for r in app.routes if r.path == path)
+
+
 def test_request_body_ref():
     app = App()
 
@@ -15,7 +19,7 @@ def test_request_body_ref():
     def create(item: Item):
         return {}
 
-    rb = request_body_for(app.routes[0])
+    rb = request_body_for(_route(app, "/items"))
     assert rb == {"content": {"application/json": {"schema": {
         "$ref": "#/components/schemas/Item"}}}, "required": True}
     assert _model_name(Item) == "Item"
@@ -28,4 +32,4 @@ def test_request_body_none_when_no_body():
     def x(q: int):
         return {}
 
-    assert request_body_for(app.routes[0]) is None
+    assert request_body_for(_route(app, "/x")) is None

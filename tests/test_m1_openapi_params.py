@@ -12,7 +12,8 @@ def test_parameters_shape_and_header_dash():
     def read(item_id: int, q: str, x_tok: typing.Annotated[str, Header()] = "d"):
         return {}
 
-    params = parameters_for(app.routes[0])
+    route = next(r for r in app.routes if r.path == "/items/{item_id}")
+    params = parameters_for(route)
     by = {(p["in"], p["name"]): p for p in params}
     assert list(by[("path", "item_id")]) == ["name", "in", "required", "schema"]
     assert by[("path", "item_id")]["required"] is True

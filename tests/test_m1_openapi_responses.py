@@ -13,12 +13,14 @@ def test_responses_success_and_422_injection():
     def n():
         return {}
 
-    r1 = responses_for(app.routes[0])
+    rx = next(r for r in app.routes if r.path == "/x/{i}")
+    rn = next(r for r in app.routes if r.path == "/noparams")
+    r1 = responses_for(rx)
     assert r1["200"]["description"] == "Successful Response"
     assert r1["200"]["content"]["application/json"]["schema"] == {}
     assert r1["422"]["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/HTTPValidationError"}
-    assert "422" not in responses_for(app.routes[1])  # no params/body (MUST-36)
+    assert "422" not in responses_for(rn)  # no params/body (MUST-36)
     assert _VALIDATION_ERROR["title"] == "ValidationError"
     assert _VALIDATION_ERROR["required"] == ["loc", "msg", "type"]
     assert _HTTP_VALIDATION_ERROR["title"] == "HTTPValidationError"
