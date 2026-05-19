@@ -4,6 +4,8 @@ run on the M1-P5 blocking pool so they never pin the reactor; FastAPI
 runs them via run_in_threadpool too. Stdlib-only (runtime dep =
 pydantic)."""
 import inspect
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 
 class BackgroundTasks:
@@ -21,3 +23,64 @@ class BackgroundTasks:
                 await func(*args, **kwargs)
             else:
                 await get_pool().offload(func, *args, **kwargs)
+
+
+class QueueFull(Exception):
+    """Detached background queue exhausted (WBS U33 bounded queue)."""
+
+
+class BackgroundPool:
+    """Detached pool SEPARATE from request workers (WBS U33): a request
+    returns immediately; the job outlives it. Bounded → QueueFull rather
+    than unbounded growth. `_depth` counts submitted-but-unfinished tasks;
+    the ceiling is `max_workers + max_queue` (running occupy workers,
+    the rest wait in the bounded queue). The Rust src/background/pool.rs
+    realization is the spec §3-69 unification (ledgered RED)."""
+
+    def __init__(self, max_workers: int = 8, max_queue: int = 10_000):
+        self._ex = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="lancelot-bg")
+        self._ceiling = max_workers + max_queue
+        self._depth = 0
+        self._lock = threading.Lock()
+
+    def spawn(self, fn, /, *args, **kwargs):
+        with self._lock:
+            if self._depth >= self._ceiling:
+                raise QueueFull()
+            self._depth += 1
+
+        def _run():
+            try:
+                fn(*args, **kwargs)
+            finally:
+                with self._lock:
+                    self._depth -= 1
+
+        self._ex.submit(_run)
+
+    def shutdown(self):
+        self._ex.shutdown(wait=False, cancel_futures=True)
+
+
+_POOL: "BackgroundPool | None" = None
+_POOL_LOCK = threading.Lock()
+
+
+def _pool() -> BackgroundPool:
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                _POOL = BackgroundPool()
+    return _POOL
+
+
+def spawn(fn, /, *args, **kwargs):
+    """Detached: returns immediately, the job outlives the response (U33).
+    `await_in_request=True` opts back into the old run-before-return
+    semantics (kept for migration parity)."""
+    if kwargs.pop("await_in_request", False):
+        fn(*args, **kwargs)
+        return
+    _pool().spawn(fn, *args, **kwargs)

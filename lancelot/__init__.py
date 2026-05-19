@@ -4,7 +4,7 @@ from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
 __all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient",
-           "BackgroundTasks", "run", "_ping"]
+           "BackgroundTasks", "background", "run", "_ping"]
 __version__ = "0.0.0"
 
 

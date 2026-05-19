@@ -193,3 +193,46 @@ def test_background_tasks_run_after_response_like_fastapi():
         assert l.status_code == f.status_code == 200
         assert l.content == f.content                  # byte parity
         assert lsink == fsink == ["first", "second"]   # order + ran-after
+
+
+def test_background_spawn_does_not_delay_the_response():
+    import lancelot
+    from lancelot.testclient import TestClient as LC
+
+    done = threading.Event()
+    app = lancelot.App()
+
+    @app.get("/spawn")
+    def spawn_route():
+        from lancelot import background
+
+        def long_job():
+            time.sleep(0.6)
+            done.set()
+
+        background.spawn(long_job)            # detached, bounded
+        return {"accepted": True}
+
+    with LC(app) as lc:
+        t0 = time.perf_counter()
+        r = lc.get("/spawn")
+        dt = time.perf_counter() - t0
+        assert r.status_code == 200
+        assert dt < 0.3, f"spawn delayed the response: {dt:.2f}s"  # U33
+        assert not done.is_set()              # still running after response
+        assert done.wait(2)                   # it does eventually complete
+
+
+def test_background_spawn_bounded_queue_rejects_when_full():
+    from lancelot.background import BackgroundPool, QueueFull
+
+    bp = BackgroundPool(max_workers=1, max_queue=1)
+    try:
+        rel = threading.Event()
+        bp.spawn(lambda: rel.wait(2))         # occupies the worker
+        bp.spawn(lambda: None)                # fills the queue (depth 1)
+        with pytest.raises(QueueFull):
+            bp.spawn(lambda: None)            # over the bound → rejected
+        rel.set()
+    finally:
+        bp.shutdown()
