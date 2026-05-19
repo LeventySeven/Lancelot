@@ -8,7 +8,7 @@ import types
 
 import lancelot
 from conformance.swap import RealTestClient
-from lancelot.params import Depends, Query, Path, Header, Cookie, Body
+from lancelot.params import Depends, Query, Path, Header, Cookie, Body, Form
 
 _fastapi = types.ModuleType("fastapi")
 _fastapi.FastAPI = lancelot.App
@@ -19,6 +19,22 @@ _fastapi.Path = Path
 _fastapi.Header = Header
 _fastapi.Cookie = Cookie
 _fastapi.Body = Body
+# Genuinely-implemented Lancelot surface, exposed under the `fastapi`
+# name (harness-design §4.1 — the swap's purpose; NOT editing tests).
+# File/UploadFile are intentionally NOT mapped (multipart is ledgered
+# RED) so tests needing them fail HONESTLY at import.
+_fastapi.Form = Form
+_fastapi.BackgroundTasks = lancelot.BackgroundTasks
+_fastapi.Request = lancelot.Request
+from lancelot.websockets import WebSocket as _WS, WebSocketDisconnect as _WSD  # noqa: E402
+
+_fastapi.WebSocket = _WS
+_fastapi.WebSocketDisconnect = _WSD
+import lancelot.responses as _lresp  # noqa: E402
+
+for _rn in ("Response", "JSONResponse", "HTMLResponse", "PlainTextResponse"):
+    if hasattr(_lresp, _rn):
+        setattr(_fastapi, _rn, getattr(_lresp, _rn))
 sys.modules["fastapi"] = _fastapi
 
 _tc = types.ModuleType("fastapi.testclient")

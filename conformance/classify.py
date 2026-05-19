@@ -66,6 +66,12 @@ def classify_file(path: pathlib.Path) -> tuple[str, str]:
         if any(i == priv or i.startswith(priv + ".") for i in imps):
             return "EXCLUDE", f"imports FastAPI-private `{priv}` (Class C: " \
                               f"asserts a framework internal, not wire bytes)"
+    if any(i == "inline_snapshot" or i.startswith("inline_snapshot.")
+           for i in imps):
+        # `inline_snapshot` IS the byte-snapshot mechanism — definitionally
+        # a Lane-A2 (OpenAPI/HTML byte-exact) test.
+        return "A2", "uses inline_snapshot (byte-exact snapshot; Lane A2, " \
+                     "semantic-equiv only at v0)"
     consts = _str_consts(tree)
     if any(s in consts for s in SNAPSHOT_PATHS):
         # Asserts the literal /openapi.json|/docs|/redoc surface → snapshot.

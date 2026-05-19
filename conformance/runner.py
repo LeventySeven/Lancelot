@@ -1,36 +1,51 @@
-"""Run the vendored corpus through the swap; return (passed, total).
+"""Run the pinned real FastAPI corpus through the swap; return
+(passed, total) over **Class A only** (the honest gate).
 
-A6: runs pytest in a SUBPROCESS (not in-process) so an in-process caller
-(e.g. tests/test_m1_p1_acceptance.py) never pollutes the parent pytest
-process's sys.modules['fastapi'] with the swap fake. The swap auto-applies
-because pytest loads `conformance/conftest.py` (the parent conftest of
-`conformance/vendor`). M1-P7 swaps the seed for the pinned 581-file FastAPI
-tree + reference/candidate differential harness."""
+A6: pytest runs in a SUBPROCESS so the swap fake `fastapi` never leaks
+into a parent pytest. `conformance/conftest.py` (the swap) auto-applies
+because it is the rootdir conftest (cwd=conformance). `vendor/fastapi`
+is on PYTHONPATH so `from .main import app` (the `tests` package) and
+`from docs_src... import app` resolve against the pinned tree, byte-
+unmodified. classify.py decides Class A/A2/B/EXCLUDE deterministically;
+no vendored test is ever edited and no file is hand-picked to move the
+ratio (harness-design §4 — the cardinal rule)."""
+import os
 import pathlib
 import re
 import subprocess
 import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+ROOT = pathlib.Path(__file__).resolve().parent
+VENDOR_FA = ROOT / "vendor" / "fastapi"
+
+
+def _class_a_files():
+    sys.path.insert(0, str(ROOT.parent))
+    from conformance.classify import classify_all
+
+    return [str(VENDOR_FA / rel)
+            for rel, (tag, _r) in sorted(classify_all().items())
+            if tag == "A"]
 
 
 def run() -> tuple[int, int]:
-    vendor = ROOT / "conformance" / "vendor"
-    # The ratchet gates the ACTIVE corpus only. Not-yet-implemented seed tests
-    # live in conformance/vendor/quarantine/ (RED-first, excluded from the
-    # ratio) and graduate into vendor/ when the feature lands — so a sub-plan
-    # can follow RED-first discipline without the "parity may only rise"
-    # ratchet hard-failing CI. (Review fix: floor=100 was P3-blocking.)
+    files = _class_a_files()
+    if not files:
+        return 0, 1
+    env = {**os.environ, "PYTHONPATH": str(VENDOR_FA)}
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-         "--ignore", str(vendor / "quarantine"), str(vendor)],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
+         "--no-header", "--import-mode=importlib",
+         "--continue-on-collection-errors", *files],
+        cwd=str(ROOT), capture_output=True, text=True, env=env,
     )
     out = proc.stdout + proc.stderr
     passed = sum(int(n) for n in re.findall(r"(\d+) passed", out))
     failed = sum(int(n) for n in re.findall(r"(\d+) failed", out))
     errors = sum(int(n) for n in re.findall(r"(\d+) error", out))
-    total = passed + failed + errors
-    return passed, max(total, 1)
+    return passed, max(passed + failed + errors, 1)
+
+
+if __name__ == "__main__":
+    p, t = run()
+    print(f"Class-A: {p}/{t} = {100.0 * p / t:.1f}%")
