@@ -140,3 +140,26 @@ def components_schemas(app) -> dict:
         defs["ValidationError"] = _VALIDATION_ERROR
         defs["HTTPValidationError"] = _HTTP_VALIDATION_ERROR
     return {k: defs[k] for k in sorted(defs)}  # MUST-17 lexicographic
+
+
+def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
+    paths: dict = {}
+    for r in app.routes:
+        op = {"summary": summary(r), "operationId": operation_id(r)}
+        ps = parameters_for(r)
+        if ps:
+            op["parameters"] = ps
+        rb = request_body_for(r)
+        if rb is not None:
+            op["requestBody"] = rb
+        op["responses"] = responses_for(r)
+        paths.setdefault(r.path, {})[r.method.lower()] = op
+    doc = {  # MUST-28: wire key order = pydantic OpenAPI model field order
+        "openapi": "3.1.0",
+        "info": {"title": title, "version": version},
+        "paths": paths,
+    }
+    schemas = components_schemas(app)
+    if schemas:
+        doc["components"] = {"schemas": schemas}
+    return doc
