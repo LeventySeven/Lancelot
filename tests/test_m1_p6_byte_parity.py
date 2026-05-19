@@ -78,6 +78,31 @@ def test_websocket_echo_param_and_1008():
                 w.receive_text()
 
 
+def test_unmatched_ws_closes_1000_not_illegal_1006():
+    """B4: RFC 6455 §7.4.1 — 1006 MUST NOT be sent in a Close frame;
+    Starlette closes an unmatched WS route with code 1000, reason ''."""
+    import lancelot
+
+    sent = []
+    incoming = [{"type": "websocket.connect"}]
+
+    async def receive():
+        return incoming.pop(0) if incoming else {
+            "type": "websocket.disconnect", "code": 1000}
+
+    async def send(m):
+        sent.append(m)
+
+    import asyncio
+    app = lancelot.App()
+    asyncio.run(app.asgi()(
+        {"type": "websocket", "path": "/nope", "headers": []},
+        receive, send))
+    closes = [m for m in sent if m["type"] == "websocket.close"]
+    assert closes and closes[0]["code"] == 1000
+    assert closes[0].get("reason") == ""
+
+
 def test_staticfiles_etag_range_304_traversal_match_starlette(tmp_path):
     import starlette.applications
     from starlette.staticfiles import StaticFiles as SSF
@@ -115,6 +140,68 @@ def test_staticfiles_etag_range_304_traversal_match_starlette(tmp_path):
         assert l4.status_code == s4.status_code == 416
         assert lc.get("/s/../test_m1_p6_byte_parity.py").status_code in (
             404, 400)
+
+
+def _raw_static(app_callable, path, req_headers=None):
+    """Drive the ASGI callable directly, capture ordered start headers +
+    status + body (header order is part of the wire bytes — M1-P4)."""
+    import anyio
+
+    out = {}
+
+    async def rcv():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def snd(m):
+        if m["type"] == "http.response.start":
+            out["s"] = m["status"]
+            out["h"] = [k.decode() for k, _ in m["headers"]]
+        elif m["type"] == "http.response.body":
+            out["b"] = out.get("b", b"") + m.get("body", b"")
+
+    scope = {"type": "http", "method": "GET", "path": path,
+             "raw_path": path.encode(), "query_string": b"",
+             "headers": [(k.lower().encode(), v.encode())
+                         for k, v in (req_headers or {}).items()],
+             "scheme": "http", "server": ("t", 80), "client": ("c", 1),
+             "http_version": "1.1"}
+
+    async def _run():
+        await app_callable(scope, rcv, snd)
+
+    anyio.run(_run)
+    return out["s"], out["h"], out.get("b", b"")
+
+
+def test_staticfiles_suffix_range_order_and_nul_match_starlette(tmp_path):
+    import starlette.applications
+    from starlette.staticfiles import StaticFiles as SSF
+    import lancelot
+    from lancelot.staticfiles import StaticFiles as LSF
+
+    (tmp_path / "a.txt").write_bytes(b"hello world")
+    sapp = starlette.applications.Starlette()
+    sapp.mount("/s", SSF(directory=str(tmp_path)))
+    lapp = lancelot.App()
+    lapp.mount("/s", LSF(directory=str(tmp_path)))
+    fa, lc = sapp, lapp.asgi()
+
+    # B3: ordered wire headers (200 + 206) must match Starlette FileResponse
+    for hdrs in (None, {"range": "bytes=0-4"}):
+        ss, sh, sb = _raw_static(fa, "/s/a.txt", hdrs)
+        ls, lh, lb = _raw_static(lc, "/s/a.txt", hdrs)
+        assert (ls, lh, lb) == (ss, sh, sb), (hdrs, lh, sh)
+
+    # B2: RFC suffix range bytes=-3 → last 3 bytes (was serving wrong bytes)
+    for spec in ("bytes=-3", "bytes=-100", "bytes=0--1", "bytes=5-2",
+                 "items=0-1", "bytes=abc", "bytes=-0"):
+        ss, _sh, sb = _raw_static(fa, "/s/a.txt", {"range": spec})
+        ls, _lh, lb = _raw_static(lc, "/s/a.txt", {"range": spec})
+        assert (ls, lb) == (ss, sb), (spec, ls, lb, ss, sb)
+
+    # B1: NUL byte in path → 404 (Starlette), NOT an uncaught ValueError
+    ls, _lh, _lb = _raw_static(lc, "/s/a\x00.txt")
+    assert ls == 404
 
 
 def test_settings_provider_cached_and_missing_env_boot_crash(monkeypatch):

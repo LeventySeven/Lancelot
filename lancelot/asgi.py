@@ -245,7 +245,9 @@ async def _ws(app, scope, receive, send):
             await receive()  # consume websocket.connect
         except Exception:  # noqa: BLE001
             return
-        await send({"type": "websocket.close", "code": 1006})
+        # RFC 6455 §7.4.1: 1006 MUST NOT be sent in a Close frame. Starlette
+        # closes an unmatched WS route with 1000/"" — match it.
+        await send({"type": "websocket.close", "code": 1000, "reason": ""})
         return
 
     params = route.match(path) or {}
