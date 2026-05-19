@@ -2,9 +2,11 @@
 pure-ASGI escape hatch — an unmodified ASGI middleware wrapping the app
 callable, NEVER BaseHTTPMiddleware/call_next.
 
-CORSMiddleware — byte-faithful to Starlette's CORSMiddleware (FastAPI's)
-for the covered config, verified by tests/test_m1_p4_byte_parity.py
-against real fastapi 0.136.1: literal `*` for allow_origins=["*"] (NOT an
+CORSMiddleware — byte-faithful to Starlette's CORSMiddleware (the one
+FastAPI re-exports) for the covered config, verified by
+tests/test_m1_p4_byte_parity.py against the real installed stack
+(fastapi 0.136.1 / starlette 1.0.0): literal `*` for allow_origins=["*"]
+(NOT an
 Origin reflector — V1 review blocker); `Vary: Origin` for explicit-list;
 preflight 400 "Disallowed CORS origin|method|headers" (incl. ACRH
 validation); `sorted(SAFELISTED ∪ allow_headers)` Allow-Headers; ACAC
