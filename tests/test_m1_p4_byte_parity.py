@@ -61,3 +61,208 @@ def test_p4_byte_parity_covered_subset():
                                     "Authorization": "Bearer x"})
         assert lh.headers.get("access-control-allow-origin") == \
             fh.headers.get("access-control-allow-origin") == "https://ex.com"
+
+
+def _star_app(F, CORS):
+    app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+    @app.get("/")
+    def root():
+        return {"ok": True}
+
+    app.add_middleware(CORS, allow_origins=["*"], allow_methods=["GET"])
+    return app
+
+
+def test_cors_wildcard_and_preflight_byte_parity():
+    """V1/A3: `allow_origins=["*"]` must emit literal `*` (Starlette), NOT
+    reflect Origin (open-reflector vuln); preflight on a disallowed origin
+    must 400 like Starlette; duplicate Authorization = first-wins."""
+    with FA(_star_app(fastapi, FACORS)) as fa, LC(_star_app(lancelot, LCORS)) as lc:
+        f = fa.get("/", headers={"Origin": "https://attacker.evil"})
+        l = lc.get("/", headers={"Origin": "https://attacker.evil"})
+        assert l.headers.get("access-control-allow-origin") == \
+            f.headers.get("access-control-allow-origin") == "*"  # NOT reflected
+
+    # explicit-list preflight: disallowed origin -> Starlette 400
+    with FA(_build_fa()) as fa, LC(_build_lc()) as lc:
+        fp = fa.request("OPTIONS", "/me", headers={
+            "Origin": "https://evil.com",
+            "Access-Control-Request-Method": "GET"})
+        lp = lc.request("OPTIONS", "/me", headers={
+            "Origin": "https://evil.com",
+            "Access-Control-Request-Method": "GET"})
+        assert lp.status_code == fp.status_code  # 400 in Starlette
+        # duplicate Authorization header -> FIRST wins (no smuggling)
+        fr = fa.get("/me", headers=[("authorization", "Bearer aaa"),
+                                    ("authorization", "Bearer bbb")])
+        lr = lc.get("/me", headers=[("authorization", "Bearer aaa"),
+                                    ("authorization", "Bearer bbb")])
+        assert lr.json() == fr.json()
+
+
+def _hdr_app(F, CORS):
+    app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+    @app.get("/")
+    def root():
+        return {"ok": True}
+
+    app.add_middleware(CORS, allow_origins=["https://ex.com"],
+                       allow_methods=["GET"], allow_headers=["Z-Last", "A-Token"])
+    return app
+
+
+def _cred_app(F, CORS):
+    app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+    @app.get("/")
+    def root():
+        return {"ok": True}
+
+    app.add_middleware(CORS, allow_origins=["https://ex.com"],
+                       allow_credentials=True, allow_methods=["GET"])
+    return app
+
+
+def test_cors_preflight_acrh_and_sorted_headers_byte_parity():
+    with FA(_hdr_app(fastapi, FACORS)) as fa, LC(_hdr_app(lancelot, LCORS)) as lc:
+        def pf(c, acrh):
+            return c.request("OPTIONS", "/", headers={
+                "Origin": "https://ex.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": acrh})
+
+        f1, l1 = pf(fa, "a-token"), pf(lc, "a-token")
+        assert l1.status_code == f1.status_code == 200
+        assert l1.content == f1.content
+        assert l1.headers.get("access-control-allow-headers") == \
+            f1.headers.get("access-control-allow-headers")
+        f2, l2 = pf(fa, "authorization, x-nope"), pf(lc, "authorization, x-nope")
+        assert l2.status_code == f2.status_code == 400  # Disallowed CORS headers
+        assert l2.content == f2.content
+    with FA(_cred_app(fastapi, FACORS)) as fa, LC(_cred_app(lancelot, LCORS)) as lc:
+        f = fa.get("/", headers={"Origin": "https://evil.com"})
+        l = lc.get("/", headers={"Origin": "https://evil.com"})
+        assert l.headers.get("access-control-allow-credentials") == \
+            f.headers.get("access-control-allow-credentials") == "true"
+        assert l.headers.get("access-control-allow-origin") == \
+            f.headers.get("access-control-allow-origin")
+
+
+def _star_methods_app(F, CORS):
+    app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+    @app.get("/")
+    def root():
+        return {"ok": True}
+
+    app.add_middleware(CORS, allow_origins=["https://ex.com"],
+                       allow_methods=["*"], allow_headers=["*"])
+    return app
+
+
+def test_cors_wildcard_methods_headers_and_content_length():
+    # F1 (*-methods expand) + F2 (*-headers: verbatim ACRH / none w/o ACRH)
+    with FA(_star_methods_app(fastapi, FACORS)) as fa, \
+         LC(_star_methods_app(lancelot, LCORS)) as lc:
+        def pf(c, extra):
+            h = {"Origin": "https://ex.com",
+                 "Access-Control-Request-Method": "DELETE"}
+            h.update(extra)
+            return c.request("OPTIONS", "/", headers=h)
+        f1, l1 = pf(fa, {}), pf(lc, {})
+        assert l1.headers.get("access-control-allow-methods") == \
+            f1.headers.get("access-control-allow-methods") == \
+            "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+        assert l1.headers.get("access-control-allow-headers") == \
+            f1.headers.get("access-control-allow-headers")  # both None
+        f2, l2 = pf(fa, {"Access-Control-Request-Headers": "x-y, z-w"}), \
+            pf(lc, {"Access-Control-Request-Headers": "x-y, z-w"})
+        assert l2.headers.get("access-control-allow-headers") == \
+            f2.headers.get("access-control-allow-headers") == "x-y, z-w"
+    # F3: content-length byte-identical to real FastAPI (the 401 body is
+    # byte-identical across the two; /openapi.json is byte-identical for
+    # this security-only app once the 422 predicate is FastAPI-faithful).
+    with FA(_build_fa()) as fa, LC(_build_lc()) as lc:
+        fj, lj = fa.get("/openapi.json"), lc.get("/openapi.json")
+        assert lj.content == fj.content  # full byte parity (security-only)
+        assert lj.headers.get("content-length") == fj.headers.get("content-length")
+        assert lj.headers.get("content-length") == str(len(lj.content))  # honest
+        f0, l0 = fa.get("/me"), lc.get("/me")  # 401
+        assert l0.headers.get("content-length") == f0.headers.get("content-length")
+
+
+def _p_app(F):
+    """One app, six route shapes — the exact predicate FastAPI uses to emit
+    the 422 response + HTTPValidationError/ValidationError schemas."""
+    from pydantic import BaseModel
+
+    is_fa = hasattr(F, "FastAPI")
+    app = F.FastAPI() if is_fa else F.App()
+    Dep = (F.Depends if is_fa else __import__(
+        "lancelot.params", fromlist=["Depends"]).Depends)
+    if is_fa:
+        from fastapi.security import HTTPBearer as B
+        from fastapi import Request as Rq
+    else:
+        from lancelot.security import HTTPBearer as B
+        from lancelot.requests import Request as Rq
+    sec = B()
+
+    class Body(BaseModel):
+        x: int
+
+    @app.get("/secdep")
+    def secdep(c=Dep(sec)):
+        return {}
+
+    @app.get("/none")
+    def none():
+        return {}
+
+    @app.get("/req")
+    def req(r: Rq):
+        return {}
+
+    @app.get("/query")
+    def q(limit: int = 0):
+        return {}
+
+    @app.post("/body")
+    def body(b: Body):
+        return {}
+
+    def _inner(page: int = 1):
+        return page
+
+    @app.get("/depquery")
+    def depquery(v=Dep(_inner)):
+        return {}
+
+    return app
+
+
+def test_openapi_422_predicate_matches_fastapi():
+    """FastAPI emits `422` + the validation-error schemas IFF a route has
+    >=1 transitive validatable field (query/path/header/cookie) or a body.
+    Security-only / no-param / Request-only routes get NEITHER. Lancelot
+    previously over-emitted (keyed off `bool(plan.dependencies)`, and a
+    security scheme IS a SubDep) — the byte oracle caught it."""
+    with FA(_p_app(fastapi)) as fa, LC(_p_app(lancelot)) as lc:
+        fd = fa.get("/openapi.json").json()
+        ld = lc.get("/openapi.json").json()
+
+        def has422(d, p, m="get"):
+            return "422" in d["paths"][p][m]["responses"]
+
+        for p, m in [("/secdep", "get"), ("/none", "get"), ("/req", "get")]:
+            assert has422(fd, p, m) is False
+            assert has422(ld, p, m) == has422(fd, p, m), (p, "must NOT 422")
+        for p, m in [("/query", "get"), ("/body", "post"),
+                     ("/depquery", "get")]:
+            assert has422(fd, p, m) is True
+            assert has422(ld, p, m) == has422(fd, p, m), (p, "MUST 422")
+        # schemas presence parity (some route 422s here → both have them)
+        assert ("schemas" in ld.get("components", {})) == \
+            ("schemas" in fd.get("components", {})) is True

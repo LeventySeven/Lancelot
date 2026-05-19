@@ -91,9 +91,9 @@ async def _http(app, scope, receive, send):
     from lancelot.requests import Request as LRequest
     from lancelot.validation import errors_to_422, _wire_json
 
-    # Drain the body (ASGI more_body streaming). NOTE: no max-body cap yet —
-    # tracked P-any security carry-forward (the ASGI path is the migration
-    # on-ramp, not the fast path).
+    # Drain the body (ASGI more_body streaming); capped at _MAX_BODY → 413
+    # (enforced just below). The ASGI path is the migration on-ramp, not the
+    # fast path; a configurable/per-route limit is a P-any item.
     body = b""
     while True:
         msg = await receive()
@@ -108,7 +108,9 @@ async def _http(app, scope, receive, send):
 
     qs = parse_qs(scope.get("query_string", b"").decode())
     query = {k: v[-1] for k, v in qs.items()}
-    headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
+    headers = {}  # FIRST-wins (Starlette parity; blocks header smuggling — A2)
+    for _hk, _hv in scope.get("headers", []):
+        headers.setdefault(_hk.decode(), _hv.decode())
     params = route.match(path) or {}
     lreq = LRequest(method, path, query, headers, {}, params, body, scope["app"])
     lreq.scope_state = scope.get("state")  # honor incoming ASGI scope state
@@ -148,8 +150,10 @@ async def _http(app, scope, receive, send):
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
                 await send({"type": "http.response.start",
                             "status": result.status_code,
-                            "headers": [(b"content-type",
-                                         result.media_type.encode())]})
+                            "headers": [
+                                (b"content-type", result.media_type.encode()),
+                                (b"content-length",
+                                 str(len(result.body)).encode())]})
                 await send({"type": "http.response.body", "body": result.body})
                 sent = True
                 return
@@ -158,13 +162,14 @@ async def _http(app, scope, receive, send):
             sent = True
     except HTTPException as exc:  # byte-faithful {"detail":…} + headers (MUST-11)
         if not sent:
-            hdrs = [(b"content-type", b"application/json")]
+            ebody = _wire_json({"detail": exc.detail})
+            hdrs = [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(ebody)).encode())]
             for k, v in exc.headers.items():
                 hdrs.append((str(k).encode(), str(v).encode()))
             await send({"type": "http.response.start",
                         "status": exc.status_code, "headers": hdrs})
-            await send({"type": "http.response.body",
-                        "body": _wire_json({"detail": exc.detail})})
+            await send({"type": "http.response.body", "body": ebody})
     except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
@@ -174,6 +179,7 @@ async def _send_json(send, status: int, body: bytes):
     await send({
         "type": "http.response.start",
         "status": status,
-        "headers": [(b"content-type", b"application/json")],
+        "headers": [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
     })
     await send({"type": "http.response.body", "body": body})

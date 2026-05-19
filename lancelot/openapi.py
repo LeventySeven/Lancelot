@@ -100,9 +100,21 @@ _HTTP_VALIDATION_ERROR = {
 }
 
 
+def _plan_has_field(plan) -> bool:
+    # FastAPI emits 422 iff the route has >=1 TRANSITIVE validatable field
+    # (query/path/header/cookie) — recursing through value/yield sub-deps.
+    # A security SubDep carries plan=None (invoked with the Request, not a
+    # DI graph) and a `Request`-only param is not a field, so neither counts
+    # (matches real fastapi 0.136.1 exactly — see the byte oracle).
+    if plan is None:
+        return False
+    if plan.fields:
+        return True
+    return any(_plan_has_field(sub.plan) for sub in plan.dependencies)
+
+
 def _has_params_or_body(route) -> bool:
-    return bool(route.plan.fields) or route.body is not None or bool(
-        route.plan.dependencies)
+    return route.body is not None or _plan_has_field(route.plan)
 
 
 def responses_for(route) -> dict:
