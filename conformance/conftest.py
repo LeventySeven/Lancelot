@@ -8,7 +8,7 @@ import types
 
 import lancelot
 from conformance.swap import RealTestClient
-from lancelot.params import Depends, Query, Path, Header, Cookie, Body, Form
+from lancelot.params import Depends, Query, Path, Header, Cookie, Body, Form, File
 
 _fastapi = types.ModuleType("fastapi")
 _fastapi.FastAPI = lancelot.App
@@ -24,6 +24,7 @@ _fastapi.Body = Body
 # File/UploadFile are intentionally NOT mapped (multipart is ledgered
 # RED) so tests needing them fail HONESTLY at import.
 _fastapi.Form = Form
+_fastapi.File = File
 _fastapi.BackgroundTasks = lancelot.BackgroundTasks
 _fastapi.Request = lancelot.Request
 from lancelot.websockets import WebSocket as _WS, WebSocketDisconnect as _WSD  # noqa: E402
@@ -42,6 +43,23 @@ import lancelot.status as _lstatus  # noqa: E402
 
 sys.modules["fastapi.status"] = _lstatus
 _fastapi.status = _lstatus
+# fastapi.exceptions / fastapi.middleware / fastapi.websockets submodule maps
+import lancelot.exceptions as _lexc  # noqa: E402
+
+sys.modules["fastapi.exceptions"] = _lexc
+_fastapi.exceptions = _lexc
+import lancelot.middleware as _lmw  # noqa: E402
+
+sys.modules["fastapi.middleware"] = _lmw
+_fastapi.middleware = _lmw
+# fastapi.middleware.cors / fastapi.middleware.trustedhost via the alias
+_mw_cors = types.ModuleType("fastapi.middleware.cors")
+_mw_cors.CORSMiddleware = _lmw.CORSMiddleware
+sys.modules["fastapi.middleware.cors"] = _mw_cors
+import lancelot.websockets as _lws  # noqa: E402
+
+sys.modules["fastapi.websockets"] = _lws
+_fastapi.websockets = _lws
 sys.modules["fastapi"] = _fastapi
 
 _tc = types.ModuleType("fastapi.testclient")
@@ -59,6 +77,10 @@ for _n in ("APIKeyHeader", "APIKeyQuery", "APIKeyCookie", "HTTPBearer",
     setattr(_sec, _n, getattr(_lsec, _n))
 sys.modules["fastapi.security"] = _sec
 _fastapi.security = _sec
+# SecurityScopes (FastAPI primitive; minimal stub — behavior ledgered)
+_sec.SecurityScopes = type("SecurityScopes", (),
+                           {"__init__": lambda self, scopes=None:
+                            setattr(self, "scopes", scopes or [])})
 from lancelot.params import Security as _Security  # noqa: E402
 
 _fastapi.Security = _Security

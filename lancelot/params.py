@@ -81,6 +81,7 @@ class File(Body):
 class Depends:
     dependency: typing.Callable
     use_cache: bool = True
+    scope: typing.Any = None  # FastAPI security-scopes wiring; ledgered
 
 
 @dataclass

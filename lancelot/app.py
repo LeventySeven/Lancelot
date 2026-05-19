@@ -113,6 +113,31 @@ class App:
 
         return deco
 
+    def api_route(self, path: str, *, methods=None, **kwargs):
+        """FastAPI's generic route decorator — registers one Route per
+        method in `methods` (default ['GET'])."""
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+
+        def deco(fn):
+            for m in (methods or ["GET"]):
+                self.router.add(Route(m.upper(), path, fn, **kw))
+            return fn
+
+        return deco
+
+    def add_api_route(self, path: str, endpoint, *, methods=None, **kwargs):
+        """Function-based registration (no decorator). Same kwargs as
+        api_route; default methods=['GET']."""
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+        for m in (methods or ["GET"]):
+            self.router.add(Route(m.upper(), path, endpoint, **kw))
+
     def get(self, p, **kw): return self._add("GET", p, **kw)
     def post(self, p, **kw): return self._add("POST", p, **kw)
     def put(self, p, **kw): return self._add("PUT", p, **kw)
