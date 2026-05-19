@@ -32,13 +32,26 @@ class App:
     def _register_builtin_routes(self):
         """OpenAPI JSON endpoint (doc UIs added in M1-P3 T8). FastAPI does the
         same — every app exposes /openapi.json."""
-        from lancelot.responses import JSONResponse
+        from lancelot.docs import redoc_html, scalar_html, swagger_ui_html
+        from lancelot.responses import HTMLResponse, JSONResponse
         from lancelot.validation import _wire_json
 
         def _openapi_json():
             return JSONResponse(_wire_json(self.openapi()))
 
+        def _docs():
+            return HTMLResponse(swagger_ui_html("/openapi.json", "Lancelot - Swagger UI"))
+
+        def _redoc():
+            return HTMLResponse(redoc_html("/openapi.json", "Lancelot - ReDoc"))
+
+        def _scalar():
+            return HTMLResponse(scalar_html("/openapi.json", "Lancelot - Scalar"))
+
         self.get("/openapi.json")(_openapi_json)
+        self.get("/docs")(_docs)
+        self.get("/redoc")(_redoc)
+        self.get("/scalar")(_scalar)
 
     # --- registration -----------------------------------------------------
     @property
