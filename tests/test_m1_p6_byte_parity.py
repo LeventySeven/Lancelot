@@ -161,3 +161,27 @@ def test_urlencoded_form_and_missing_field_match_fastapi():
         l2 = lc.post("/login", data={"username": "a"})
         assert l2.status_code == f2.status_code == 422
         assert l2.content == f2.content
+
+
+def test_p6_imports_and_dependency_light():
+    import lancelot
+
+    assert lancelot.WebSocket is not None
+    assert lancelot.WebSocketDisconnect is not None
+    assert lancelot.StaticFiles is not None
+
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, lancelot;"
+        "lancelot.WebSocket; lancelot.WebSocketDisconnect;"
+        "lancelot.StaticFiles;"
+        "bad=[m for m in ('starlette','fastapi','httpx','anyio',"
+        "'pydantic_settings','multipart','python_multipart') "
+        "if m in sys.modules];"
+        "print('CLEAN' if not bad else ('LEAK', bad))"
+    )
+    out = subprocess.run([sys.executable, "-c", code],
+                         capture_output=True, text=True)
+    assert out.stdout.strip() == "CLEAN", out.stdout + out.stderr

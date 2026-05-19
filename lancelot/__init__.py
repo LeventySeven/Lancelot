@@ -4,7 +4,8 @@ from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
 __all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient",
-           "BackgroundTasks", "background", "run", "_ping"]
+           "BackgroundTasks", "background", "WebSocket",
+           "WebSocketDisconnect", "StaticFiles", "run", "_ping"]
 __version__ = "0.0.0"
 
 
@@ -21,4 +22,12 @@ def __getattr__(name):
         from lancelot.background import BackgroundTasks
 
         return BackgroundTasks
+    if name in ("WebSocket", "WebSocketDisconnect"):
+        from lancelot import websockets
+
+        return getattr(websockets, name)
+    if name == "StaticFiles":
+        from lancelot.staticfiles import StaticFiles
+
+        return StaticFiles
     raise AttributeError(f"module 'lancelot' has no attribute {name!r}")
