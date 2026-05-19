@@ -25,3 +25,19 @@ _tc = types.ModuleType("fastapi.testclient")
 _tc.TestClient = RealTestClient
 sys.modules["fastapi.testclient"] = _tc
 _fastapi.testclient = _tc
+
+# fastapi.security -> lancelot.security (M1-P4)
+import lancelot.security as _lsec  # noqa: E402
+
+_sec = types.ModuleType("fastapi.security")
+for _n in ("APIKeyHeader", "APIKeyQuery", "APIKeyCookie", "HTTPBearer",
+           "HTTPBasic", "HTTPAuthorizationCredentials", "HTTPBasicCredentials",
+           "OAuth2", "OAuth2PasswordBearer", "OAuth2PasswordRequestForm"):
+    setattr(_sec, _n, getattr(_lsec, _n))
+sys.modules["fastapi.security"] = _sec
+_fastapi.security = _sec
+from lancelot.params import Security as _Security  # noqa: E402
+
+_fastapi.Security = _Security
+_fastapi.HTTPException = __import__(
+    "lancelot.exceptions", fromlist=["HTTPException"]).HTTPException
