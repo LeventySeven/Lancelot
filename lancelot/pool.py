@@ -1,0 +1,71 @@
+"""Bounded, GIL-friendly blocking pool (WBS U32 — "fixes the FastAPI
+cliff"). Stdlib only: the runtime dep set is `pydantic` (anyio is a
+TEST-only dep). Sync handlers/deps run HERE off the event loop; when the
+bounded inflight budget is exhausted the caller gets PoolFull, which the
+ASGI seam maps to a byte-exact 503 Retry-After (no silent hang — unlike
+FastAPI/anyio which backpressure at 40 and can stall the reactor).
+
+The Rust 3-variant Empty/Mono/Pool runner (src/blocking/runner.rs) and
+crossbeam BOUNDED(10_000) live with the spec §3-69 Rust-pipeline
+unification; this is the Python-ASGI-seam realization that the
+conformance/byte oracle actually exercises (ledger: conformance/vendor/
+quarantine/test_p5_longtail.py)."""
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+
+class PoolFull(Exception):
+    """Raised when the bounded inflight budget is exhausted. The ASGI seam
+    maps this to 503 + Retry-After (WBS U32 done-when)."""
+
+
+class BlockingPool:
+    def __init__(self, max_workers: int = 40, max_inflight: int = 10_000):
+        # FastAPI/anyio default thread budget is 40 — match it so default
+        # latency is on par; max_inflight is the queue ceiling (WBS:
+        # crossbeam BOUNDED(10_000)) that turns an overload into a 503
+        # instead of an unbounded backlog.
+        self._ex = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="lancelot-blocking")
+        self._max_inflight = max_inflight
+        self._inflight = 0
+        self._lock = threading.Lock()
+
+    async def offload(self, fn, /, *args, **kwargs):
+        with self._lock:
+            if self._inflight >= self._max_inflight:
+                raise PoolFull()
+            self._inflight += 1
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                self._ex, lambda: fn(*args, **kwargs))
+        finally:
+            with self._lock:
+                self._inflight -= 1
+
+    def shutdown(self):
+        self._ex.shutdown(wait=False, cancel_futures=True)
+
+
+_DEFAULT: "BlockingPool | None" = None
+_DEFAULT_LOCK = threading.Lock()
+
+
+def get_pool() -> BlockingPool:
+    global _DEFAULT
+    if _DEFAULT is None:
+        with _DEFAULT_LOCK:
+            if _DEFAULT is None:
+                _DEFAULT = BlockingPool()
+    return _DEFAULT
+
+
+def configure(*, max_workers: int = 40, max_inflight: int = 10_000) -> None:
+    global _DEFAULT
+    with _DEFAULT_LOCK:
+        if _DEFAULT is not None:
+            _DEFAULT.shutdown()
+        _DEFAULT = BlockingPool(max_workers=max_workers,
+                                max_inflight=max_inflight)
