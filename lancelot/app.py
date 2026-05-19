@@ -42,6 +42,14 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._register_builtin_routes()
 
+    async def __call__(self, scope, receive, send):
+        """FastAPI/Starlette parity: `App` is directly callable as ASGI.
+        `TestClient(app)` from starlette/anywhere works without an explicit
+        `app.asgi()` unwrap. Internally lazy-builds the wrapped ASGI callable."""
+        if self._asgi is None:
+            self._asgi = self.asgi()
+        await self._asgi(scope, receive, send)
+
     def mount(self, prefix: str, app) -> None:
         """Mount a sub-ASGI app (e.g. StaticFiles) at a path prefix —
         Starlette's Mount shape. The dispatcher strips the prefix from

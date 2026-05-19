@@ -29,7 +29,10 @@ def _field_schema(fi) -> dict:
     # (non-$ref) schemas (MUST-26); $ref schemas get no injected title.
     s = TypeAdapter(fi.annotation).json_schema(ref_template=_REF_TEMPLATE)
     if "$ref" not in s and "title" not in s:
-        s["title"] = fi.name.replace("_", " ").title()
+        # FastAPI title uses the alias when present (so test_list expects
+        # "P Alias" from alias='p_alias', not "P" from name='p').
+        _title_src = fi.alias or fi.name
+        s["title"] = _title_src.replace("_", " ").title()
     # Optional params carry their default in the schema (FastAPI/pydantic).
     if not fi.required and fi.default is not None and "default" not in s:
         s["default"] = fi.default
