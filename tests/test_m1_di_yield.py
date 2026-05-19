@@ -37,3 +37,35 @@ def test_yield_teardown_after_response_and_reverse_order():
     asyncio.new_event_loop().run_until_complete(go())
     assert events == ["outer-setup", "inner-setup", "handler",
                       "response-sent", "inner-teardown", "outer-teardown"]
+
+
+def test_handler_exception_propagates_into_yield_dep_and_500s():
+    """B4 (DoD #4): a raising handler must throw the exception INTO the
+    yield-dep generator (so `except:`/`finally:` rollback runs) and the
+    request must 500, not crash/200."""
+    import lancelot
+    from lancelot.testclient import TestClient
+    from lancelot.params import Depends
+
+    seen = []
+
+    def db():
+        try:
+            yield "session"
+        except RuntimeError:
+            seen.append("rolled-back")
+            raise
+        finally:
+            seen.append("closed")
+
+    app = lancelot.App()
+
+    @app.get("/boom")
+    def boom(s: str = Depends(db)):
+        raise RuntimeError("handler blew up")
+
+    with TestClient(app) as c:
+        r = c.get("/boom")
+    assert r.status_code == 500
+    assert "rolled-back" in seen  # exception WAS thrown into the generator
+    assert seen[-1] == "closed"   # finally still ran

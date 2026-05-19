@@ -16,8 +16,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def run() -> tuple[int, int]:
     vendor = ROOT / "conformance" / "vendor"
+    # The ratchet gates the ACTIVE corpus only. Not-yet-implemented seed tests
+    # live in conformance/vendor/quarantine/ (RED-first, excluded from the
+    # ratio) and graduate into vendor/ when the feature lands — so a sub-plan
+    # can follow RED-first discipline without the "parity may only rise"
+    # ratchet hard-failing CI. (Review fix: floor=100 was P3-blocking.)
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(vendor)],
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--ignore", str(vendor / "quarantine"), str(vendor)],
         cwd=str(ROOT),
         capture_output=True,
         text=True,

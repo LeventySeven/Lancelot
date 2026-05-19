@@ -2,9 +2,8 @@
 conformance/test driver (deliberately NOT the fast path; spec §2,
 harness-design §1.2)."""
 import inspect
-import json as _json
 
-from lancelot import _native
+_MAX_BODY = 16 * 1024 * 1024  # 16 MiB cap on the ASGI migration path (A4)
 
 
 def build_asgi(app):
@@ -58,6 +57,7 @@ class _AppProxy:
         self._app = app
         self.state = app.state
         self.dependency_overrides = app.dependency_overrides
+        self.override_plans = app._override_plans  # per-app cache (A2)
         self.router = app.router
 
     def openapi(self):
@@ -88,7 +88,7 @@ async def _http(app, scope, receive, send):
 
     from lancelot.di import solve_async
     from lancelot.requests import Request as LRequest
-    from lancelot.validation import errors_to_422
+    from lancelot.validation import errors_to_422, _wire_json
 
     # Drain the body (ASGI more_body streaming). NOTE: no max-body cap yet —
     # tracked P-any security carry-forward (the ASGI path is the migration
@@ -99,6 +99,9 @@ async def _http(app, scope, receive, send):
         if msg["type"] == "http.disconnect":
             return
         body += msg.get("body", b"")
+        if len(body) > _MAX_BODY:  # A4: bound the migration-path body (DoS)
+            await _send_json(send, 413, b'{"detail":"Request entity too large"}')
+            return
         if not msg.get("more_body", False):
             break
 
@@ -119,23 +122,31 @@ async def _http(app, scope, receive, send):
 
     # Handler call + response MUST be inside the solve_async context so
     # yield-dependency teardown runs AFTER the response (PEP-789, deep/01 §5).
-    async with solve_async(route.plan, lreq) as res:
-        errs = list(res.errors) + body_errors
-        if errs:
-            status, out = errors_to_422(errs)
-            await _send_json(send, status, out)
-            return
-        kwargs = dict(res.kwargs)
-        if route.body is not None:
-            kwargs[route.body[0]] = body_value
-        result = route.handler(**kwargs)
-        if inspect.isawaitable(result):
-            result = await result
-        try:
-            out = bytes(_native._to_json(result))
-        except Exception:  # noqa: BLE001 - fallback keeps the spine robust
-            out = _json.dumps(result).encode()
-        await _send_json(send, 200, out)
+    # A handler/dep exception propagates through solve_async (which feeds the
+    # real exc_info into the yield-dep AsyncExitStack so `except:`/`finally:`
+    # rollback runs — B4) and is mapped to 500 here so it never escapes the
+    # ASGI callable (A5).
+    sent = False
+    try:
+        async with solve_async(route.plan, lreq) as res:
+            errs = list(res.errors) + body_errors
+            if errs:
+                status, out = errors_to_422(errs)
+                await _send_json(send, status, out)
+                sent = True
+                return
+            kwargs = dict(res.kwargs)
+            if route.body is not None:
+                kwargs[route.body[0]] = body_value
+            result = route.handler(**kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            payload = _wire_json(result)
+            await _send_json(send, 200, payload)
+            sent = True
+    except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
+        if not sent:
+            await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
 
 
 async def _send_json(send, status: int, body: bytes):

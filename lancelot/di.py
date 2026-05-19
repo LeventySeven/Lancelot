@@ -16,7 +16,6 @@ class SubDep:
     call: typing.Callable
     plan: "Plan"
     use_cache: bool
-    cache_slot: int
     param_name: str  # parent param this dep binds to (recorded at COMPILE time
     #                  so solve() never re-introspects a signature — U15)
 
@@ -33,8 +32,7 @@ class Plan:
         return next(f for f in self.fields if f.name == name)
 
 
-def compile_dependant(fn: typing.Callable, _slots=None, path_params=()) -> Plan:
-    slots = _slots if _slots is not None else [0]
+def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
     hints = typing.get_type_hints(fn, include_extras=True)
     sig = inspect.signature(fn)
     fields, validators, deps = [], {}, []
@@ -49,11 +47,9 @@ def compile_dependant(fn: typing.Callable, _slots=None, path_params=()) -> Plan:
                 if isinstance(m, Depends):
                     dep_marker = m
         if dep_marker is not None:
-            sub = compile_dependant(dep_marker.dependency, slots, path_params)
-            slot = slots[0]
-            slots[0] += 1
+            sub = compile_dependant(dep_marker.dependency, path_params)
             deps.append(
-                SubDep(dep_marker.dependency, sub, dep_marker.use_cache, slot, name)
+                SubDep(dep_marker.dependency, sub, dep_marker.use_cache, name)
             )
             continue
         fi = extract_field(name, ann, default, path_params)
@@ -86,21 +82,24 @@ def _raw_for(fi, request):
     return request.body, bool(request.body)  # body handled at the ASGI seam (T11)
 
 
-_OVERRIDE_PLANS: dict = {}
-
-
 def _resolve_dep(sub: SubDep, request):
     """Apply request.app.dependency_overrides (deep/01 §4.4). The override's
-    own signature is compiled once (memoized). The use_cache key stays the
-    ORIGINAL dependency (FastAPI caches by the original, not the override)."""
-    ov = getattr(getattr(request, "app", None), "dependency_overrides", None) or {}
+    own signature is compiled once and memoized on a PER-APP store
+    (request.app.override_plans) — never a process-global (no unbounded
+    cross-app cache leak; A2). The use_cache key stays the ORIGINAL
+    dependency (FastAPI caches by the original, not the override)."""
+    app = getattr(request, "app", None)
+    ov = getattr(app, "dependency_overrides", None) or {}
     target = ov.get(sub.call, sub.call)
     if target is sub.call:
         return target, sub.plan
-    p = _OVERRIDE_PLANS.get(target)
+    store = getattr(app, "override_plans", None)
+    if store is None:  # bare/test app object without an override-plan store
+        return target, compile_dependant(target)
+    p = store.get(target)
     if p is None:
         p = compile_dependant(target)
-        _OVERRIDE_PLANS[target] = p
+        store[target] = p
     return target, p
 
 
@@ -139,19 +138,6 @@ def _is_gen_dep(call):
 
 
 @contextlib.asynccontextmanager
-async def _sync_gen_cm(genfn, /, **kw):
-    gen = genfn(**kw)
-    val = next(gen)
-    try:
-        yield val
-    finally:
-        try:
-            next(gen)
-        except StopIteration:
-            pass
-
-
-@contextlib.asynccontextmanager
 async def solve_async(plan: Plan, request, _cache=None, _stack=None):
     """Like solve(), but `yield`-dependencies are entered as (async) context
     managers on a SHARED AsyncExitStack so their teardown runs AFTER the
@@ -174,14 +160,16 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 if sr.errors:
                     errors.extend(sr.errors)
                     continue
-                if _is_gen_dep(target):
-                    cm = (
-                        contextlib.asynccontextmanager(target)
-                        if inspect.isasyncgenfunction(target)
-                        else _sync_gen_cm
+                if inspect.isasyncgenfunction(target):
+                    val = await stack.enter_async_context(
+                        contextlib.asynccontextmanager(target)(**sr.kwargs)
                     )
-                    arg = (target,) if cm is _sync_gen_cm else ()
-                    val = await stack.enter_async_context(cm(*arg, **sr.kwargs))
+                elif inspect.isgeneratorfunction(target):
+                    # stdlib @contextmanager.__exit__ does gen.throw(exc) on
+                    # error → the dep's `except:`/`finally:` rollback runs (B4).
+                    val = stack.enter_context(
+                        contextlib.contextmanager(target)(**sr.kwargs)
+                    )
                 else:
                     val = target(**sr.kwargs)
             if sub.use_cache:
@@ -195,6 +183,14 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
             else:
                 kwargs[fi.name] = value
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
-    finally:
+    except BaseException as exc:
+        # B4: the handler (or a dep) raised inside the `async with` body.
+        # Feed the REAL exc_info to the stack so each yield-dep's generator
+        # gets the exception thrown in at its `yield` (its `except:`/`finally:`
+        # rollback runs — PEP-789 / deep/01 §5), then re-raise.
+        if own:
+            await stack.__aexit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
         if own:
             await stack.__aexit__(None, None, None)  # teardown AFTER response

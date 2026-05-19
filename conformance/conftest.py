@@ -8,10 +8,17 @@ import types
 
 import lancelot
 from conformance.swap import RealTestClient
+from lancelot.params import Depends, Query, Path, Header, Cookie, Body
 
 _fastapi = types.ModuleType("fastapi")
 _fastapi.FastAPI = lancelot.App
 _fastapi.APIRouter = lancelot.APIRouter
+_fastapi.Depends = Depends
+_fastapi.Query = Query
+_fastapi.Path = Path
+_fastapi.Header = Header
+_fastapi.Cookie = Cookie
+_fastapi.Body = Body
 sys.modules["fastapi"] = _fastapi
 
 _tc = types.ModuleType("fastapi.testclient")

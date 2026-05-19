@@ -55,12 +55,19 @@ def _regenerate(exc: ValidationError, loc_prefix):
     url stripped (include_url=False), loc left-prefixed (deep/01 §0.2)."""
     out = []
     for err in exc.errors(include_url=False):
+        inp = err.get("input")
+        if isinstance(inp, (bytes, bytearray)):
+            inp = {}  # defensive: never let raw bytes reach the JSON serializer
         e = {"type": err["type"],
              "loc": list(loc_prefix) + list(err.get("loc", ())),
              "msg": err["msg"],
-             "input": err.get("input")}
+             "input": inp}
         if "ctx" in err:
-            e["ctx"] = err["ctx"]
+            ctx = dict(err["ctx"])
+            for k, v in list(ctx.items()):
+                if isinstance(v, (bytes, bytearray)):
+                    ctx[k] = v.decode("utf-8", "replace")
+            e["ctx"] = ctx
         out.append(e)
     return out
 
@@ -76,9 +83,24 @@ class BodyValidator:
 
     def validate_json(self, raw: bytes):
         try:
-            return self._adapter.validate_json(raw), []
+            return self._adapter.validate_json(raw), []  # single pass (valid path)
         except ValidationError as e:
-            return None, _regenerate(e, ["body"])
+            errs = _regenerate(e, ["body"])
+            # Malformed JSON: FastAPI synthesizes this from STDLIB json
+            # (json.loads → JSONDecodeError), not pydantic-core, so the
+            # msg/pos/ctx are byte-identical only if we do the same. The
+            # extra json.loads is on the error path only (valid bodies stay
+            # single-pass, per spec §2).
+            if any(x["type"] == "json_invalid" for x in errs):
+                try:
+                    _json.loads(raw)
+                except _json.JSONDecodeError as je:
+                    return None, [{"type": "json_invalid",
+                                   "loc": ["body", je.pos],
+                                   "msg": "JSON decode error",
+                                   "input": {},
+                                   "ctx": {"error": je.msg}}]
+            return None, errs
 
 
 def compile_validator(fi: FieldInfo) -> ParamValidator:
@@ -99,5 +121,21 @@ def collect_errors(items):
     return out
 
 
+def _wire_json(obj) -> bytes:
+    """The ONE wire serializer — byte-identical to Starlette/FastAPI's
+    JSONResponse (compact separators, ensure_ascii=False, allow_nan=False).
+    Routes through the Rust pydantic-core seam (same as the 200 path) so the
+    422 bytes provably cannot drift from the success bytes; stdlib fallback
+    uses the exact Starlette flags."""
+    try:
+        from lancelot import _native
+
+        return bytes(_native._to_json(obj))
+    except Exception:  # noqa: BLE001
+        return _json.dumps(
+            obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+
+
 def errors_to_422(errors: list) -> tuple[int, bytes]:
-    return 422, _json.dumps({"detail": errors}).encode()
+    return 422, _wire_json({"detail": errors})

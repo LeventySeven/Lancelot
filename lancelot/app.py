@@ -23,6 +23,7 @@ class App:
         self.router = Router()
         self.state = State()
         self.dependency_overrides: dict = {}
+        self._override_plans: dict = {}  # per-app compiled override plans (A2)
         self._lifespan = lifespan
         self._asgi = None
 
