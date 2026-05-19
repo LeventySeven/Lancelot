@@ -215,8 +215,17 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                     val = stack.enter_context(
                         contextlib.contextmanager(target)(**sr.kwargs)
                     )
+                elif inspect.iscoroutinefunction(target):
+                    val = await target(**sr.kwargs)
                 else:
-                    val = target(**sr.kwargs)
+                    # Plain sync dep → bounded blocking pool, never the
+                    # loop (FastAPI solve_dependencies uses run_in_threadpool
+                    # for sync deps too). Generator/async-gen yield-deps
+                    # above stay on the loop so the AsyncExitStack /
+                    # gen.throw teardown semantics (M1-P2 B4) are preserved.
+                    from lancelot.pool import get_pool
+
+                    val = await get_pool().offload(target, **sr.kwargs)
             if sub.use_cache:
                 cache[sub.call] = val
             kwargs[sub.param_name] = val

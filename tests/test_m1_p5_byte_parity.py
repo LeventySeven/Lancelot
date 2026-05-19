@@ -81,3 +81,51 @@ def test_sync_handlers_run_concurrently_and_bytes_match_fastapi():
 
     elapsed = asyncio.run(hammer(lapp.asgi()))
     assert elapsed < 1.5, f"sync handlers serialized: {elapsed:.2f}s"
+
+
+def test_sync_dependency_offloaded_and_bytes_match_fastapi():
+    import fastapi
+    from fastapi.testclient import TestClient as FA
+    import httpx
+    import lancelot
+    from lancelot.testclient import TestClient as LC
+    from lancelot.params import Depends as LDepends
+
+    def build(F):
+        is_fa = hasattr(F, "FastAPI")
+        app = F.FastAPI() if is_fa else F.App()
+        Dep = F.Depends if is_fa else LDepends
+
+        def slow_dep():               # SYNC dependency
+            time.sleep(0.25)
+            return {"d": 1}
+
+        @app.get("/d")
+        def d(v=Dep(slow_dep)):
+            return v
+
+        return app
+
+    with FA(build(fastapi)) as fa, LC(build(lancelot)) as lc:
+        f, l = fa.get("/d"), lc.get("/d")
+        assert l.status_code == f.status_code == 200
+        assert l.content == f.content
+
+    lapp = lancelot.App()
+
+    def slow_dep2():
+        time.sleep(0.25)
+        return {"d": 1}
+
+    @lapp.get("/d")
+    def d2(v=LDepends(slow_dep2)):
+        return v
+
+    async def hammer():
+        tr = httpx.ASGITransport(app=lapp.asgi())
+        async with httpx.AsyncClient(transport=tr, base_url="http://t") as c:
+            t0 = time.perf_counter()
+            await asyncio.gather(*[c.get("/d") for _ in range(8)])
+            return time.perf_counter() - t0
+
+    assert asyncio.run(hammer()) < 1.5, "sync deps serialized"
