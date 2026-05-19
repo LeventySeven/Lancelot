@@ -26,6 +26,13 @@ pool. RED here = the parts NOT in M1-P5 scope:
      changed the function-handler offload path; the M1-P5 review caught
      this via the byte oracle). Belongs with the DI/U15-U18 surface
      work; ledgered honestly rather than silently narrowed.
+  5. Post-send background-task exceptions: byte/observable parity holds
+     (wire is 200, the yield-dep teardown still sees the exception, same
+     as FastAPI), but Lancelot's A5 seam (`asgi.py` `except Exception`)
+     silently absorbs the post-send failure whereas FastAPI lets it
+     propagate so the server LOGS it. The only divergence is server-side
+     error visibility/logging — that is U35 (M3 JSON-logs/observability),
+     not M1; recorded so it is not hidden.
 Graduate into conformance/vendor/ as M3 + the §3-69 unification land."""
 import pytest
 
