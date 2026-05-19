@@ -28,6 +28,7 @@ class Route:
     path: str
     handler: Callable[..., Any]
     name: str = ""
+    include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
 
     def __post_init__(self):
         self.method = self.method.upper()

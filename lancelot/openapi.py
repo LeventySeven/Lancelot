@@ -30,6 +30,9 @@ def _field_schema(fi) -> dict:
     s = TypeAdapter(fi.annotation).json_schema(ref_template=_REF_TEMPLATE)
     if "$ref" not in s and "title" not in s:
         s["title"] = fi.name.replace("_", " ").title()
+    # Optional params carry their default in the schema (FastAPI/pydantic).
+    if not fi.required and fi.default is not None and "default" not in s:
+        s["default"] = fi.default
     return s
 
 
@@ -84,6 +87,8 @@ _VALIDATION_ERROR = {
                 "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
         "msg": {"title": "Message", "type": "string"},
         "type": {"title": "Error Type", "type": "string"},
+        "input": {"title": "Input"},
+        "ctx": {"title": "Context", "type": "object"},
     },
     "required": ["loc", "msg", "type"],
 }
@@ -145,6 +150,8 @@ def components_schemas(app) -> dict:
 def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
     paths: dict = {}
     for r in app.routes:
+        if not getattr(r, "include_in_schema", True):
+            continue  # FastAPI: /docs /redoc /openapi.json are not self-documented
         op = {"summary": summary(r), "operationId": operation_id(r)}
         ps = parameters_for(r)
         if ps:

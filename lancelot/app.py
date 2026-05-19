@@ -19,7 +19,9 @@ class State:
 
 
 class App:
-    def __init__(self, lifespan=None):
+    def __init__(self, lifespan=None, title="Lancelot", version="0.1.0"):
+        self.title = title
+        self.version = version
         self.router = Router()
         self.state = State()
         self.dependency_overrides: dict = {}
@@ -48,10 +50,9 @@ class App:
         def _scalar():
             return HTMLResponse(scalar_html("/openapi.json", "Lancelot - Scalar"))
 
-        self.get("/openapi.json")(_openapi_json)
-        self.get("/docs")(_docs)
-        self.get("/redoc")(_redoc)
-        self.get("/scalar")(_scalar)
+        for path, fn in (("/openapi.json", _openapi_json), ("/docs", _docs),
+                         ("/redoc", _redoc), ("/scalar", _scalar)):
+            self.router.add(Route("GET", path, fn, include_in_schema=False))
 
     # --- registration -----------------------------------------------------
     @property
@@ -85,7 +86,9 @@ class App:
         if self._openapi_cache is None:
             from lancelot.openapi import build_openapi
 
-            self._openapi_cache = build_openapi(self)
+            self._openapi_cache = build_openapi(
+                self, title=self.title, version=self.version
+            )
         return self._openapi_cache
 
     def asgi(self):
