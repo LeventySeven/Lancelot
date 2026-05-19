@@ -8,7 +8,9 @@ class Response:
     def __init__(self, content=b"", status_code=200, media_type=None):
         self.status_code = status_code
         if media_type:
-            self.media_type = media_type
+            # A3: never let CRLF in a (potentially user-set) media_type
+            # inject response headers at the ASGI seam.
+            self.media_type = media_type.replace("\r", "").replace("\n", "")
         self.body = (
             content if isinstance(content, (bytes, bytearray))
             else str(content).encode()

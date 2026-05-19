@@ -1,13 +1,18 @@
-"""OpenAPI moat: build the SAME app on real FastAPI and Lancelot, compare
-/openapi.json. Lancelot's document is **structurally identical** to
-FastAPI's (every value byte-identical; this is exactly the bar FastAPI's
-OWN test-suite holds — dict equality, order-insensitive, deep/03 §3.5).
+"""OpenAPI moat — HONEST SCOPE (corrected after the M1-P3 review's
+broadened oracle): for the **covered subset** — flat required-field
+pydantic models + scalar params with non-None defaults, no Optional
+model fields, no list/set/tuple body, no header/cookie params —
+Lancelot's /openapi.json is **structurally identical** to real FastAPI
+(every value equal; FastAPI's own dict-equality bar, deep/03 §3.5).
 
-The stricter RAW-wire key-order of pydantic-generated component schemas
-(FastAPI re-emits them through its openapi.models.Schema model →
-`type` before `title`; vanilla pydantic gives `title` first) is a tracked
-P7 ratchet item — quarantined as conformance/vendor/quarantine/, NOT
-silently passing."""
+KNOWN divergences OUTSIDE the covered subset, all P7-ledgered &
+quarantined (conformance/vendor/quarantine/test_openapi_value_divergences.py
++ test_openapi_schema_byte_order.py), NOT silently passing:
+  1. raw-wire key order of pydantic component schemas (type-vs-title);
+  2. Optional model field `x: T|None = None` → extra `"default": null`;
+  3. list/set/tuple request-body array schema missing `"title"`;
+  4. header/cookie param `schema.title` from name not converted alias.
+This test asserts ONLY the covered subset (which is genuinely identical)."""
 import pydantic
 import fastapi
 from fastapi.testclient import TestClient as FA
