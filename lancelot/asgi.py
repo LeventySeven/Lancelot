@@ -240,7 +240,32 @@ async def _http(app, scope, receive, send):
                 if lreq._background._tasks:
                     await lreq._background()
                 return
-            payload = _wire_json(result)
+            # FastAPI response_model: validate-coerce-and-serialize the
+            # return value through pydantic, honouring by_alias / exclude_*
+            # kwargs (default by_alias=True; the rest default False).
+            if route.response_model is not None:
+                from pydantic import TypeAdapter, ValidationError
+
+                try:
+                    _ta = TypeAdapter(route.response_model)
+                    _val = _ta.validate_python(result)
+                    payload = _ta.dump_json(
+                        _val,
+                        by_alias=route.response_model_by_alias,
+                        exclude_unset=route.response_model_exclude_unset,
+                        exclude_defaults=route.response_model_exclude_defaults,
+                        exclude_none=route.response_model_exclude_none,
+                        include=route.response_model_include,
+                        exclude=route.response_model_exclude,
+                    )
+                except ValidationError:
+                    # FastAPI 500: response-model coercion failure.
+                    await _send_json(send, 500,
+                                     b'{"detail":"Internal Server Error"}')
+                    sent = True
+                    return
+            else:
+                payload = _wire_json(result)
             # FastAPI: @app.post(..., status_code=201) sets default response
             # status when the handler returns a value (not a Response).
             default_status = route.status_code or 200

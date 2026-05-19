@@ -33,6 +33,12 @@ class Route:
     status_code: int | None = None  # FastAPI default response status
     # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
     response_model: Any = None
+    response_model_include: Any = None
+    response_model_exclude: Any = None
+    response_model_by_alias: bool = True
+    response_model_exclude_unset: bool = False
+    response_model_exclude_defaults: bool = False
+    response_model_exclude_none: bool = False
     response_class: Any = None
     responses: dict | None = None
     operation_id: str | None = None
