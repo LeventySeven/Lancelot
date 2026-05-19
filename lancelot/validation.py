@@ -38,7 +38,12 @@ class ParamValidator:
     def validate(self, raw, *, present: bool):
         """Returns (value, errors). errors == [] on success. `present` is False
         when the param was absent (→ missing vs coercion failure)."""
-        loc_prefix = [self.fi.marker.in_, self.fi.alias or self.fi.name]
+        # FastAPI: form/file params share the body loc bucket — a bare
+        # scalar Form error is loc=["body","<name>"] (deep/01 §1 / MUST-6),
+        # not ["form",...]. query/path/header/cookie keep their own bucket.
+        _src = self.fi.marker.in_
+        _bucket = "body" if _src in ("form", "file", "body") else _src
+        loc_prefix = [_bucket, self.fi.alias or self.fi.name]
         if not present:
             if self.fi.required:
                 return None, [{"type": "missing", "loc": loc_prefix,

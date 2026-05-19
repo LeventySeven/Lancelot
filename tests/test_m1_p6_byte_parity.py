@@ -133,3 +133,31 @@ def test_settings_provider_cached_and_missing_env_boot_crash(monkeypatch):
     monkeypatch.delenv("PORT", raising=False)
     with pytest.raises(Exception):           # missing required env at BUILD
         settings_provider(S, eager=True)()
+
+
+def test_urlencoded_form_and_missing_field_match_fastapi():
+    import fastapi
+    from fastapi import Form
+    from fastapi.testclient import TestClient as FA
+    import lancelot
+    from lancelot.params import Form as LForm
+    from lancelot.testclient import TestClient as LC
+
+    def build(F, Fm):
+        app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+        @app.post("/login")
+        def login(username: str = Fm(), password: str = Fm()):
+            return {"u": username}
+
+        return app
+
+    with FA(build(fastapi, Form)) as fa, LC(build(lancelot, LForm)) as lc:
+        f = fa.post("/login", data={"username": "a", "password": "b"})
+        l = lc.post("/login", data={"username": "a", "password": "b"})
+        assert l.status_code == f.status_code == 200
+        assert l.content == f.content
+        f2 = fa.post("/login", data={"username": "a"})  # missing password
+        l2 = lc.post("/login", data={"username": "a"})
+        assert l2.status_code == f2.status_code == 422
+        assert l2.content == f2.content

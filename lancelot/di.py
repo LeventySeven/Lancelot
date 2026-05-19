@@ -123,6 +123,27 @@ def _raw_for(fi, request):
         return h.get(k), k in h
     if src == "cookie":
         return request.cookies.get(key), key in request.cookies
+    if src == "form":
+        # application/x-www-form-urlencoded only (stdlib — no runtime dep).
+        # multipart/form-data + UploadFile is ledgered (needs
+        # python-multipart). Parsed once per request, cached.
+        form = getattr(request, "_form_cache", None)
+        if form is None:
+            import urllib.parse
+
+            ct = ""
+            for hk, hv in request.headers.items():
+                if hk.lower() == "content-type":
+                    ct = hv
+                    break
+            if "application/x-www-form-urlencoded" in ct:
+                parsed = urllib.parse.parse_qs(
+                    request.body.decode("latin-1"))
+                form = {k: v[-1] for k, v in parsed.items()}
+            else:
+                form = {}
+            request._form_cache = form
+        return form.get(key), key in form
     return request.body, bool(request.body)  # body handled at the ASGI seam (T11)
 
 
