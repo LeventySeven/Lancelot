@@ -40,3 +40,44 @@ def test_pool_runs_off_the_event_loop_and_bounds_inflight():
         asyncio.run(main())
     finally:
         pool.shutdown()
+
+
+def test_sync_handlers_run_concurrently_and_bytes_match_fastapi():
+    import fastapi
+    from fastapi.testclient import TestClient as FA
+    import httpx
+    import lancelot
+    from lancelot.testclient import TestClient as LC
+
+    def build(F):
+        app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+        @app.get("/slow")
+        def slow():                       # SYNC handler
+            time.sleep(0.25)
+            return {"ok": True}
+
+        return app
+
+    with FA(build(fastapi)) as fa, LC(build(lancelot)) as lc:
+        f, l = fa.get("/slow"), lc.get("/slow")
+        assert l.status_code == f.status_code == 200
+        assert l.content == f.content
+
+    lapp = lancelot.App()
+
+    @lapp.get("/slow")
+    def slow2():
+        time.sleep(0.25)
+        return {"ok": True}
+
+    async def hammer(app_callable):
+        transport = httpx.ASGITransport(app=app_callable)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://t") as c:
+            t0 = time.perf_counter()
+            await asyncio.gather(*[c.get("/slow") for _ in range(8)])
+            return time.perf_counter() - t0
+
+    elapsed = asyncio.run(hammer(lapp.asgi()))
+    assert elapsed < 1.5, f"sync handlers serialized: {elapsed:.2f}s"

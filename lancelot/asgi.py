@@ -88,6 +88,7 @@ async def _http(app, scope, receive, send):
 
     from lancelot.di import solve_async
     from lancelot.exceptions import HTTPException
+    from lancelot.pool import get_pool
     from lancelot.requests import Request as LRequest
     from lancelot.validation import errors_to_422, _wire_json
 
@@ -142,9 +143,14 @@ async def _http(app, scope, receive, send):
             kwargs = dict(res.kwargs)
             if route.body is not None:
                 kwargs[route.body[0]] = body_value
-            result = route.handler(**kwargs)
-            if inspect.isawaitable(result):
-                result = await result
+            # Sync handlers run on the bounded blocking pool so they never
+            # pin the reactor (WBS U32 — the FastAPI cliff). Async handlers
+            # are awaited directly. is_async is decided at COMPILE time
+            # (Plan.is_async), so a sync fn never runs on the loop thread.
+            if route.plan.is_async:
+                result = await route.handler(**kwargs)
+            else:
+                result = await get_pool().offload(route.handler, **kwargs)
             from lancelot.responses import Response
 
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
