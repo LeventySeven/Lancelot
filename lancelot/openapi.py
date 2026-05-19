@@ -65,17 +65,38 @@ def _model_name(model) -> str:
     return re.sub(r"[^a-zA-Z0-9.\-_]", "_", nm)
 
 
+def _embed_body_fields(route):
+    """Return the in-plan body-embed scalar fields (Body(embed=True)).
+    FastAPI synthesizes a `Body_<operation_id>` schema containing them."""
+    return [fi for fi in route.plan.fields
+            if getattr(fi.marker, "in_", None) == "body"
+            and getattr(fi.marker, "embed", False)]
+
+
+def _embed_body_schema_name(route):
+    return f"Body_{operation_id(route)}"
+
+
 def request_body_for(route):
-    if route.body is None:
-        return None
-    model = route.body[1]._model
-    origin = typing.get_origin(model)
-    if origin in (list, set, frozenset, tuple):
-        schema = {"type": "array",
-                  "items": {"$ref": f"#/components/schemas/{_model_name(model)}"}}
-    else:
-        schema = {"$ref": f"#/components/schemas/{_model_name(model)}"}
-    return {"content": {"application/json": {"schema": schema}}, "required": True}
+    if route.body is not None:
+        model = route.body[1]._model
+        origin = typing.get_origin(model)
+        if origin in (list, set, frozenset, tuple):
+            schema = {"type": "array",
+                      "items": {"$ref":
+                                f"#/components/schemas/{_model_name(model)}"}}
+        else:
+            schema = {"$ref": f"#/components/schemas/{_model_name(model)}"}
+        return {"content": {"application/json": {"schema": schema}},
+                "required": True}
+    # FastAPI Body(embed=True) → synthetic Body_<operation_id> schema in
+    # components; requestBody $refs it.
+    embedded = _embed_body_fields(route)
+    if embedded:
+        return {"content": {"application/json": {"schema": {
+            "$ref": f"#/components/schemas/{_embed_body_schema_name(route)}"
+        }}}, "required": True}
+    return None
 
 
 # Verbatim FastAPI consts (deep/03 §4.3 / openapi/utils.py:42-69).
@@ -153,6 +174,26 @@ def components_schemas(app) -> dict:
         inputs = [(m, "validation", TypeAdapter(m).core_schema) for m in models]
         _, definitions = gen.generate_definitions(inputs=inputs)
         defs.update(definitions)
+    # Synthesize Body_<operation_id> schemas for routes with embed=True
+    # scalar body params (FastAPI parity for Annotated[T, Body(embed=True)]).
+    for r in app.routes:
+        if not getattr(r, "include_in_schema", True):
+            continue
+        embedded = _embed_body_fields(r)
+        if not embedded:
+            continue
+        props = {}
+        required = []
+        for fi in embedded:
+            key = fi.alias or fi.name
+            props[key] = _field_schema(fi)
+            if fi.required:
+                required.append(key)
+        name = _embed_body_schema_name(r)
+        schema = {"properties": props, "type": "object", "title": name}
+        if required:
+            schema["required"] = required
+        defs[name] = schema
     if any(_has_params_or_body(r) for r in app.routes):
         defs["ValidationError"] = _VALIDATION_ERROR
         defs["HTTPValidationError"] = _HTTP_VALIDATION_ERROR
