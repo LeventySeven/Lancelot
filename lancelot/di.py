@@ -27,15 +27,26 @@ class Plan:
     validators: dict  # name -> ParamValidator
     dependencies: list  # list[SubDep], topological order
     is_async: bool
+    security: list = None  # list[(SecurityBase, scopes_tuple)] for OpenAPI
+
+    def __post_init__(self):
+        if self.security is None:
+            self.security = []
 
     def field(self, name):
         return next(f for f in self.fields if f.name == name)
 
 
+def _is_security(obj) -> bool:
+    from lancelot.security import SecurityBase
+
+    return isinstance(obj, SecurityBase)
+
+
 def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
     hints = typing.get_type_hints(fn, include_extras=True)
     sig = inspect.signature(fn)
-    fields, validators, deps = [], {}, []
+    fields, validators, deps, security = [], {}, [], []
     for name, p in sig.parameters.items():
         ann = hints.get(
             name, p.annotation if p.annotation is not inspect.Parameter.empty else str
@@ -47,15 +58,24 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
                 if isinstance(m, Depends):
                     dep_marker = m
         if dep_marker is not None:
-            sub = compile_dependant(dep_marker.dependency, path_params)
-            deps.append(
-                SubDep(dep_marker.dependency, sub, dep_marker.use_cache, name)
-            )
+            dep = dep_marker.dependency
+            if _is_security(dep):
+                # A security scheme is invoked directly with the Request —
+                # NOT recursively compiled (its __call__(request) signature
+                # is not a DI graph). Scopes (params.Security) are plumbed
+                # for OpenAPI, NOT enforced (MUST-13).
+                scopes = tuple(getattr(dep_marker, "scopes", ()) or ())
+                deps.append(SubDep(dep, None, dep_marker.use_cache, name))
+                security.append((dep, scopes))
+                continue
+            sub = compile_dependant(dep, path_params)
+            deps.append(SubDep(dep, sub, dep_marker.use_cache, name))
             continue
         fi = extract_field(name, ann, default, path_params)
         fields.append(fi)
         validators[name] = compile_validator(fi)
-    return Plan(fn, fields, validators, deps, inspect.iscoroutinefunction(fn))
+    return Plan(fn, fields, validators, deps,
+                inspect.iscoroutinefunction(fn), security)
 
 
 @dataclass
@@ -115,6 +135,9 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
             kwargs[sub.param_name] = cache[sub.call]
             continue
         target, subplan = _resolve_dep(sub, request)
+        if _is_security(target):
+            raise RuntimeError(
+                "security schemes require the async request path (solve_async)")
         sr = solve(subplan, request, cache)
         if sr.errors:
             errors.extend(sr.errors)
@@ -156,6 +179,18 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 kwargs[sub.param_name] = cache[sub.call]
                 continue
             target, subplan = _resolve_dep(sub, request)
+            if _is_security(target):
+                # Invoke the scheme directly with the live Request. Its 401
+                # HTTPException propagates out through this async-with to the
+                # ASGI seam (mapped byte-faithfully); the exc-info also
+                # reaches yield-dep teardown (B4-correct).
+                val = target(request)
+                if inspect.isawaitable(val):
+                    val = await val
+                if sub.use_cache:
+                    cache[sub.call] = val
+                kwargs[sub.param_name] = val
+                continue
             async with solve_async(subplan, request, cache, stack) as sr:
                 if sr.errors:
                     errors.extend(sr.errors)
