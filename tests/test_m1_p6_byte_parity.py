@@ -115,3 +115,21 @@ def test_staticfiles_etag_range_304_traversal_match_starlette(tmp_path):
         assert l4.status_code == s4.status_code == 416
         assert lc.get("/s/../test_m1_p6_byte_parity.py").status_code in (
             404, 400)
+
+
+def test_settings_provider_cached_and_missing_env_boot_crash(monkeypatch):
+    from pydantic_settings import BaseSettings   # TEST-only oracle
+    from lancelot.settings import settings_provider
+
+    class S(BaseSettings):
+        port: int
+        name: str = "lancelot"
+
+    monkeypatch.setenv("PORT", "8080")
+    get = settings_provider(S)
+    a, b = get(), get()
+    assert a is b and a.port == 8080 and a.name == "lancelot"  # cached
+
+    monkeypatch.delenv("PORT", raising=False)
+    with pytest.raises(Exception):           # missing required env at BUILD
+        settings_provider(S, eager=True)()
