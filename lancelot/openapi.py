@@ -149,6 +149,7 @@ def components_schemas(app) -> dict:
 
 def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
     paths: dict = {}
+    sec_schemes: dict = {}  # route-iteration order, NOT sorted (deep/03 §3.1.8)
     for r in app.routes:
         if not getattr(r, "include_in_schema", True):
             continue  # FastAPI: /docs /redoc /openapi.json are not self-documented
@@ -160,6 +161,13 @@ def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
         if rb is not None:
             op["requestBody"] = rb
         op["responses"] = responses_for(r)
+        sec = getattr(r.plan, "security", None) or []
+        if sec:
+            op["security"] = [
+                {scheme.scheme_name: list(scopes)} for scheme, scopes in sec
+            ]  # MUST-14: first-seen order, NOT sorted
+            for scheme, _ in sec:
+                sec_schemes.setdefault(scheme.scheme_name, scheme.model)
         paths.setdefault(r.path, {})[r.method.lower()] = op
     doc = {  # MUST-28: wire key order = pydantic OpenAPI model field order
         "openapi": "3.1.0",
@@ -167,6 +175,11 @@ def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
         "paths": paths,
     }
     schemas = components_schemas(app)
+    components = {}
     if schemas:
-        doc["components"] = {"schemas": schemas}
+        components["schemas"] = schemas
+    if sec_schemes:
+        components["securitySchemes"] = sec_schemes  # route-order (not sorted)
+    if components:
+        doc["components"] = components
     return doc
