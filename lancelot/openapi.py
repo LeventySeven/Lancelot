@@ -72,3 +72,38 @@ def request_body_for(route):
     else:
         schema = {"$ref": f"#/components/schemas/{_model_name(model)}"}
     return {"content": {"application/json": {"schema": schema}}, "required": True}
+
+
+# Verbatim FastAPI consts (deep/03 §4.3 / openapi/utils.py:42-69).
+_VALIDATION_ERROR = {
+    "title": "ValidationError",
+    "type": "object",
+    "properties": {
+        "loc": {"title": "Location", "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+        "msg": {"title": "Message", "type": "string"},
+        "type": {"title": "Error Type", "type": "string"},
+    },
+    "required": ["loc", "msg", "type"],
+}
+_HTTP_VALIDATION_ERROR = {
+    "title": "HTTPValidationError",
+    "type": "object",
+    "properties": {"detail": {"title": "Detail", "type": "array",
+                              "items": {"$ref": "#/components/schemas/ValidationError"}}},
+}
+
+
+def _has_params_or_body(route) -> bool:
+    return bool(route.plan.fields) or route.body is not None or bool(
+        route.plan.dependencies)
+
+
+def responses_for(route) -> dict:
+    resp = {"200": {"description": "Successful Response",
+                    "content": {"application/json": {"schema": {}}}}}
+    if _has_params_or_body(route):  # MUST-20/36
+        resp["422"] = {"description": "Validation Error",
+                       "content": {"application/json": {"schema": {
+                           "$ref": "#/components/schemas/HTTPValidationError"}}}}
+    return resp
