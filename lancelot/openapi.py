@@ -8,6 +8,7 @@ import re
 import typing
 
 from pydantic import TypeAdapter
+from pydantic.json_schema import GenerateJsonSchema
 
 _REF_TEMPLATE = "#/components/schemas/{model}"
 
@@ -107,3 +108,35 @@ def responses_for(route) -> dict:
                        "content": {"application/json": {"schema": {
                            "$ref": "#/components/schemas/HTTPValidationError"}}}}
     return resp
+
+
+def _route_models(app) -> list:
+    models, seen = [], set()
+    for r in app.routes:
+        if r.body is None:
+            continue
+        m = r.body[1]._model
+        cands = []
+        if typing.get_origin(m) in (list, set, frozenset, tuple):
+            cands = list(typing.get_args(m))
+        else:
+            cands = [m]
+        for c in cands:
+            if isinstance(c, type) and hasattr(c, "model_json_schema") and c not in seen:
+                seen.add(c)
+                models.append(c)
+    return models
+
+
+def components_schemas(app) -> dict:
+    defs = {}
+    models = _route_models(app)
+    if models:
+        gen = GenerateJsonSchema(ref_template=_REF_TEMPLATE)
+        inputs = [(m, "validation", TypeAdapter(m).core_schema) for m in models]
+        _, definitions = gen.generate_definitions(inputs=inputs)
+        defs.update(definitions)
+    if any(_has_params_or_body(r) for r in app.routes):
+        defs["ValidationError"] = _VALIDATION_ERROR
+        defs["HTTPValidationError"] = _HTTP_VALIDATION_ERROR
+    return {k: defs[k] for k in sorted(defs)}  # MUST-17 lexicographic
