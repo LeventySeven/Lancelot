@@ -25,9 +25,13 @@ _CONSTRAINT_KEYS = (
 class Param:
     in_: str = "query"
 
-    def __init__(self, default=Required, *, alias=None, **constraints):
+    def __init__(self, default=Required, *, alias=None,
+                 validation_alias=None, **constraints):
         self.default = default
         self.alias = alias
+        # Pydantic v2 distinction: alias = input AND output; validation_alias
+        # = input ONLY (errors loc still uses name/alias, not validation_alias).
+        self.validation_alias = validation_alias
         self.constraints = {
             k: v for k, v in constraints.items()
             if k in _CONSTRAINT_KEYS and v is not None
@@ -61,6 +65,8 @@ class Body(Param):
     in_ = "body"
 
     def __init__(self, default=Required, *, embed=False, **kw):
+        # Pop body-only kwargs before super; super ignores unknowns via
+        # **constraints filtering, but we want explicit storage for embed.
         super().__init__(default, **kw)
         # FastAPI Body(embed=True): scalar param is wrapped in a JSON
         # object keyed by the param name (or alias). Multiple embeds in
@@ -99,6 +105,7 @@ class FieldInfo:
     alias: str | None = None
     is_bucket: str = ""  # "" | "query" | "header" | "cookie" — bucket-model
     explicit_marker: bool = False  # True if user wrote Query()/Body()/etc.
+    validation_alias: str | None = None  # input-only alias (Pydantic v2)
 
 
 def _scalar_default_marker(annotation) -> Param:
@@ -132,4 +139,5 @@ def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
         name, real_ann, required, None if required else eff_default,
         marker, getattr(marker, "alias", None),
         explicit_marker=explicit,
+        validation_alias=getattr(marker, "validation_alias", None),
     )

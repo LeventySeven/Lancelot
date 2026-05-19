@@ -153,7 +153,8 @@ def _raw_for(fi, request):
         multi = {k: [v] for k, v in cks.items()}
         return _multi_to_model_dict(multi, fi.annotation), bool(cks)
     src = fi.marker.in_
-    key = fi.alias or fi.name
+    # Pydantic v2 input-direction key: validation_alias > alias > name.
+    key = fi.validation_alias or fi.alias or fi.name
     if src == "path":
         return request.path_params.get(key), key in request.path_params
     if src == "query":
