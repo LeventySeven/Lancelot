@@ -29,7 +29,15 @@ class App:
         self._lifespan = lifespan
         self._asgi = None
         self._openapi_cache = None
+        self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._register_builtin_routes()
+
+    def add_middleware(self, mw_cls, **opts):
+        """U20 escape hatch: an unmodified pure-ASGI middleware wrapping the
+        app callable. NEVER BaseHTTPMiddleware/call_next. Last-added is the
+        outermost wrapper."""
+        self._middleware.append((mw_cls, opts))
+        self._asgi = None  # rebuild the wrapped callable
 
     def _register_builtin_routes(self):
         """OpenAPI JSON endpoint (doc UIs added in M1-P3 T8). FastAPI does the
@@ -95,7 +103,11 @@ class App:
         if self._asgi is None:
             from lancelot.asgi import build_asgi
 
-            self._asgi = build_asgi(self)
+            app = build_asgi(self)
+            # last-added wraps outermost (FastAPI/Starlette order)
+            for mw_cls, opts in reversed(self._middleware):
+                app = mw_cls(app, **opts)
+            self._asgi = app
         return self._asgi
 
 
