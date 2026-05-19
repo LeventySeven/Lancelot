@@ -116,6 +116,9 @@ class SolveResult:
     errors: list
 
 
+_MISSING = object()
+
+
 def _multi_to_model_dict(multi: dict, model) -> dict:
     """Bucket-model coercion: per-field, if the field is sequence-typed
     pass the full list of values; else pass the last. Extras with >1
@@ -162,6 +165,23 @@ def _raw_for(fi, request):
         return h.get(k), k in h
     if src == "cookie":
         return request.cookies.get(key), key in request.cookies
+    if src == "body" and getattr(fi.marker, "embed", False):
+        # FastAPI Body(embed=True): the request body is a JSON object
+        # keyed by the param name/alias; the handler receives the unwrapped
+        # value. Parse once, cache on the request.
+        cache = getattr(request, "_body_obj_cache", _MISSING)
+        if cache is _MISSING:
+            import json as _json
+
+            try:
+                parsed = _json.loads(request.body) if request.body else None
+            except Exception:  # noqa: BLE001 - malformed → field absent
+                parsed = None
+            cache = parsed if isinstance(parsed, dict) else None
+            request._body_obj_cache = cache
+        if cache is None:
+            return None, False
+        return cache.get(key), key in cache
     if src == "form":
         # application/x-www-form-urlencoded only (stdlib — no runtime dep).
         # multipart/form-data + UploadFile is ledgered (needs

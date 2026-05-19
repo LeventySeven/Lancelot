@@ -60,6 +60,14 @@ class Cookie(Param):
 class Body(Param):
     in_ = "body"
 
+    def __init__(self, default=Required, *, embed=False, **kw):
+        super().__init__(default, **kw)
+        # FastAPI Body(embed=True): scalar param is wrapped in a JSON
+        # object keyed by the param name (or alias). Multiple embeds in
+        # one route share the same object. Default behavior (embed=False)
+        # treats the body as the raw scalar JSON.
+        self.embed = embed
+
 
 class Form(Body):
     in_ = "form"
