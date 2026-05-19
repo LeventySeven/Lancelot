@@ -88,7 +88,7 @@ async def _http(app, scope, receive, send):
 
     from lancelot.di import solve_async
     from lancelot.exceptions import HTTPException
-    from lancelot.pool import get_pool
+    from lancelot.pool import PoolFull, get_pool
     from lancelot.requests import Request as LRequest
     from lancelot.validation import errors_to_422, _wire_json
 
@@ -183,6 +183,15 @@ async def _http(app, scope, receive, send):
             await send({"type": "http.response.start",
                         "status": exc.status_code, "headers": hdrs})
             await send({"type": "http.response.body", "body": ebody})
+    except PoolFull:  # WBS U32: overload → byte 503 + Retry-After, no hang
+        if not sent:
+            pbody = b'{"detail":"Service Unavailable"}'
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"retry-after", b"1"),
+                                    (b"content-length",
+                                     str(len(pbody)).encode()),
+                                    (b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": pbody})
     except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')

@@ -129,3 +129,35 @@ def test_sync_dependency_offloaded_and_bytes_match_fastapi():
             return time.perf_counter() - t0
 
     assert asyncio.run(hammer()) < 1.5, "sync deps serialized"
+
+
+def test_pool_full_returns_503_retry_after_not_a_hang():
+    import httpx
+    import lancelot
+    from lancelot.pool import configure
+    from lancelot.testclient import TestClient as LC  # noqa: F401
+
+    configure(max_workers=1, max_inflight=1)  # tiny pool → easy to exhaust
+    try:
+        app = lancelot.App()
+
+        @app.get("/blk")
+        def blk():
+            time.sleep(0.4)
+            return {"ok": True}
+
+        async def race():
+            tr = httpx.ASGITransport(app=app.asgi())
+            async with httpx.AsyncClient(transport=tr,
+                                         base_url="http://t") as c:
+                return await asyncio.gather(c.get("/blk"), c.get("/blk"),
+                                            c.get("/blk"))
+
+        rs = asyncio.run(race())
+        codes = sorted(r.status_code for r in rs)
+        assert 503 in codes, codes                       # not a hang
+        over = [r for r in rs if r.status_code == 503][0]
+        assert over.headers.get("retry-after") == "1"
+        assert over.json() == {"detail": "Service Unavailable"}
+    finally:
+        configure()  # restore defaults for the rest of the suite
