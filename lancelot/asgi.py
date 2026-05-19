@@ -141,6 +141,16 @@ async def _http(app, scope, receive, send):
             result = route.handler(**kwargs)
             if inspect.isawaitable(result):
                 result = await result
+            from lancelot.responses import Response
+
+            if isinstance(result, Response):  # pre-serialized (docs / openapi)
+                await send({"type": "http.response.start",
+                            "status": result.status_code,
+                            "headers": [(b"content-type",
+                                         result.media_type.encode())]})
+                await send({"type": "http.response.body", "body": result.body})
+                sent = True
+                return
             payload = _wire_json(result)
             await _send_json(send, 200, payload)
             sent = True

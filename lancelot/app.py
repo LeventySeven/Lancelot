@@ -26,6 +26,19 @@ class App:
         self._override_plans: dict = {}  # per-app compiled override plans (A2)
         self._lifespan = lifespan
         self._asgi = None
+        self._openapi_cache = None
+        self._register_builtin_routes()
+
+    def _register_builtin_routes(self):
+        """OpenAPI JSON endpoint (doc UIs added in M1-P3 T8). FastAPI does the
+        same — every app exposes /openapi.json."""
+        from lancelot.responses import JSONResponse
+        from lancelot.validation import _wire_json
+
+        def _openapi_json():
+            return JSONResponse(_wire_json(self.openapi()))
+
+        self.get("/openapi.json")(_openapi_json)
 
     # --- registration -----------------------------------------------------
     @property
@@ -53,12 +66,14 @@ class App:
             self.router.add(Route(r.method, prefix + r.path, r.handler, r.name))
 
     def openapi(self) -> dict:
-        # M1-P3 (U17) replaces this with the real pydantic-FFI generator.
-        return {
-            "openapi": "3.1.0",
-            "info": {"title": "Lancelot", "version": "0"},
-            "paths": {},
-        }
+        """Built once at first access, then memoized (FastAPI semantics:
+        the schema is built once; routes added after first access are not
+        reflected — documented contract)."""
+        if self._openapi_cache is None:
+            from lancelot.openapi import build_openapi
+
+            self._openapi_cache = build_openapi(self)
+        return self._openapi_cache
 
     def asgi(self):
         if self._asgi is None:
