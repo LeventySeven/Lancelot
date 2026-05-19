@@ -87,6 +87,7 @@ async def _http(app, scope, receive, send):
     from urllib.parse import parse_qs
 
     from lancelot.di import solve_async
+    from lancelot.exceptions import HTTPException
     from lancelot.requests import Request as LRequest
     from lancelot.validation import errors_to_422, _wire_json
 
@@ -154,6 +155,15 @@ async def _http(app, scope, receive, send):
             payload = _wire_json(result)
             await _send_json(send, 200, payload)
             sent = True
+    except HTTPException as exc:  # byte-faithful {"detail":…} + headers (MUST-11)
+        if not sent:
+            hdrs = [(b"content-type", b"application/json")]
+            for k, v in exc.headers.items():
+                hdrs.append((str(k).encode(), str(v).encode()))
+            await send({"type": "http.response.start",
+                        "status": exc.status_code, "headers": hdrs})
+            await send({"type": "http.response.body",
+                        "body": _wire_json({"detail": exc.detail})})
     except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
