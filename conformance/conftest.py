@@ -35,6 +35,13 @@ import lancelot.responses as _lresp  # noqa: E402
 for _rn in ("Response", "JSONResponse", "HTMLResponse", "PlainTextResponse"):
     if hasattr(_lresp, _rn):
         setattr(_fastapi, _rn, getattr(_lresp, _rn))
+# `from fastapi.responses import JSONResponse` / `from fastapi import status`
+sys.modules["fastapi.responses"] = _lresp
+_fastapi.responses = _lresp
+import lancelot.status as _lstatus  # noqa: E402
+
+sys.modules["fastapi.status"] = _lstatus
+_fastapi.status = _lstatus
 sys.modules["fastapi"] = _fastapi
 
 _tc = types.ModuleType("fastapi.testclient")

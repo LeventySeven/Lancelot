@@ -19,9 +19,17 @@ class State:
 
 
 class App:
-    def __init__(self, lifespan=None, title="Lancelot", version="0.1.0"):
+    def __init__(self, lifespan=None, title="Lancelot", version="0.1.0",
+                 *, redirect_slashes: bool = True, **kwargs):
+        """FastAPI-shape constructor: accepts the documented kwargs verbatim.
+        Implemented: lifespan, title, version, redirect_slashes. Other
+        FastAPI kwargs (docs_url, default_response_class, dependencies,
+        generate_unique_id_function, separate_input_output_schemas, …)
+        are accepted at registration so user code that passes them does
+        not crash; their behavior is ledgered until needed."""
         self.title = title
         self.version = version
+        self.redirect_slashes = redirect_slashes
         self.router = Router()
         self.state = State()
         self.dependency_overrides: dict = {}
@@ -31,6 +39,7 @@ class App:
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
+        self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._register_builtin_routes()
 
     def mount(self, prefix: str, app) -> None:
@@ -75,27 +84,42 @@ class App:
     def routes(self) -> list[Route]:
         return self.router.routes
 
-    def _add(self, method: str, path: str):
+    def _add(self, method: str, path: str, **kwargs):
+        """Route decorator factory accepting FastAPI's documented kwargs.
+        Implemented: status_code. Accepted-and-stored (behavior ledgered):
+        response_model, response_class, responses, operation_id, summary,
+        description, tags, dependencies, deprecated, name, ...
+        Unknown kwargs are accepted (collection-unblock) and dropped."""
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+
         def deco(fn):
-            self.router.add(Route(method, path, fn))
+            self.router.add(Route(method, path, fn, **kw))
             return fn
 
         return deco
 
-    def websocket(self, path: str):
+    def websocket(self, path: str, **kwargs):
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+
         def deco(fn):
-            self.router.add(Route("GET", path, fn, is_ws=True))
+            self.router.add(Route("GET", path, fn, is_ws=True, **kw))
             return fn
 
         return deco
 
-    def get(self, p): return self._add("GET", p)
-    def post(self, p): return self._add("POST", p)
-    def put(self, p): return self._add("PUT", p)
-    def delete(self, p): return self._add("DELETE", p)
-    def patch(self, p): return self._add("PATCH", p)
-    def head(self, p): return self._add("HEAD", p)
-    def options(self, p): return self._add("OPTIONS", p)
+    def get(self, p, **kw): return self._add("GET", p, **kw)
+    def post(self, p, **kw): return self._add("POST", p, **kw)
+    def put(self, p, **kw): return self._add("PUT", p, **kw)
+    def delete(self, p, **kw): return self._add("DELETE", p, **kw)
+    def patch(self, p, **kw): return self._add("PATCH", p, **kw)
+    def head(self, p, **kw): return self._add("HEAD", p, **kw)
+    def options(self, p, **kw): return self._add("OPTIONS", p, **kw)
 
     def include_router(self, router: APIRouter, prefix: str = ""):
         prefix = prefix.rstrip("/")

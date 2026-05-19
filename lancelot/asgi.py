@@ -90,6 +90,24 @@ async def _http(app, scope, receive, send):
     route, info = app.router.match(method, path)
     if route is None:
         status = info  # 404 or 405
+        # FastAPI redirect_slashes (default True): on 404, if the toggled-
+        # slash path matches a route, return 307 to that path. Disabling
+        # via `FastAPI(redirect_slashes=False)` keeps the 404.
+        if status == 404 and getattr(app, "redirect_slashes", True):
+            alt = path[:-1] if path.endswith("/") and len(path) > 1 \
+                else path + "/"
+            alt_route, _ = app.router.match(method, alt)
+            if alt_route is not None:
+                qs = scope.get("query_string", b"").decode()
+                location = alt + (f"?{qs}" if qs else "")
+                await send({"type": "http.response.start", "status": 307,
+                            "headers": [
+                                (b"location", location.encode()),
+                                (b"content-length", b"0"),
+                                (b"content-type",
+                                 b"text/plain; charset=utf-8")]})
+                await send({"type": "http.response.body", "body": b""})
+                return
         body = (
             b'{"detail":"Not Found"}'
             if status == 404
@@ -223,7 +241,10 @@ async def _http(app, scope, receive, send):
                     await lreq._background()
                 return
             payload = _wire_json(result)
-            await _send_json(send, 200, payload)
+            # FastAPI: @app.post(..., status_code=201) sets default response
+            # status when the handler returns a value (not a Response).
+            default_status = route.status_code or 200
+            await _send_json(send, default_status, payload)
             sent = True
             if lreq._background._tasks:  # FastAPI: post-send, pre-teardown
                 await lreq._background()

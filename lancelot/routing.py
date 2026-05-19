@@ -30,6 +30,17 @@ class Route:
     name: str = ""
     include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
     is_ws: bool = False  # WebSocket route (matched by scope type, not method)
+    status_code: int | None = None  # FastAPI default response status
+    # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
+    response_model: Any = None
+    response_class: Any = None
+    responses: dict | None = None
+    operation_id: str | None = None
+    summary: str | None = None
+    description: str | None = None
+    tags: list | None = None
+    dependencies: list | None = None
+    deprecated: bool | None = None
 
     def __post_init__(self):
         self.method = self.method.upper()
@@ -88,20 +99,28 @@ class APIRouter:
         self.tags = tags or []
         self.routes: list[Route] = []
 
-    def _add(self, method: str, path: str):
+    def _add(self, method: str, path: str, **kwargs):
+        # Filter to Route's known kwargs; unknown kwargs are accepted at
+        # the App._add layer and dropped here (FastAPI surface that
+        # Lancelot doesn't behave on yet — collection-unblock only).
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+
         def deco(fn):
-            self.routes.append(Route(method, self.prefix + path, fn))
+            self.routes.append(Route(method, self.prefix + path, fn, **kw))
             return fn
 
         return deco
 
-    def get(self, p): return self._add("GET", p)
-    def post(self, p): return self._add("POST", p)
-    def put(self, p): return self._add("PUT", p)
-    def delete(self, p): return self._add("DELETE", p)
-    def patch(self, p): return self._add("PATCH", p)
-    def head(self, p): return self._add("HEAD", p)
-    def options(self, p): return self._add("OPTIONS", p)
+    def get(self, p, **kw): return self._add("GET", p, **kw)
+    def post(self, p, **kw): return self._add("POST", p, **kw)
+    def put(self, p, **kw): return self._add("PUT", p, **kw)
+    def delete(self, p, **kw): return self._add("DELETE", p, **kw)
+    def patch(self, p, **kw): return self._add("PATCH", p, **kw)
+    def head(self, p, **kw): return self._add("HEAD", p, **kw)
+    def options(self, p, **kw): return self._add("OPTIONS", p, **kw)
 
     def websocket(self, path: str):
         def deco(fn):
