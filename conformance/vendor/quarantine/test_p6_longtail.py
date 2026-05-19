@@ -14,8 +14,22 @@ ASGI seam (the path the oracle exercises). RED = out of M1-P6 scope:
      with stdlib (no runtime dep) and python-multipart is a TEST-only
      oracle dep. multipart/file streaming is the remaining tail.
   3. WS subprotocol negotiation + permessage-deflate; static
-     directory-index / HTML mode / multi-range. Single-range +
-     conditional + traversal-guard ship in M1-P6.
+     directory-index / HTML mode / multi-range. Single-range (incl. RFC
+     suffix bytes=-N, malformed-400, unsatisfiable-416) + conditional +
+     traversal-guard ship byte-faithfully in M1-P6.
+Honesty notes (review reconciliation, NOT silently narrowed):
+  * The plan's Task 5 promised asgi.py emits 400 "There was an error
+    parsing the body" for an unparseable form body. That message is part
+    of the multipart/form-data path (ledger item 2) — DEFERRED with it.
+    M1-P6 ships urlencoded Form byte-faithfully; a malformed multipart
+    body currently 422s (clean, no crash) instead of 400. The plan text
+    is superseded by ledger item 2; the commit says "MUST-6 partial".
+  * WS dependency-validation close: Lancelot emits ONLY the correct
+    error(s) with close code 1008. Real FastAPI additionally emits a
+    spurious {"loc":["query","websocket"],...} from mis-detecting the
+    bare `websocket` param. Lancelot's close code (1008) and the genuine
+    errors match; the reason string is intentionally SANER (no spurious
+    artifact) — a deliberate, documented deviation, not a parity claim.
 Graduate into conformance/vendor/ as M3 + the §3-69 unification land."""
 import pytest
 
