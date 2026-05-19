@@ -66,6 +66,19 @@ class Route:
         self.plan = compile_dependant(
             self.handler, path_params=set(self._rx.groupindex)
         )
+        # FastAPI rule (test_invalid_path_param): path params must be
+        # primitive-coercible — NOT collections/dicts/BaseModels.
+        for fi in self.plan.fields:
+            if getattr(fi.marker, "in_", None) != "path":
+                continue
+            ann = fi.annotation
+            origin = typing.get_origin(ann) or ann
+            if origin in (list, tuple, set, frozenset, dict) \
+                    or (isinstance(ann, type)
+                        and hasattr(ann, "model_validate")):
+                raise AssertionError(
+                    f"Path param '{fi.name}' must be a primitive type; "
+                    f"got {ann!r}")
         self.body = None
         self.body_kind = "json"  # "json" | "form"  (multipart ledgered)
         for fi in list(self.plan.fields):
