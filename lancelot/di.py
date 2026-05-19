@@ -59,6 +59,11 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         if ann is _Req:  # `request: Request` → bound to the live Request
             req_params.append(name)
             continue
+        from lancelot.background import BackgroundTasks as _BT
+
+        if ann is _BT:  # FastAPI: a fresh BackgroundTasks injected per req
+            req_params.append(("__bg__", name))
+            continue
         default = p.default if p.default is not inspect.Parameter.empty else Required
         dep_marker = default if isinstance(default, Depends) else None
         if typing.get_origin(ann) is typing.Annotated:
@@ -161,8 +166,11 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
             errors.extend(errs)
         else:
             kwargs[fi.name] = value
-    for nm in plan.request_params:
-        kwargs[nm] = request
+    for entry in plan.request_params:
+        if isinstance(entry, tuple) and entry[0] == "__bg__":
+            kwargs[entry[1]] = request._background  # set by the ASGI seam
+        else:
+            kwargs[entry] = request
     return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
 
 
@@ -236,8 +244,11 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 errors.extend(errs)
             else:
                 kwargs[fi.name] = value
-        for nm in plan.request_params:
-            kwargs[nm] = request
+        for entry in plan.request_params:
+            if isinstance(entry, tuple) and entry[0] == "__bg__":
+                kwargs[entry[1]] = request._background  # set by ASGI seam
+            else:
+                kwargs[entry] = request
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
     except BaseException as exc:
         # B4: the handler (or a dep) raised inside the `async with` body.

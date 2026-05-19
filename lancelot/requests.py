@@ -13,6 +13,7 @@ class Request:
     app: object
     _json_cache: object = None
     scope_state: dict = None  # incoming ASGI scope["state"] (P2 advisory)
+    _background: object = None  # fresh BackgroundTasks, set by the ASGI seam
 
     @property
     def state(self):

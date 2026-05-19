@@ -115,6 +115,9 @@ async def _http(app, scope, receive, send):
     params = route.match(path) or {}
     lreq = LRequest(method, path, query, headers, {}, params, body, scope["app"])
     lreq.scope_state = scope.get("state")  # honor incoming ASGI scope state
+    from lancelot.background import BackgroundTasks as _BT
+
+    lreq._background = _BT()  # FastAPI: fresh per request, run after response
 
     body_value, body_errors = None, []
     if route.body is not None:
@@ -165,10 +168,17 @@ async def _http(app, scope, receive, send):
                                  result.media_type.encode())]})
                 await send({"type": "http.response.body", "body": result.body})
                 sent = True
+                # BackgroundTasks run AFTER the body is sent and BEFORE
+                # yield-dep teardown (still inside the async with) — FastAPI
+                # ordering (Starlette runs response.background post-send).
+                if lreq._background._tasks:
+                    await lreq._background()
                 return
             payload = _wire_json(result)
             await _send_json(send, 200, payload)
             sent = True
+            if lreq._background._tasks:  # FastAPI: post-send, pre-teardown
+                await lreq._background()
     except HTTPException as exc:  # byte-faithful {"detail":…} + headers (MUST-11)
         if not sent:
             ebody = _wire_json({"detail": exc.detail})

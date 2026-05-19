@@ -161,3 +161,35 @@ def test_pool_full_returns_503_retry_after_not_a_hang():
         assert over.json() == {"detail": "Service Unavailable"}
     finally:
         configure()  # restore defaults for the rest of the suite
+
+
+def test_background_tasks_run_after_response_like_fastapi():
+    import fastapi
+    from fastapi.testclient import TestClient as FA
+    import lancelot
+    from lancelot.testclient import TestClient as LC
+
+    def build(F, sink):
+        is_fa = hasattr(F, "FastAPI")
+        app = F.FastAPI() if is_fa else F.App()
+        BT = (fastapi.BackgroundTasks if is_fa
+              else __import__("lancelot", fromlist=["BackgroundTasks"]
+                              ).BackgroundTasks)
+
+        def write(tag):
+            sink.append(tag)
+
+        @app.get("/bg")
+        def bg(bt: BT):
+            bt.add_task(write, "first")
+            bt.add_task(write, "second")
+            return {"queued": 2}
+
+        return app
+
+    fsink, lsink = [], []
+    with FA(build(fastapi, fsink)) as fa, LC(build(lancelot, lsink)) as lc:
+        f, l = fa.get("/bg"), lc.get("/bg")
+        assert l.status_code == f.status_code == 200
+        assert l.content == f.content                  # byte parity
+        assert lsink == fsink == ["first", "second"]   # order + ran-after

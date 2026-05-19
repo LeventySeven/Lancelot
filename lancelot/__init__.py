@@ -3,8 +3,8 @@ from lancelot.app import App, Lancelot, run
 from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
-__all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient", "run",
-           "_ping"]
+__all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient",
+           "BackgroundTasks", "run", "_ping"]
 __version__ = "0.0.0"
 
 
@@ -17,4 +17,8 @@ def __getattr__(name):
         from lancelot.testclient import TestClient
 
         return TestClient
+    if name == "BackgroundTasks":
+        from lancelot.background import BackgroundTasks
+
+        return BackgroundTasks
     raise AttributeError(f"module 'lancelot' has no attribute {name!r}")
