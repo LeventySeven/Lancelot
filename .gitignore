@@ -26,3 +26,4 @@ dhat-heap.json
 # Secrets
 .env
 *.env
+conformance/log.txt
