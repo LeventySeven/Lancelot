@@ -76,3 +76,42 @@ def test_websocket_echo_param_and_1008():
         with pytest.raises(Exception):           # validation fail → 1008
             with lc.websocket_connect("/v/notanint") as w:
                 w.receive_text()
+
+
+def test_staticfiles_etag_range_304_traversal_match_starlette(tmp_path):
+    import starlette.applications
+    from starlette.staticfiles import StaticFiles as SSF
+    from starlette.testclient import TestClient as STC
+    import lancelot
+    from lancelot.staticfiles import StaticFiles as LSF
+    from lancelot.testclient import TestClient as LC
+
+    (tmp_path / "a.txt").write_bytes(b"hello world")
+
+    sapp = starlette.applications.Starlette()
+    sapp.mount("/s", SSF(directory=str(tmp_path)))
+    lapp = lancelot.App()
+    lapp.mount("/s", LSF(directory=str(tmp_path)))
+
+    with STC(sapp) as sc, LC(lapp) as lc:
+        s, l = sc.get("/s/a.txt"), lc.get("/s/a.txt")
+        assert l.status_code == s.status_code == 200
+        assert l.content == s.content == b"hello world"
+        assert l.headers["etag"] == s.headers["etag"]
+        assert l.headers["last-modified"] == s.headers["last-modified"]
+        assert l.headers["content-type"] == s.headers["content-type"]
+        assert l.headers["accept-ranges"] == s.headers["accept-ranges"]
+        et = s.headers["etag"]
+        s2 = sc.get("/s/a.txt", headers={"if-none-match": et})
+        l2 = lc.get("/s/a.txt", headers={"if-none-match": et})
+        assert l2.status_code == s2.status_code == 304
+        s3 = sc.get("/s/a.txt", headers={"range": "bytes=0-4"})
+        l3 = lc.get("/s/a.txt", headers={"range": "bytes=0-4"})
+        assert l3.status_code == s3.status_code == 206
+        assert l3.content == s3.content == b"hello"
+        assert l3.headers["content-range"] == s3.headers["content-range"]
+        s4 = sc.get("/s/a.txt", headers={"range": "bytes=999-1000"})
+        l4 = lc.get("/s/a.txt", headers={"range": "bytes=999-1000"})
+        assert l4.status_code == s4.status_code == 416
+        assert lc.get("/s/../test_m1_p6_byte_parity.py").status_code in (
+            404, 400)

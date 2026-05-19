@@ -30,7 +30,15 @@ class App:
         self._asgi = None
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
+        self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
         self._register_builtin_routes()
+
+    def mount(self, prefix: str, app) -> None:
+        """Mount a sub-ASGI app (e.g. StaticFiles) at a path prefix —
+        Starlette's Mount shape. The dispatcher strips the prefix from
+        scope['path'] before delegating."""
+        self._mounts.append((prefix.rstrip("/"), app))
+        self._asgi = None
 
     def add_middleware(self, mw_cls, **opts):
         """U20 escape hatch: an unmodified pure-ASGI middleware wrapping the

@@ -11,6 +11,17 @@ def build_asgi(app):
         if scope["type"] == "lifespan":
             await _lifespan(app, receive, send)
             return
+        if scope["type"] in ("http", "websocket"):
+            p = scope.get("path", "")
+            for mp, sub in getattr(app, "_mounts", ()):
+                if p == mp or p.startswith(mp + "/"):
+                    sub_path = p[len(mp):] or "/"
+                    sub_scope = dict(scope)
+                    sub_scope["path"] = sub_path
+                    sub_scope["raw_path"] = sub_path.encode()
+                    sub_scope.setdefault("app", _AppProxy(app))
+                    await sub(sub_scope, receive, send)
+                    return
         if scope["type"] == "http":
             await _http(app, scope, receive, send)
             return
