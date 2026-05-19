@@ -257,6 +257,36 @@ def test_import_lancelot_stays_dependency_light_with_pool():
     assert out.stdout.strip().startswith("CLEAN"), out.stdout + out.stderr
 
 
+def test_backgroundtasks_backpressure_not_poolfull_no_spurious_rollback():
+    """Review blocker #1: a saturated REQUEST inflight-gate must NOT make
+    post-send BackgroundTasks (a) raise a synthetic PoolFull that unwinds
+    SUCCESSFUL yield-deps (data-integrity bug) nor (b) silently drop the
+    task. FastAPI/Starlette run_in_threadpool BACKPRESSURES (queues), it
+    never rejects accepted background work."""
+    from lancelot.background import BackgroundTasks
+    from lancelot.pool import configure, get_pool
+
+    configure(max_workers=2, max_inflight=1)  # gate=1; 2 worker threads
+    try:
+        pool = get_pool()
+        rel = threading.Event()
+
+        async def main():
+            blocker = asyncio.create_task(pool.offload(lambda: rel.wait(2)))
+            await asyncio.sleep(0.05)          # inflight gate now full (1>=1)
+            ran = []
+            bt = BackgroundTasks()
+            bt.add_task(lambda: ran.append("x"))
+            await bt()                          # must NOT raise PoolFull
+            assert ran == ["x"]                 # task actually ran
+            rel.set()
+            await blocker
+
+        asyncio.run(main())
+    finally:
+        configure()
+
+
 def test_async_handler_still_inline_bytes_match_fastapi():
     # regression: the offload split must not change async-handler bytes
     import fastapi

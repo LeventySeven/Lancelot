@@ -22,7 +22,12 @@ class BackgroundTasks:
             if inspect.iscoroutinefunction(func):
                 await func(*args, **kwargs)
             else:
-                await get_pool().offload(func, *args, **kwargs)
+                # BACKPRESSURE (not the 503 inflight gate): post-send work
+                # is already accepted — Starlette run_in_threadpool queues
+                # it, never rejects. Using offload() here would raise a
+                # synthetic PoolFull into the (successful) request's
+                # solve_async scope and spuriously roll back yield-deps.
+                await get_pool().run_backpressured(func, *args, **kwargs)
 
 
 class QueueFull(Exception):
@@ -57,7 +62,12 @@ class BackgroundPool:
                 with self._lock:
                     self._depth -= 1
 
-        self._ex.submit(_run)
+        try:
+            self._ex.submit(_run)
+        except RuntimeError:  # submit after shutdown → don't leak _depth
+            with self._lock:
+                self._depth -= 1
+            raise
 
     def shutdown(self):
         self._ex.shutdown(wait=False, cancel_futures=True)

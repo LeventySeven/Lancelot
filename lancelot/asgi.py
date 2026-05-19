@@ -148,8 +148,13 @@ async def _http(app, scope, receive, send):
                 kwargs[route.body[0]] = body_value
             # Sync handlers run on the bounded blocking pool so they never
             # pin the reactor (WBS U32 — the FastAPI cliff). Async handlers
-            # are awaited directly. is_async is decided at COMPILE time
-            # (Plan.is_async), so a sync fn never runs on the loop thread.
+            # are awaited directly. is_async = iscoroutinefunction(fn) is
+            # decided at COMPILE time (Plan.is_async) — same basis FastAPI
+            # uses — so a sync fn never runs on the loop thread. Callable
+            # INSTANCE handlers (`async def __call__`) are a pre-existing
+            # DI-surface gap (compile_dependant can't introspect an
+            # instance) — ledgered, not silently narrowed: see
+            # conformance/vendor/quarantine/test_p5_longtail.py item 4.
             if route.plan.is_async:
                 result = await route.handler(**kwargs)
             else:

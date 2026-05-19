@@ -45,6 +45,19 @@ class BlockingPool:
             with self._lock:
                 self._inflight -= 1
 
+    async def run_backpressured(self, fn, /, *args, **kwargs):
+        """Post-response background path: queue on the executor WITHOUT the
+        inflight gate, so it BACKPRESSURES (like Starlette run_in_threadpool
+        / the anyio limiter) instead of raising PoolFull. The inflight 503
+        gate is for REQUEST admission only — rejecting already-accepted
+        background work (and unwinding a SUCCESSFUL request's yield-deps
+        with a synthetic PoolFull) is a data-integrity bug and diverges
+        from FastAPI (review blocker #1). A task that raises on its own
+        still propagates — that IS FastAPI's behavior."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._ex, lambda: fn(*args, **kwargs))
+
     def shutdown(self):
         self._ex.shutdown(wait=False, cancel_futures=True)
 
