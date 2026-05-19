@@ -79,6 +79,7 @@ class BodyValidator:
     ctx.error) — byte-identical to FastAPI routing.py:427-441."""
 
     def __init__(self, model):
+        self._model = model  # the annotation (used by openapi.py)
         self._adapter = TypeAdapter(model)
 
     def validate_json(self, raw: bytes):

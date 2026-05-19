@@ -5,6 +5,7 @@ GenerateJsonSchema (spec §3/§9 — never reimplemented). The long tail
 examples, additional responses) is driven up by the P7 conformance ratchet
 via conformance/vendor/quarantine/."""
 import re
+import typing
 
 from pydantic import TypeAdapter
 
@@ -47,3 +48,27 @@ def parameters_for(route) -> list:
             "schema": _field_schema(fi),
         }
     return list(out.values())
+
+
+def _model_name(model) -> str:
+    # MUST-27 normalize_name; container -> element model name
+    origin = typing.get_origin(model)
+    if origin in (list, set, frozenset, tuple):
+        for a in typing.get_args(model):
+            if isinstance(a, type) and hasattr(a, "model_json_schema"):
+                return _model_name(a)
+    nm = getattr(model, "__name__", str(model))
+    return re.sub(r"[^a-zA-Z0-9.\-_]", "_", nm)
+
+
+def request_body_for(route):
+    if route.body is None:
+        return None
+    model = route.body[1]._model
+    origin = typing.get_origin(model)
+    if origin in (list, set, frozenset, tuple):
+        schema = {"type": "array",
+                  "items": {"$ref": f"#/components/schemas/{_model_name(model)}"}}
+    else:
+        schema = {"$ref": f"#/components/schemas/{_model_name(model)}"}
+    return {"content": {"application/json": {"schema": schema}}, "required": True}
