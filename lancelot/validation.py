@@ -43,7 +43,10 @@ class ParamValidator:
         # not ["form",...]. query/path/header/cookie keep their own bucket.
         _src = self.fi.marker.in_
         _bucket = "body" if _src in ("form", "file", "body") else _src
-        loc_prefix = [_bucket, self.fi.alias or self.fi.name]
+        # FastAPI/Pydantic v2: loc uses the *validation* key, so
+        # validation_alias takes precedence over alias.
+        loc_prefix = [_bucket,
+                      self.fi.validation_alias or self.fi.alias or self.fi.name]
         if not present:
             if self.fi.required:
                 return None, [{"type": "missing", "loc": loc_prefix,
