@@ -96,6 +96,14 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
             deps.append(SubDep(dep, sub, dep_marker.use_cache, name))
             continue
         fi = extract_field(name, ann, default, path_params)
+        # Bucket-model: Query()/Header()/Cookie() + BaseModel annotation →
+        # the WHOLE bucket is validated against the model (FastAPI parity);
+        # `_raw_for` returns the full bucket dict, ParamValidator's existing
+        # TypeAdapter(Model).validate_python(dict) does the rest.
+        if fi.marker.in_ in ("query", "header", "cookie") \
+                and isinstance(fi.annotation, type) \
+                and hasattr(fi.annotation, "model_validate"):
+            fi.is_bucket = fi.marker.in_
         fields.append(fi)
         validators[name] = compile_validator(fi)
     return Plan(fn, fields, validators, deps,
@@ -108,8 +116,39 @@ class SolveResult:
     errors: list
 
 
+def _multi_to_model_dict(multi: dict, model) -> dict:
+    """Bucket-model coercion: per-field, if the field is sequence-typed
+    pass the full list of values; else pass the last. Extras with >1
+    values stay as list (lossless; pydantic extra='allow' accepts it)."""
+    import typing as _t
+
+    seq = set()
+    for fname, finfo in model.model_fields.items():
+        keys = {fname}
+        if finfo.alias:
+            keys.add(finfo.alias)
+        origin = _t.get_origin(finfo.annotation) or finfo.annotation
+        if origin in (list, tuple, set, frozenset):
+            seq.update(keys)
+    return {k: (vs if (k in seq or len(vs) > 1) else vs[-1])
+            for k, vs in multi.items()}
+
+
 def _raw_for(fi, request):
     """Pull the raw value + presence for a field from its source bucket."""
+    # Bucket-model fields take the WHOLE bucket dict, validated by the
+    # field's existing TypeAdapter(Model).validate_python(dict).
+    if fi.is_bucket == "query":
+        multi = request.query_params_multi or {}
+        return _multi_to_model_dict(multi, fi.annotation), bool(multi)
+    if fi.is_bucket == "header":
+        multi = request.headers_multi or {}
+        lower = {k.lower(): vs for k, vs in multi.items()}
+        return _multi_to_model_dict(lower, fi.annotation), bool(lower)
+    if fi.is_bucket == "cookie":
+        cks = request.cookies or {}
+        multi = {k: [v] for k, v in cks.items()}
+        return _multi_to_model_dict(multi, fi.annotation), bool(cks)
     src = fi.marker.in_
     key = fi.alias or fi.name
     if src == "path":
@@ -137,13 +176,22 @@ def _raw_for(fi, request):
                     ct = hv
                     break
             if "application/x-www-form-urlencoded" in ct:
-                parsed = urllib.parse.parse_qs(
+                # Keep multi-value form; per-field below decides scalar/list
+                # based on the FieldInfo annotation (FastAPI parity).
+                form = urllib.parse.parse_qs(
                     request.body.decode("latin-1"))
-                form = {k: v[-1] for k, v in parsed.items()}
             else:
                 form = {}
             request._form_cache = form
-        return form.get(key), key in form
+        vs = form.get(key)
+        if vs is None:
+            return None, False
+        import typing as _t
+
+        ann = fi.annotation
+        origin = _t.get_origin(ann) or ann
+        is_seq = origin in (list, tuple, set, frozenset)
+        return (vs if is_seq else vs[-1]), True
     return request.body, bool(request.body)  # body handled at the ASGI seam (T11)
 
 

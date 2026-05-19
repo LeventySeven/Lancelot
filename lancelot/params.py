@@ -88,6 +88,8 @@ class FieldInfo:
     default: typing.Any
     marker: Param
     alias: str | None = None
+    is_bucket: str = ""  # "" | "query" | "header" | "cookie" — bucket-model
+    explicit_marker: bool = False  # True if user wrote Query()/Body()/etc.
 
 
 def _scalar_default_marker(annotation) -> Param:
@@ -97,15 +99,18 @@ def _scalar_default_marker(annotation) -> Param:
 def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
     marker = None
     real_ann = annotation
+    explicit = False
     if typing.get_origin(annotation) is typing.Annotated:
         args = typing.get_args(annotation)
         real_ann = args[0]
         for meta in args[1:]:
             if isinstance(meta, (Param, Depends)):
                 marker = meta
+                explicit = True
     if isinstance(default, (Param, Depends)):
         marker = default
         default = marker.default if isinstance(marker, Param) else Required
+        explicit = True
     if marker is None:
         # FastAPI rule: a bare scalar whose NAME is a route path placeholder
         # is implicitly a Path param; otherwise Query (deep/01 §1).
@@ -117,4 +122,5 @@ def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
     return FieldInfo(
         name, real_ann, required, None if required else eff_default,
         marker, getattr(marker, "alias", None),
+        explicit_marker=explicit,
     )

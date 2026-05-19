@@ -123,12 +123,30 @@ async def _http(app, scope, receive, send):
 
     qs = parse_qs(scope.get("query_string", b"").decode())
     query = {k: v[-1] for k, v in qs.items()}
+    query_multi = dict(qs)  # full multi-value form (bucket-model uses)
     headers = {}  # FIRST-wins (Starlette parity; blocks header smuggling — A2)
+    headers_multi: dict = {}
     for _hk, _hv in scope.get("headers", []):
-        headers.setdefault(_hk.decode(), _hv.decode())
+        k = _hk.decode()
+        headers.setdefault(k, _hv.decode())
+        headers_multi.setdefault(k, []).append(_hv.decode())
+    # Parse cookies from the Cookie header (RFC 6265; semicolon-separated).
+    cookies: dict = {}
+    if "cookie" in headers:
+        from http.cookies import SimpleCookie
+
+        try:
+            sc = SimpleCookie()
+            sc.load(headers["cookie"])
+            cookies = {k: v.value for k, v in sc.items()}
+        except Exception:  # noqa: BLE001 - malformed cookie header → empty
+            cookies = {}
     params = route.match(path) or {}
-    lreq = LRequest(method, path, query, headers, {}, params, body, scope["app"])
+    lreq = LRequest(method, path, query, headers, cookies, params, body,
+                    scope["app"])
     lreq.scope_state = scope.get("state")  # honor incoming ASGI scope state
+    lreq.query_params_multi = query_multi
+    lreq.headers_multi = headers_multi
     from lancelot.background import BackgroundTasks as _BT
 
     lreq._background = _BT()  # FastAPI: fresh per request, run after response

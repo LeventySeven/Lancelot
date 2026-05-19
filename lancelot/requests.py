@@ -15,6 +15,8 @@ class Request:
     scope_state: dict = None  # incoming ASGI scope["state"] (P2 advisory)
     _background: object = None  # fresh BackgroundTasks, set by the ASGI seam
     _ws: object = None  # live WebSocket, set by the ASGI websocket seam
+    query_params_multi: dict = None  # full {k:[v,...]} — bucket-model needs
+    headers_multi: dict = None  # full {k:[v,...]} — multi-value header bucket
 
     @property
     def state(self):

@@ -60,8 +60,14 @@ class Route:
         for fi in list(self.plan.fields):
             if not _is_body_annotation(fi.annotation):
                 continue
+            mk = getattr(fi.marker, "in_", None)
+            # Query/Header/Cookie BUCKET model only when EXPLICIT (the user
+            # wrote `= Query()`); a bare `item: Item` (implicit-Query
+            # default) is FastAPI's body-by-inference rule — still lifted.
+            if fi.explicit_marker and mk in ("query", "header", "cookie"):
+                continue
             # `Annotated[Model, Form()]` → urlencoded form-body, not JSON.
-            if getattr(fi.marker, "in_", None) == "form":
+            if mk == "form":
                 self.body = (fi.name, FormBodyValidator(fi.annotation))
                 self.body_kind = "form"
             else:
