@@ -1,8 +1,10 @@
 from lancelot._native import _ping
 from lancelot.app import App, Lancelot, run
+from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
-__all__ = ["App", "Lancelot", "APIRouter", "TestClient", "run", "_ping"]
+__all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient", "run",
+           "_ping"]
 __version__ = "0.0.0"
 
 

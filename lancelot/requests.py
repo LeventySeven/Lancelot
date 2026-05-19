@@ -12,7 +12,12 @@ class Request:
     body: bytes
     app: object
     _json_cache: object = None
+    scope_state: dict = None  # incoming ASGI scope["state"] (P2 advisory)
 
     @property
     def state(self):
+        # Honor the incoming scope["state"] (Starlette TestClient / middleware
+        # seed it) over app.state — P2-deferred advisory, now implemented.
+        if self.scope_state is not None:
+            return self.scope_state
         return getattr(self.app, "state", None)

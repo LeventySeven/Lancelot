@@ -28,10 +28,13 @@ class Plan:
     dependencies: list  # list[SubDep], topological order
     is_async: bool
     security: list = None  # list[(SecurityBase, scopes_tuple)] for OpenAPI
+    request_params: list = None  # param names bound to the live Request
 
     def __post_init__(self):
         if self.security is None:
             self.security = []
+        if self.request_params is None:
+            self.request_params = []
 
     def field(self, name):
         return next(f for f in self.fields if f.name == name)
@@ -46,11 +49,16 @@ def _is_security(obj) -> bool:
 def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
     hints = typing.get_type_hints(fn, include_extras=True)
     sig = inspect.signature(fn)
-    fields, validators, deps, security = [], {}, [], []
+    from lancelot.requests import Request as _Req
+
+    fields, validators, deps, security, req_params = [], {}, [], [], []
     for name, p in sig.parameters.items():
         ann = hints.get(
             name, p.annotation if p.annotation is not inspect.Parameter.empty else str
         )
+        if ann is _Req:  # `request: Request` → bound to the live Request
+            req_params.append(name)
+            continue
         default = p.default if p.default is not inspect.Parameter.empty else Required
         dep_marker = default if isinstance(default, Depends) else None
         if typing.get_origin(ann) is typing.Annotated:
@@ -75,7 +83,7 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         fields.append(fi)
         validators[name] = compile_validator(fi)
     return Plan(fn, fields, validators, deps,
-                inspect.iscoroutinefunction(fn), security)
+                inspect.iscoroutinefunction(fn), security, req_params)
 
 
 @dataclass
@@ -153,6 +161,8 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
             errors.extend(errs)
         else:
             kwargs[fi.name] = value
+    for nm in plan.request_params:
+        kwargs[nm] = request
     return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
 
 
@@ -217,6 +227,8 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 errors.extend(errs)
             else:
                 kwargs[fi.name] = value
+        for nm in plan.request_params:
+            kwargs[nm] = request
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
     except BaseException as exc:
         # B4: the handler (or a dep) raised inside the `async with` body.

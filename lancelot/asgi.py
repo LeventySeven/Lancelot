@@ -111,6 +111,7 @@ async def _http(app, scope, receive, send):
     headers = {k.decode(): v.decode() for k, v in scope.get("headers", [])}
     params = route.match(path) or {}
     lreq = LRequest(method, path, query, headers, {}, params, body, scope["app"])
+    lreq.scope_state = scope.get("state")  # honor incoming ASGI scope state
 
     body_value, body_errors = None, []
     if route.body is not None:
