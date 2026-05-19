@@ -148,12 +148,15 @@ async def _http(app, scope, receive, send):
             from lancelot.responses import Response
 
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
+                # Starlette init_headers wire order: content-length, then
+                # content-type LAST (header order is part of the wire bytes).
                 await send({"type": "http.response.start",
                             "status": result.status_code,
                             "headers": [
-                                (b"content-type", result.media_type.encode()),
                                 (b"content-length",
-                                 str(len(result.body)).encode())]})
+                                 str(len(result.body)).encode()),
+                                (b"content-type",
+                                 result.media_type.encode())]})
                 await send({"type": "http.response.body", "body": result.body})
                 sent = True
                 return
@@ -163,10 +166,14 @@ async def _http(app, scope, receive, send):
     except HTTPException as exc:  # byte-faithful {"detail":…} + headers (MUST-11)
         if not sent:
             ebody = _wire_json({"detail": exc.detail})
-            hdrs = [(b"content-type", b"application/json"),
-                    (b"content-length", str(len(ebody)).encode())]
-            for k, v in exc.headers.items():
-                hdrs.append((str(k).encode(), str(v).encode()))
+            # Starlette JSONResponse(headers=exc.headers) wire order:
+            # the exception's explicit headers FIRST (names lower-cased,
+            # as Starlette init_headers does), then content-length, then
+            # content-type LAST.
+            hdrs = [(str(k).lower().encode(), str(v).encode())
+                    for k, v in exc.headers.items()]
+            hdrs.append((b"content-length", str(len(ebody)).encode()))
+            hdrs.append((b"content-type", b"application/json"))
             await send({"type": "http.response.start",
                         "status": exc.status_code, "headers": hdrs})
             await send({"type": "http.response.body", "body": ebody})
@@ -179,7 +186,8 @@ async def _send_json(send, status: int, body: bytes):
     await send({
         "type": "http.response.start",
         "status": status,
-        "headers": [(b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode())],
+        # Starlette init_headers wire order: content-length, content-type LAST.
+        "headers": [(b"content-length", str(len(body)).encode()),
+                    (b"content-type", b"application/json")],
     })
     await send({"type": "http.response.body", "body": body})

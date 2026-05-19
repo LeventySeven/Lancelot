@@ -193,6 +193,67 @@ def test_cors_wildcard_methods_headers_and_content_length():
         assert l0.headers.get("content-length") == f0.headers.get("content-length")
 
 
+def _raw_headers(app_callable, method, path, req_headers=None):
+    """Drive the ASGI callable directly and capture the ORDERED
+    http.response.start header list — header order is part of the wire
+    bytes (ASGI servers write the list verbatim); .headers.get() is
+    order-blind and cannot gate this."""
+    import anyio
+
+    out = {}
+
+    async def rcv():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def snd(m):
+        if m["type"] == "http.response.start":
+            out["h"] = [(k.decode(), v.decode()) for k, v in m["headers"]]
+            out["s"] = m["status"]
+
+    scope = {"type": "http", "method": method, "path": path,
+             "raw_path": path.encode(), "query_string": b"",
+             "headers": [(k.lower().encode(), v.encode())
+                         for k, v in (req_headers or {}).items()],
+             "scheme": "http", "server": ("t", 80), "client": ("c", 1),
+             "http_version": "1.1"}
+
+    async def _run():
+        await app_callable(scope, rcv, snd)
+
+    anyio.run(_run)
+    return out["s"], [k for k, _ in out["h"]]
+
+
+def test_wire_header_ORDER_matches_fastapi():
+    """Raw-ASGI differential: the ordered http.response.start header list
+    must equal real fastapi 0.136.1 on every JSON/security/CORS path
+    (Starlette init_headers: explicit headers, then content-length, then
+    content-type LAST). The order-blind .headers.get() asserts could not
+    catch this."""
+    fasgi = _build_fa()         # FastAPI app instance IS the ASGI callable
+    lasgi = _build_lc().asgi()  # Lancelot: build the ASGI callable
+    cases = [
+        ("GET", "/me", None),                                    # 401 sec
+        ("GET", "/nope", None),                                   # 404
+        ("OPTIONS", "/me", {"origin": "https://ex.com",
+                             "access-control-request-method": "GET"}),
+        ("GET", "/me", {"origin": "https://ex.com",
+                        "authorization": "Bearer x"}),            # simple CORS
+        ("GET", "/openapi.json", None),                           # Response
+    ]
+    for m, p, h in cases:
+        fs, fo = _raw_headers(fasgi, m, p, h)
+        ls, lo = _raw_headers(lasgi, m, p, h)
+        assert ls == fs, (m, p, "status", ls, fs)
+        assert lo == fo, (m, p, "HEADER ORDER", lo, fo)
+    # credentials simple path: Starlette emits ACAC before ACAO/Vary
+    fcs, fco = _raw_headers(_cred_app(fastapi, FACORS), "GET", "/",
+                            {"origin": "https://ex.com"})
+    lcs, lco = _raw_headers(_cred_app(lancelot, LCORS).asgi(), "GET", "/",
+                            {"origin": "https://ex.com"})
+    assert lcs == fcs and lco == fco, ("cred simple ORDER", lco, fco)
+
+
 def _p_app(F):
     """One app, six route shapes — the exact predicate FastAPI uses to emit
     the 422 response + HTTPValidationError/ValidationError schemas."""

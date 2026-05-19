@@ -8,7 +8,10 @@ against real fastapi 0.136.1: literal `*` for allow_origins=["*"] (NOT an
 Origin reflector — V1 review blocker); `Vary: Origin` for explicit-list;
 preflight 400 "Disallowed CORS origin|method|headers" (incl. ACRH
 validation); `sorted(SAFELISTED ∪ allow_headers)` Allow-Headers; ACAC
-emitted unconditionally on the simple path (Starlette parity).
+emitted unconditionally on the simple path (Starlette parity). Wire
+header ORDER also matches Starlette (init_headers: content-length then
+content-type LAST; ACAC before ACAO/Vary) — gated by the ordered
+raw-ASGI differential test_wire_header_ORDER_matches_fastapi.
 Genuinely-unimplemented tail (ledgered, conformance/vendor/quarantine/
 test_p4_longtail.py): allow_origin_regex / wildcard-subdomain origins,
 `expose_headers`, `access-control-request-private-network`."""
@@ -72,10 +75,12 @@ class CORSMiddleware:
                 req = [x.strip().lower() for x in acrh.split(",") if x.strip()]
                 if any(r not in self._allow_headers_lc for r in req):
                     failures.append("headers")
-            # Starlette preflight header set (present on BOTH 200 and 400):
+            # Starlette PlainTextResponse wire order (present on BOTH 200 and
+            # 400): vary, ACAM, max-age, [ACAH], [ACAC], [ACAO], then
+            # content-length, then content-type LAST (header order is part
+            # of the wire bytes — init_headers appends ctype/clen last).
             hdrs = [
                 (b"vary", b"Origin"),
-                (b"content-type", b"text/plain; charset=utf-8"),
                 (b"access-control-allow-methods",
                  ", ".join(self.allow_methods).encode()),
                 (b"access-control-max-age", str(self.max_age).encode()),
@@ -95,8 +100,10 @@ class CORSMiddleware:
                 hdrs.append((b"access-control-allow-origin", acao.encode()))
             body = (("Disallowed CORS " + ", ".join(failures)).encode()
                     if failures else b"OK")
-            # Starlette's PlainTextResponse sets Content-Length.
+            # Starlette PlainTextResponse.init_headers: content-length then
+            # content-type appended LAST.
             hdrs.append((b"content-length", str(len(body)).encode()))
+            hdrs.append((b"content-type", b"text/plain; charset=utf-8"))
             await send({"type": "http.response.start",
                         "status": 400 if failures else 200, "headers": hdrs})
             await send({"type": "http.response.body", "body": body})
@@ -108,14 +115,16 @@ class CORSMiddleware:
             if msg["type"] == "http.response.start":
                 msg = dict(msg)
                 hh = list(msg.get("headers", []))
+                # Starlette simple_response wire order: headers.update(
+                # simple_headers) puts ACAC FIRST (unconditional — inert
+                # without ACAO), THEN the explicit-origin branch appends
+                # ACAO and the Vary header.
+                if self.allow_credentials:
+                    hh.append((b"access-control-allow-credentials", b"true"))
                 if allowed:
                     hh.append((b"access-control-allow-origin", acao.encode()))
                     if vary:
                         hh.append((b"vary", b"Origin"))
-                # ACAC is unconditional in Starlette's simple_headers
-                # (emitted even on a disallowed origin — inert without ACAO).
-                if self.allow_credentials:
-                    hh.append((b"access-control-allow-credentials", b"true"))
                 msg["headers"] = hh
             await send(msg)
 
