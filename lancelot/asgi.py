@@ -14,7 +14,10 @@ def build_asgi(app):
         if scope["type"] == "http":
             await _http(app, scope, receive, send)
             return
-        raise NotImplementedError(scope["type"])  # websocket -> M1-P6
+        if scope["type"] == "websocket":
+            await _ws(app, scope, receive, send)
+            return
+        raise NotImplementedError(scope["type"])
 
     return asgi
 
@@ -210,6 +213,53 @@ async def _http(app, scope, receive, send):
     except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
+
+
+async def _ws(app, scope, receive, send):
+    """ASGI WebSocket seam (WBS U13). DI works like the HTTP path; a
+    dependency/path validation failure → close 1008 with the JSON-encoded
+    errors as reason (deep/01 line 93 / MUST-7) BEFORE accept. The Rust
+    tokio-tungstenite realization is the spec §3-69 unification."""
+    from lancelot.di import solve_async
+    from lancelot.requests import Request as LRequest
+    from lancelot.validation import _wire_json
+    from lancelot.websockets import WebSocket, WebSocketDisconnect
+
+    path = scope["path"]
+    scope.setdefault("app", _AppProxy(app))
+    route, _info = app.router.match_ws(path)
+    ws = WebSocket(scope, receive, send)
+    if route is None:
+        try:
+            await receive()  # consume websocket.connect
+        except Exception:  # noqa: BLE001
+            return
+        await send({"type": "websocket.close", "code": 1006})
+        return
+
+    params = route.match(path) or {}
+    ws.path_params = params
+    headers = {}
+    for hk, hv in scope.get("headers", []):
+        headers.setdefault(hk.decode(), hv.decode())
+    lreq = LRequest("GET", path, {}, headers, {}, params, b"", scope["app"])
+    lreq._ws = ws
+    try:
+        async with solve_async(route.plan, lreq) as res:
+            if res.errors:  # MUST-7: validation failure → close 1008
+                await ws.close(code=1008,
+                               reason=_wire_json(res.errors).decode())
+                return
+            result = route.handler(**res.kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+    except WebSocketDisconnect:
+        return  # client closed mid-handler — nothing to send
+    except Exception:  # noqa: BLE001 - never let it escape the ASGI callable
+        try:
+            await ws.close(code=1011)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _send_json(send, status: int, body: bytes):

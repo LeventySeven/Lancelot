@@ -29,6 +29,7 @@ class Route:
     handler: Callable[..., Any]
     name: str = ""
     include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
+    is_ws: bool = False  # WebSocket route (matched by scope type, not method)
 
     def __post_init__(self):
         self.method = self.method.upper()
@@ -89,6 +90,14 @@ class APIRouter:
     def head(self, p): return self._add("HEAD", p)
     def options(self, p): return self._add("OPTIONS", p)
 
+    def websocket(self, path: str):
+        def deco(fn):
+            self.routes.append(
+                Route("GET", self.prefix + path, fn, is_ws=True))
+            return fn
+
+        return deco
+
     def include_router(self, router: "APIRouter", prefix: str = ""):
         add_prefix = (self.prefix + prefix).rstrip("/")
         for r in router.routes:
@@ -110,6 +119,8 @@ class Router:
         method = method.upper()
         path_exists = False
         for r in self.routes:
+            if r.is_ws:  # WebSocket routes are matched via match_ws only
+                continue
             params = r.match(path)
             if params is None:
                 continue
@@ -117,3 +128,12 @@ class Router:
             if r.method == method:
                 return r, params
         return (None, 405) if path_exists else (None, 404)
+
+    def match_ws(self, path: str):
+        for r in self.routes:
+            if not r.is_ws:
+                continue
+            params = r.match(path)
+            if params is not None:
+                return r, params
+        return None, 404

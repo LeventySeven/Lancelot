@@ -74,6 +74,13 @@ class App:
 
         return deco
 
+    def websocket(self, path: str):
+        def deco(fn):
+            self.router.add(Route("GET", path, fn, is_ws=True))
+            return fn
+
+        return deco
+
     def get(self, p): return self._add("GET", p)
     def post(self, p): return self._add("POST", p)
     def put(self, p): return self._add("PUT", p)

@@ -14,6 +14,7 @@ class Request:
     _json_cache: object = None
     scope_state: dict = None  # incoming ASGI scope["state"] (P2 advisory)
     _background: object = None  # fresh BackgroundTasks, set by the ASGI seam
+    _ws: object = None  # live WebSocket, set by the ASGI websocket seam
 
     @property
     def state(self):

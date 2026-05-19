@@ -64,6 +64,17 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         if ann is _BT:  # FastAPI: a fresh BackgroundTasks injected per req
             req_params.append(("__bg__", name))
             continue
+        from lancelot.websockets import WebSocket as _WS
+
+        # `websocket: WebSocket` (FastAPI) OR a bare param literally named
+        # `websocket` (Starlette WebSocketRoute convention) → live socket.
+        if ann is _WS or (
+            name == "websocket"
+            and p.annotation is inspect.Parameter.empty
+            and p.default is inspect.Parameter.empty
+        ):
+            req_params.append(("__ws__", name))
+            continue
         default = p.default if p.default is not inspect.Parameter.empty else Required
         dep_marker = default if isinstance(default, Depends) else None
         if typing.get_origin(ann) is typing.Annotated:
@@ -169,6 +180,8 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
     for entry in plan.request_params:
         if isinstance(entry, tuple) and entry[0] == "__bg__":
             kwargs[entry[1]] = request._background  # set by the ASGI seam
+        elif isinstance(entry, tuple) and entry[0] == "__ws__":
+            kwargs[entry[1]] = request._ws  # live WebSocket (ws seam)
         else:
             kwargs[entry] = request
     return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
@@ -247,6 +260,8 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
         for entry in plan.request_params:
             if isinstance(entry, tuple) and entry[0] == "__bg__":
                 kwargs[entry[1]] = request._background  # set by ASGI seam
+            elif isinstance(entry, tuple) and entry[0] == "__ws__":
+                kwargs[entry[1]] = request._ws  # live WebSocket (ws seam)
             else:
                 kwargs[entry] = request
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
