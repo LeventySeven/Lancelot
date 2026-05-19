@@ -1,0 +1,36 @@
+"""M1-P5 LEDGER (quarantined, excluded from the ratchet) — the
+genuinely-deferred blocking-pool / background tail. M1-P5 ships the
+behavior on the Python ASGI seam (the path the conformance/byte oracle
+actually exercises): a bounded stdlib blocking pool offloads sync
+handlers + sync deps, overload → byte 503 Retry-After, BackgroundTasks
+byte/timing-faithful to fastapi 0.136.1, and a detached background.spawn
+pool. RED here = the parts NOT in M1-P5 scope:
+
+  1. The Rust 3-variant Empty/Mono/Pool runner (src/blocking/runner.rs)
+     + crossbeam BOUNDED(10_000) + py.detach()-on-recv + adaptive
+     single-flight spawn + idle-timeout death, AND src/background/
+     pool.rs — these belong to the spec §3-69 Rust-pipeline unification
+     (TestClient drives the Python ASGI seam today; the Python pool is
+     the realization the byte oracle reaches). DO NOT silently pass.
+  2. /metrics queue-depth / in-flight / rejected counters — that is
+     U35 (M3 observability), not M1.
+  3. Graceful-shutdown drain of in-flight blocking + background work on
+     lifespan shutdown / SIGTERM (U34 / U7, M3).
+Graduate into conformance/vendor/ as M3 + the §3-69 unification land."""
+import pytest
+
+
+def test_rust_blocking_runner_and_bg_pool_unification_S369():
+    pytest.fail("spec §3-69: Rust src/blocking/runner.rs + "
+                "src/background/pool.rs wired into the Rust hyper path "
+                "(M1-P5 ships the byte-faithful Python-ASGI-seam pool)")
+
+
+def test_pool_metrics_queue_depth_U35_M3():
+    pytest.fail("U35/M3: blocking_pool_* + background queue depth in "
+                "/metrics (M1-P5 enforces the bound; metrics are M3)")
+
+
+def test_graceful_drain_on_shutdown_M3():
+    pytest.fail("M3/U34: drain in-flight blocking+background work on "
+                "lifespan shutdown / SIGTERM")
