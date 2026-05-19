@@ -50,18 +50,25 @@ class Route:
         # and lift it out of scalar validation (validated single-pass at the
         # ASGI seam). list[Model]/dataclass bodies are long-tail → P7 ratchet.
         from lancelot.di import compile_dependant
-        from lancelot.validation import BodyValidator
+        from lancelot.validation import BodyValidator, FormBodyValidator
 
         self.plan = compile_dependant(
             self.handler, path_params=set(self._rx.groupindex)
         )
         self.body = None
+        self.body_kind = "json"  # "json" | "form"  (multipart ledgered)
         for fi in list(self.plan.fields):
-            if _is_body_annotation(fi.annotation):
+            if not _is_body_annotation(fi.annotation):
+                continue
+            # `Annotated[Model, Form()]` → urlencoded form-body, not JSON.
+            if getattr(fi.marker, "in_", None) == "form":
+                self.body = (fi.name, FormBodyValidator(fi.annotation))
+                self.body_kind = "form"
+            else:
                 self.body = (fi.name, BodyValidator(fi.annotation))
-                self.plan.fields = [f for f in self.plan.fields
-                                    if f.name != fi.name]
-                self.plan.validators.pop(fi.name, None)
+            self.plan.fields = [f for f in self.plan.fields
+                                if f.name != fi.name]
+            self.plan.validators.pop(fi.name, None)
 
     def match(self, path: str):
         m = self._rx.match(path)

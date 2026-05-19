@@ -109,6 +109,52 @@ class BodyValidator:
             return None, errs
 
 
+class FormBodyValidator:
+    """Form-body bucket: `Annotated[FormModel, Form()]` parses the
+    urlencoded body into a Pydantic model. FastAPI rule: per-field, if
+    the annotation is a sequence, use multi-values; else scalar (last).
+    `model_config={"extra":"allow"}` passes through unknown keys
+    automatically (pydantic handles it). Multipart is ledgered RED."""
+
+    def __init__(self, model):
+        import typing as _t
+        from pydantic_core import PydanticUndefined
+
+        self._model = model
+        self._adapter = TypeAdapter(model)
+        seq, defaults = set(), {}
+        for fname, finfo in model.model_fields.items():
+            keys = {fname}
+            if finfo.alias:
+                keys.add(finfo.alias)
+            origin = _t.get_origin(finfo.annotation) or finfo.annotation
+            if origin in (list, tuple, set, frozenset):
+                seq.update(keys)
+            # FastAPI Form-model: non-None defaults are pre-populated into
+            # the validation input so a missing-required error's `input`
+            # reflects the model state, matching test_no_data byte-shape.
+            if finfo.default is not PydanticUndefined and finfo.default is not None:
+                key = finfo.alias or fname
+                defaults[key] = finfo.default
+        self._seq_keys = seq
+        self._defaults = defaults
+
+    def validate_form(self, pairs):
+        """pairs: list[(name, value)] from urllib.parse.parse_qsl.
+        Per-key: if the field is sequence-typed OR multiple values were
+        sent (extra="allow" lossless rule), pass a list; else scalar."""
+        multi: dict = {}
+        for k, v in pairs:
+            multi.setdefault(k, []).append(v)
+        data: dict = dict(self._defaults)
+        for k, vs in multi.items():
+            data[k] = vs if (k in self._seq_keys or len(vs) > 1) else vs[0]
+        try:
+            return self._adapter.validate_python(data), []
+        except ValidationError as e:
+            return None, _regenerate(e, ["body"])
+
+
 def compile_validator(fi: FieldInfo) -> ParamValidator:
     return ParamValidator(fi)
 

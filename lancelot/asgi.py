@@ -137,7 +137,18 @@ async def _http(app, scope, receive, send):
     if route.body is not None:
         bname, bval = route.body
         if body:
-            body_value, body_errors = bval.validate_json(body)
+            if getattr(route, "body_kind", "json") == "form":
+                import urllib.parse as _up
+
+                pairs = _up.parse_qsl(body.decode("latin-1"),
+                                      keep_blank_values=True)
+                body_value, body_errors = bval.validate_form(pairs)
+            else:
+                body_value, body_errors = bval.validate_json(body)
+        elif getattr(route, "body_kind", "json") == "form":
+            # FastAPI: empty form-body validates an empty dict against
+            # the model (defaults / extra="allow" may make it succeed).
+            body_value, body_errors = bval.validate_form([])
         else:
             body_errors = [{"type": "missing", "loc": ["body", bname],
                             "msg": "Field required", "input": None}]
