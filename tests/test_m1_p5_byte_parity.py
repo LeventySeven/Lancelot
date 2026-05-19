@@ -236,3 +236,44 @@ def test_background_spawn_bounded_queue_rejects_when_full():
         rel.set()
     finally:
         bp.shutdown()
+
+
+def test_import_lancelot_stays_dependency_light_with_pool():
+    # M0 DoD #1 regression guard: importing lancelot (and touching the
+    # pool/background surface) must NOT pull anyio/starlette/httpx/fastapi.
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, lancelot;"
+        "lancelot.BackgroundTasks; lancelot.background;"
+        "import lancelot.pool;"
+        "bad=[m for m in ('anyio','starlette','httpx','fastapi') "
+        "if m in sys.modules];"
+        "print('LEAK' if bad else 'CLEAN', bad)"
+    )
+    out = subprocess.run([sys.executable, "-c", code],
+                         capture_output=True, text=True)
+    assert out.stdout.strip().startswith("CLEAN"), out.stdout + out.stderr
+
+
+def test_async_handler_still_inline_bytes_match_fastapi():
+    # regression: the offload split must not change async-handler bytes
+    import fastapi
+    from fastapi.testclient import TestClient as FA
+    import lancelot
+    from lancelot.testclient import TestClient as LC
+
+    def build(F):
+        app = F.FastAPI() if hasattr(F, "FastAPI") else F.App()
+
+        @app.get("/a")
+        async def a():
+            return {"async": True}
+
+        return app
+
+    with FA(build(fastapi)) as fa, LC(build(lancelot)) as lc:
+        f, l = fa.get("/a"), lc.get("/a")
+        assert l.status_code == f.status_code == 200
+        assert l.content == f.content
