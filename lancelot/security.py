@@ -145,3 +145,59 @@ class HTTPBasic(SecurityBase):
         if not sep:
             raise unauth
         return HTTPBasicCredentials(username=user, password=pw)
+
+
+class OAuth2(SecurityBase):
+    def __init__(self, *, flows=None, scheme_name=None, description=None,
+                 auto_error=True):
+        self.auto_error = auto_error
+        self.scheme_name = scheme_name or self.__class__.__name__
+        m = {"type": "oauth2", "flows": flows or {}}
+        if description is not None:
+            m["description"] = description
+        self.model = m
+
+    def _401(self):
+        return HTTPException(401, "Not authenticated",
+                             {"WWW-Authenticate": "Bearer"})
+
+    async def __call__(self, request):
+        auth = _auth_header(request)
+        if not auth:                                  # MUST-9
+            if self.auto_error:
+                raise self._401()
+            return None
+        return auth                                   # raw full header
+
+
+class OAuth2PasswordBearer(OAuth2):
+    def __init__(self, tokenUrl, *, scopes=None, scheme_name=None,
+                 description=None, auto_error=True, refreshUrl=None):
+        flow = {"scopes": scopes or {}, "tokenUrl": tokenUrl}  # MUST-10 key order
+        if refreshUrl is not None:
+            flow = {"refreshUrl": refreshUrl, **flow}
+        super().__init__(flows={"password": flow}, scheme_name=scheme_name,
+                         description=description, auto_error=auto_error)
+
+    async def __call__(self, request):
+        auth = _auth_header(request)
+        scheme, param = _scheme_param(auth)
+        if not auth or scheme.lower() != "bearer":
+            if self.auto_error:
+                raise self._401()
+            return None
+        return param                                  # token only
+
+
+class OAuth2PasswordRequestForm:
+    """Form-dependency import surface. Full form parsing is M1-P6 (forms);
+    the byte-exact 422 form shape is a P7 quarantine ledger item."""
+
+    def __init__(self, *, grant_type=None, username="", password="",
+                 scope="", client_id=None, client_secret=None):
+        self.grant_type = grant_type
+        self.username = username
+        self.password = password
+        self.scopes = scope.split()
+        self.client_id = client_id
+        self.client_secret = client_secret
