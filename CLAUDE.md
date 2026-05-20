@@ -24,9 +24,9 @@ make m1-conformance                                 # FastAPI byte-parity gate
 $HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings
 ```
 
-If any of these go red, the chunk does not ship. The conformance floor is `passes=910` (= 93.5% of 973).
+If any of these go red, the chunk does not ship. The conformance floor is `passes=948` (= 97.4% of 973).
 
-## Current milestone state (as of m2-conformance-push)
+## Current milestone state (as of m2-conformance-push2)
 
 - **M0** green (Rust core, hyper/tokio/pyo3)
 - **M1-EXIT** hit at 90.0% conformance, tag `m1-exit-90`
@@ -35,6 +35,7 @@ If any of these go red, the chunk does not ship. The conformance floor is `passe
 - **M2 Tier-C** — AI primitives (canonical JSON, session-affinity, transport-pool cancellation, tool output_schema, dynamic-write audit), tag `m2-tierC`
 - **M2 Tier-C5** — marquee `@app.batch` for prefix-aware request grouping, tag `m2-tierC5`
 - **M2 conformance push** — 876 → 910 Class-A passes (93.5%), tag `m2-conformance-push`. Unlocks: `@app.exception_handler` surface, `strict_content_type`, `Json[T]` Annotated preservation, lenient cookie parser, subclass-class-attr media_type, callable-instance + partial DI, single-Body scalar pattern, Starlette plaintext 500, Optional[list[T]] form wrapping.
+- **M2 conformance push 2** — 910 → 948 Class-A passes (97.4%), tag `m2-conformance-push2`. Unlocks: yield-dep swallowed-exception → FastAPIError, SecurityScopes chain propagation + per-scope cache_key, stream item validation, lru_cache/wraps unwrap in DI, 204/205/304/1xx no-body emit, Depends/Security hashable, include_router empty-path/self guards, TRACE method, list[Model]/dict[Model] response coercion, Starlette ASGI-callable response delegation (FileResponse/RedirectResponse), @app.on_event decorator, PEP 695 TypeAliasType unwrap, lax-mode explicit-CT enforcement, WS metaclass for Starlette cross-stack disconnect, WS query/cookie at handshake.
 
 Public surface added this milestone:
 - `lancelot.canonical.dumps_canonical(obj)` → stable JSON bytes for KV-cache stability
@@ -49,6 +50,9 @@ Public surface added this milestone:
 - `Response.set_session_affinity(key)`
 - Per-route `timeout=` kwarg → 504 on miss, yield-dep teardown preserved
 - Per-route / per-router `strict_content_type=True/False/None` (inherits)
+- `@app.on_event("startup"/"shutdown")` (deprecated, emits FastAPIDeprecationWarning)
+- `App.add_exception_handler(ExcCls, fn)` / `@app.exception_handler(ExcCls)` decorator
+- TRACE HTTP method on App + APIRouter
 - Magic-inject types: `Request`, `BackgroundTasks`, `WebSocket`, `Response`, `SecurityScopes`
 
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
