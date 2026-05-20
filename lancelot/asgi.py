@@ -314,12 +314,21 @@ async def _http(app, scope, receive, send):
             # FastAPI response_model: validate-coerce-and-serialize the
             # return value through pydantic, honouring by_alias / exclude_*
             # kwargs (default by_alias=True; the rest default False).
+            # For a BaseModel response_model use model_validate with
+            # from_attributes=True so a different BaseModel instance is
+            # coerced ORM-style (fields outside response_model are dropped).
             if route.response_model is not None:
-                from pydantic import TypeAdapter, ValidationError
+                from pydantic import BaseModel as _BM, TypeAdapter, \
+                    ValidationError
 
                 try:
-                    _ta = TypeAdapter(route.response_model)
-                    _val = _ta.validate_python(result)
+                    rm = route.response_model
+                    if (isinstance(rm, type) and issubclass(rm, _BM)
+                            and not isinstance(result, rm)):
+                        _val = rm.model_validate(result, from_attributes=True)
+                    else:
+                        _val = TypeAdapter(rm).validate_python(result)
+                    _ta = TypeAdapter(rm)
                     payload = _ta.dump_json(
                         _val,
                         by_alias=route.response_model_by_alias,
