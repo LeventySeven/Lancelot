@@ -24,6 +24,9 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"
 http = "1"
 tower = { version = "0.5", features = ["util"] }
+# R7: FutureExt::catch_unwind for FFI seam panic safety. Default features
+# off — we only need the executor-agnostic FutureExt traits.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 # `all` feature required for set_reuse_port (plan's bare `socket2 = "0.5"`
 # is a defect — set_reuse_port is gated behind socket2's `all` feature).
 socket2 = { version = "0.5", features = ["all"] }

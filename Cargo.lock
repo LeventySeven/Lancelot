@@ -342,6 +342,7 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "dhat",
+ "futures",
  "http",
  "http-body-util",
  "hyper",

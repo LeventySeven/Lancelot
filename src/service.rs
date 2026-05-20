@@ -49,13 +49,25 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
         Err(_) => Bytes::new(),
     };
     let handler = crate::gil::with_gil(|py| app.handlers[slot].clone_ref(py));
-    match call_async(app.locals.clone(), handler, body).await {
-        Ok(json) => HResp::builder()
+    // R7: catch_unwind at the FFI seam — any panic in the dispatch
+    // future (Python code, pyo3 conversions, anywhere) becomes a 500
+    // INSTEAD of killing the worker. Closes the documented Robyn defect
+    // (deep/04:17 — panic=abort with no catch_unwind kills the worker
+    // with no supervisor). `panic = "unwind"` is set in Cargo.toml so
+    // this is actionable.
+    use futures::FutureExt;
+    let dispatched = std::panic::AssertUnwindSafe(
+        call_async(app.locals.clone(), handler, body)
+    ).catch_unwind().await;
+    match dispatched {
+        Ok(Ok(json)) => HResp::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(json)))
             .unwrap(),
-        Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+        Ok(Err(_)) => plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+        Err(_panicked) => plain(
+            StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
     }
 }
 
