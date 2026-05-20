@@ -225,8 +225,17 @@ class App:
 
     def include_router(self, router: APIRouter, prefix: str = ""):
         prefix = prefix.rstrip("/")
+        # Copy ALL user-set Route fields (dependencies, status_code,
+        # response_model, etc.) — FastAPI parity, matches the parallel
+        # fix in APIRouter.include_router.
+        import dataclasses as _dc
+
+        _copy = {f.name for f in _dc.fields(Route)} - {
+            "method", "path", "handler", "name"}
         for r in router.routes:
-            self.router.add(Route(r.method, prefix + r.path, r.handler, r.name))
+            kw = {k: getattr(r, k) for k in _copy}
+            self.router.add(Route(r.method, prefix + r.path, r.handler,
+                                  r.name, **kw))
 
     def openapi(self) -> dict:
         """Built once at first access, then memoized (FastAPI semantics:

@@ -187,8 +187,18 @@ class APIRouter:
 
     def include_router(self, router: "APIRouter", prefix: str = ""):
         add_prefix = (self.prefix + prefix).rstrip("/")
+        # Copy ALL the user-set Route fields, not just method/path/handler
+        # — route-level dependencies, status_code, response_model, etc.
+        # must survive the include (FastAPI parity).
+        import dataclasses as _dc
+
+        _copy = {f.name for f in _dc.fields(Route)} - {
+            "method", "path", "handler", "name"}
         for r in router.routes:
-            self.routes.append(Route(r.method, add_prefix + r.path, r.handler, r.name))
+            kw = {k: getattr(r, k) for k in _copy
+                  if k not in ("plan", "body", "body_kind")}
+            self.routes.append(Route(r.method, add_prefix + r.path,
+                                     r.handler, r.name, **kw))
 
 
 class Router:
