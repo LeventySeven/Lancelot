@@ -46,6 +46,12 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
+        # FastAPI parity: `FastAPI(default_response_class=ORJSONResponse)`
+        # picks the response class for any route that didn't override.
+        self._default_response_class = kwargs.pop(
+            "default_response_class", None)
+        # Apply to routes registered directly on the app, too — same
+        # hierarchical resolution as include_router.
         self._register_builtin_routes()
 
     async def __call__(self, scope, receive, send):
@@ -108,6 +114,10 @@ class App:
 
         known = {f.name for f in _dc.fields(Route)}
         kw = {k: v for k, v in kwargs.items() if k in known}
+        # App-level default_response_class fallback (route didn't override).
+        if kw.get("response_class") is None and \
+                self._default_response_class is not None:
+            kw["response_class"] = self._default_response_class
 
         def deco(fn):
             self.router.add(Route(method, path, fn, **kw))
@@ -231,10 +241,17 @@ class App:
     def include_router(self, router: APIRouter, prefix: str = "", **kwargs):
         # Accepts FastAPI's documented include_router kwargs (dependencies,
         # default_response_class, responses, tags, deprecated, ...).
-        # Lancelot acts on `dependencies` (prepended to each route); the
-        # rest are surface-only (collection-unblock).
+        # Lancelot acts on `dependencies` (prepended) and
+        # `default_response_class` (applied to child routes without own).
         prefix = prefix.rstrip("/")
         extra_deps = list(kwargs.pop("dependencies", None) or [])
+        # Resolve effective default response class — include arg > router's
+        # own default > app's own default.
+        default_rc = kwargs.pop(
+            "default_response_class",
+            getattr(router, "default_response_class", None)
+            or self._default_response_class,
+        )
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
@@ -244,6 +261,8 @@ class App:
             if extra_deps:
                 kw["dependencies"] = list(extra_deps) + list(
                     kw.get("dependencies", []) or [])
+            if kw.get("response_class") is None and default_rc is not None:
+                kw["response_class"] = default_rc
             self.router.add(Route(r.method, prefix + r.path, r.handler,
                                   r.name, **kw))
 

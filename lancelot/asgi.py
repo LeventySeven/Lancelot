@@ -405,8 +405,35 @@ async def _http(app, scope, receive, send):
                                 extra_hdrs.append((kb, str(vv).encode()))
                         else:
                             extra_hdrs.append((kb, str(v).encode()))
-            await _send_json(send, default_status, payload,
-                             extra_headers=extra_hdrs)
+            # FastAPI `response_class=ORJSONResponse / PlainTextResponse /
+            # HTMLResponse / ...`: instantiate it with the (already-resolved)
+            # `result` (or already-serialized `payload` for JSONResponse) and
+            # emit. Without response_class we fall through to the byte-fast
+            # JSON path.
+            if route.response_class is not None:
+                # Build a response object — its render() decides bytes.
+                _rcls = route.response_class
+                # If the handler returned a Response we already handled it
+                # above; here `result` is a Python value.
+                try:
+                    _r = _rcls(result)
+                except TypeError:
+                    # Some Response subclasses take (content, status_code).
+                    _r = _rcls(result, default_status)
+                _r_status = (scratch.status_code if scratch is not None
+                             and scratch.status_code is not None
+                             else default_status)
+                _hdrs = list(extra_hdrs or [])
+                _hdrs.append((b"content-length",
+                              str(len(_r.body)).encode()))
+                _hdrs.append((b"content-type",
+                              _r.media_type.encode()))
+                await send({"type": "http.response.start",
+                            "status": _r_status, "headers": _hdrs})
+                await send({"type": "http.response.body", "body": _r.body})
+            else:
+                await _send_json(send, default_status, payload,
+                                 extra_headers=extra_hdrs)
             sent = True
             if lreq._background._tasks:  # FastAPI: post-send, pre-teardown
                 await lreq._background()
@@ -433,20 +460,17 @@ async def _http(app, scope, receive, send):
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": pbody})
-    except Exception as _exc:  # noqa: BLE001
-        # FastAPI: ResponseValidationError + WebSocketRequestValidationError
-        # MUST propagate (testclient asserts, ASGI server logs). Other
-        # exceptions become a 500 wire-response without leaking traceback.
-        from lancelot.exceptions import ResponseValidationError
-
-        if isinstance(_exc, ResponseValidationError):
-            if not sent:
-                await _send_json(
-                    send, 500, b'{"detail":"Internal Server Error"}')
-                sent = True
-            raise
+    except Exception:  # noqa: BLE001
+        # FastAPI/Starlette: in production ServerErrorMiddleware wraps and
+        # emits 500. The TestClient runs WITHOUT that wrap by default
+        # (raise_server_exceptions=True) → the original exception MUST
+        # propagate so `pytest.raises(...)` sees it. Send a 500 wire body
+        # if nothing has been sent (production-server fallback), then
+        # re-raise unconditionally — the harness's wrap decides.
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
+            sent = True
+        raise
 
 
 async def _ws(app, scope, receive, send):

@@ -245,10 +245,13 @@ class APIRouter:
                        **kwargs):
         # FastAPI: include_router accepts dependencies, default_response_class,
         # responses, tags, deprecated, include_in_schema, callbacks. The ones
-        # Lancelot acts on are dependencies (prepended) and tags (extended);
-        # the rest are surface-only collection-unblocks.
+        # Lancelot acts on: dependencies (prepended), default_response_class
+        # (applied to child routes without their own response_class), tags
+        # (extended). The rest are surface-only collection-unblocks.
         add_prefix = (self.prefix + prefix).rstrip("/")
         extra_deps = list(kwargs.pop("dependencies", None) or [])
+        default_rc = kwargs.pop("default_response_class",
+                                getattr(self, "default_response_class", None))
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
@@ -260,6 +263,11 @@ class APIRouter:
                 # Prepended → run before the route's own deps (FastAPI).
                 kw["dependencies"] = list(extra_deps) + list(
                     kw.get("dependencies", []) or [])
+            # Hierarchical default_response_class: the child route's own
+            # response_class wins; otherwise the include-time default; the
+            # parent router's default; finally None (App-level fallback).
+            if kw.get("response_class") is None and default_rc is not None:
+                kw["response_class"] = default_rc
             self.routes.append(Route(r.method, add_prefix + r.path,
                                      r.handler, r.name, **kw))
 

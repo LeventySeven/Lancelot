@@ -20,4 +20,11 @@ class TestClient(_StarletteTestClient):
 
     def __init__(self, app, base_url: str = "http://testserver", **kw):
         asgi = app.asgi() if hasattr(app, "asgi") else app
+        # Default to NOT-raising server exceptions: Lancelot's own internal
+        # test suite asserts on the 500 wire-shape (ServerErrorMiddleware
+        # contract). The conformance swap uses Starlette's TestClient
+        # directly (RealTestClient — see conformance/swap.py), which keeps
+        # the Starlette default raise_server_exceptions=True so vendored
+        # `pytest.raises(...)` assertions behave verbatim.
+        kw.setdefault("raise_server_exceptions", False)
         super().__init__(asgi, base_url=base_url, **kw)

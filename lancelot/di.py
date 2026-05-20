@@ -56,6 +56,7 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
 
     partial_args = ()
     partial_kw: dict = {}
+    orig_callable = fn  # used as the actual call target (partial preserves bind)
     if isinstance(fn, _ft.partial):
         partial_args = fn.args
         partial_kw = dict(fn.keywords or {})
@@ -77,8 +78,18 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         sig = inspect.signature(fn)
     from lancelot.requests import Request as _Req
 
+    # Skip params already pre-bound by functools.partial. Positional
+    # partial_args bind in declaration order; partial_kw binds by name.
+    _bound_names: set = set(partial_kw.keys())
+    _param_names = [n for n in sig.parameters.keys()]
+    for _i in range(len(partial_args)):
+        if _i < len(_param_names):
+            _bound_names.add(_param_names[_i])
+
     fields, validators, deps, security, req_params = [], {}, [], [], []
     for name, p in sig.parameters.items():
+        if name in _bound_names:
+            continue
         ann = hints.get(
             name, p.annotation if p.annotation is not inspect.Parameter.empty else str
         )
@@ -157,7 +168,7 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
             fi.is_bucket = fi.marker.in_
         fields.append(fi)
         validators[name] = compile_validator(fi)
-    return Plan(fn, fields, validators, deps,
+    return Plan(orig_callable, fields, validators, deps,
                 inspect.iscoroutinefunction(fn), security, req_params)
 
 
