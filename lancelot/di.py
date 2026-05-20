@@ -199,7 +199,16 @@ def _raw_for(fi, request):
             else:
                 form = {}
             request._multipart_cache = form
-        return form.get(key), key in form
+        v = form.get(key)
+        # FastAPI: `p: bytes = File()` reads the file bytes; `p:
+        # UploadFile = File()` keeps the wrapper. Coerce here so the
+        # validator sees the right shape.
+        from lancelot.uploads import UploadFile as _UF
+
+        if fi.annotation is bytes and isinstance(v, _UF):
+            v.file.seek(0)
+            v = v.file.read()
+        return v, key in form
     if src == "form":
         # application/x-www-form-urlencoded only (stdlib — no runtime dep).
         # multipart/form-data + UploadFile is ledgered (needs

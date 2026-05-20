@@ -58,7 +58,8 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
     FastAPI's FormData shape (single value per key for now; multi-value
     is on the M1-EXIT roadmap)."""
     try:
-        from python_multipart import parse_options_header, MultipartParser
+        from python_multipart import MultipartParser
+        from python_multipart.multipart import parse_options_header
     except ImportError as e:
         raise RuntimeError(
             "File/multipart requires `python-multipart` "
