@@ -36,6 +36,12 @@ def _field_schema(fi) -> dict:
     # Optional params carry their default in the schema (FastAPI/pydantic).
     if not fi.required and fi.default is not None and "default" not in s:
         s["default"] = fi.default
+    # OpenAPI 3.1: File() bytes / UploadFile use `contentMediaType:
+    # application/octet-stream` instead of pydantic's legacy
+    # `format: binary` (FastAPI does this transform too).
+    if getattr(fi.marker, "in_", None) == "file" and s.get("format") == "binary":
+        s.pop("format")
+        s["contentMediaType"] = "application/octet-stream"
     return s
 
 

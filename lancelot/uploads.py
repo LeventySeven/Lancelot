@@ -47,6 +47,8 @@ class UploadFile:
 
     @classmethod
     def __get_pydantic_json_schema__(cls, schema, handler):
+        # OpenAPI 3.1: contentMediaType is the modern shape; the openapi
+        # builder re-applies this for `bytes` annotations on File() params.
         return {"type": "string", "format": "binary"}
 
 
