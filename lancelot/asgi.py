@@ -256,6 +256,29 @@ async def _http(app, scope, receive, send):
                 result = await get_pool().offload(route.handler, **kwargs)
             from lancelot.responses import Response
 
+            # FastAPI: a handler returning a raw async-iter / generator
+            # gets auto-wrapped in a StreamingResponse (JSON lines for
+            # iterators of dicts). Detect and wrap.
+            import inspect as _isp
+            if not isinstance(result, Response) and (
+                    _isp.isasyncgen(result) or _isp.isgenerator(result)
+                    or hasattr(result, "__aiter__")):
+                from lancelot.responses import StreamingResponse
+                import json as _json
+
+                async def _aiter_json(it):
+                    if _isp.isasyncgen(it) or hasattr(it, "__aiter__"):
+                        async for x in it:
+                            yield _json.dumps(x).encode() if not isinstance(
+                                x, (bytes, str)) else (
+                                x if isinstance(x, bytes) else x.encode())
+                    else:
+                        for x in it:
+                            yield _json.dumps(x).encode() if not isinstance(
+                                x, (bytes, str)) else (
+                                x if isinstance(x, bytes) else x.encode())
+                result = StreamingResponse(_aiter_json(result),
+                                           media_type="application/json")
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
                 _user_hdrs = getattr(result, "headers", None) or {}
                 # StreamingResponse: iterate `body_iterator` (async or
