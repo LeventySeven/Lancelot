@@ -31,4 +31,11 @@ def __getattr__(name):
         from lancelot.staticfiles import StaticFiles
 
         return StaticFiles
+    if name == "llm":
+        # M2-P2: lazy so `import lancelot` doesn't pull httpx (runtime deps
+        # stay pydantic-only). Use importlib to avoid re-triggering this
+        # __getattr__ via `from lancelot import llm`.
+        import importlib
+
+        return importlib.import_module("lancelot.llm")
     raise AttributeError(f"module 'lancelot' has no attribute {name!r}")
