@@ -183,6 +183,23 @@ def _raw_for(fi, request):
         if cache is None:
             return None, False
         return cache.get(key), key in cache
+    if src == "file":
+        # multipart/form-data — parsed once, cached on request.
+        form = getattr(request, "_multipart_cache", None)
+        if form is None:
+            ct = ""
+            for hk, hv in request.headers.items():
+                if hk.lower() == "content-type":
+                    ct = hv
+                    break
+            if "multipart/form-data" in ct:
+                from lancelot.uploads import parse_multipart
+
+                form = parse_multipart(request.body, ct)
+            else:
+                form = {}
+            request._multipart_cache = form
+        return form.get(key), key in form
     if src == "form":
         # application/x-www-form-urlencoded only (stdlib — no runtime dep).
         # multipart/form-data + UploadFile is ledgered (needs

@@ -25,6 +25,9 @@ _fastapi.Body = Body
 # RED) so tests needing them fail HONESTLY at import.
 _fastapi.Form = Form
 _fastapi.File = File
+from lancelot.uploads import UploadFile as _UF  # noqa: E402
+
+_fastapi.UploadFile = _UF
 _fastapi.BackgroundTasks = lancelot.BackgroundTasks
 _fastapi.Request = lancelot.Request
 from lancelot.websockets import WebSocket as _WS, WebSocketDisconnect as _WSD, WebSocketException as _WSE  # noqa: E402

@@ -26,7 +26,14 @@ def test_p1_conformance_instrument_runs():
     from conformance.runner import run
 
     passed, total = run()
-    pct = 100.0 * passed / total
-    floor = float((pathlib.Path("conformance") / "parity_floor.txt"
-                   ).read_text().strip())
-    assert total >= 100 and pct + 1e-9 >= floor, (passed, total, pct, floor)
+    raw = (pathlib.Path("conformance") / "parity_floor.txt"
+           ).read_text().strip()
+    # passes-floor (M1-EXIT-X5 metric change) — see ratchet.py header.
+    if raw.startswith("passes="):
+        floor = int(raw.split("=", 1)[1])
+        assert total >= 100 and passed >= floor, (passed, total, floor)
+    else:
+        floor = float(raw)
+        pct = 100.0 * passed / total
+        assert total >= 100 and pct + 1e-9 >= floor, (
+            passed, total, pct, floor)
