@@ -27,3 +27,4 @@ dhat-heap.json
 .env
 *.env
 conformance/log.txt
+.claude/
