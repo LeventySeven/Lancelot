@@ -157,21 +157,48 @@ class APIRouter:
 
 
 class Router:
-    """App-wide matcher (pure-Python; the ASGI path uses this. The M0 Rust
-    matchit router still serves the hyper path — unifying both onto an FFI
-    `process_one` is a documented M1+ carry-forward, not M1-P1 scope)."""
+    """App-wide matcher with a const-tier short-circuit (M3-R1).
+
+    The hot path for static-shape routes (no `{param}` placeholders —
+    /livez, /openapi.json, /docs, every parameter-less endpoint) is a
+    single O(1) dict lookup. Routes that have a path-param placeholder
+    fall through to the regex walk. Strict-synthesis ranks this 10-50×
+    on static-route throughput (SYNTHESIS.md:31). User-code unchanged
+    — the swap is purely an implementation detail of `match()`."""
 
     def __init__(self):
         self.routes: list[Route] = []
+        # const-tier: keyed (method, path) → Route. Method-agnostic
+        # 405 detection uses _const_paths for "is this path known at all".
+        self._const: dict[tuple[str, str], Route] = {}
+        self._const_paths: set[str] = set()
+        # regex-tier: routes with `{param}` placeholders + WS routes.
+        self._dyn: list[Route] = []
 
     def add(self, route: Route):
         self.routes.append(route)
+        if route.is_ws:
+            self._dyn.append(route)
+            return
+        # Static-shape routes have no path-param groups in their compiled
+        # regex (Route.__post_init__ produces a re with named groupindex
+        # exactly equal to the {param} count).
+        if not route._rx.groupindex:
+            self._const[(route.method, route.path)] = route
+            self._const_paths.add(route.path)
+        else:
+            self._dyn.append(route)
 
     def match(self, method: str, path: str):
         method = method.upper()
-        path_exists = False
-        for r in self.routes:
-            if r.is_ws:  # WebSocket routes are matched via match_ws only
+        # const-tier: O(1) hit on static-shape routes.
+        hit = self._const.get((method, path))
+        if hit is not None:
+            return hit, {}
+        path_exists = path in self._const_paths
+        # regex-tier: routes with path-param placeholders.
+        for r in self._dyn:
+            if r.is_ws:
                 continue
             params = r.match(path)
             if params is None:
@@ -182,7 +209,7 @@ class Router:
         return (None, 405) if path_exists else (None, 404)
 
     def match_ws(self, path: str):
-        for r in self.routes:
+        for r in self._dyn:
             if not r.is_ws:
                 continue
             params = r.match(path)
