@@ -49,6 +49,17 @@ def _is_security(obj) -> bool:
 
 
 def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
+    # functools.partial unwrap — typing.get_type_hints doesn't accept
+    # partial; FastAPI introspects the wrapped __func__ and pre-binds
+    # the .args / .keywords.
+    import functools as _ft
+
+    partial_args = ()
+    partial_kw: dict = {}
+    if isinstance(fn, _ft.partial):
+        partial_args = fn.args
+        partial_kw = dict(fn.keywords or {})
+        fn = fn.func
     hints = typing.get_type_hints(fn, include_extras=True)
     sig = inspect.signature(fn)
     from lancelot.requests import Request as _Req

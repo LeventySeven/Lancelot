@@ -1,3 +1,23 @@
+class FastAPIError(Exception):
+    """Framework-level errors (FastAPI parity name)."""
+
+
+class RequestValidationError(ValueError):
+    """422-shape validation error (FastAPI parity name)."""
+
+    def __init__(self, errors, *, body=None):
+        self._errors = errors
+        self.body = body
+        super().__init__(str(errors))
+
+    def errors(self):
+        return self._errors
+
+
+class WebSocketRequestValidationError(RequestValidationError):
+    """WS-1008 validation error (deep/01 MUST-7)."""
+
+
 class HTTPException(Exception):
     """FastAPI/Starlette-shape HTTP error. The ASGI seam maps it to
     JSONResponse({"detail": detail}, status_code, headers) byte-faithfully

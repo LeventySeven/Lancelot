@@ -86,7 +86,8 @@ class File(Body):
 
 @dataclass
 class Depends:
-    dependency: typing.Callable
+    dependency: typing.Optional[typing.Callable] = None  # FastAPI allows
+    # Depends() with no arg (uses the param's annotation type as dep callable)
     use_cache: bool = True
     scope: typing.Any = None  # FastAPI security-scopes wiring; ledgered
 
