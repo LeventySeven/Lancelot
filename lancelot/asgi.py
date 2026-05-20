@@ -250,7 +250,14 @@ async def _http(app, scope, receive, send):
                     await send({"type": "http.response.body",
                                 "body": b"", "more_body": False})
                 return
-            if route.plan.is_async:
+            # FastAPI: an async-generator handler (async def with yield)
+            # returns the async-gen directly; calling it (no await) gives
+            # the iterator to stream.
+            import inspect as _isp_local
+            if _isp_local.isasyncgenfunction(route.handler) or \
+                    _isp_local.isgeneratorfunction(route.handler):
+                result = route.handler(**kwargs)
+            elif route.plan.is_async:
                 result = await route.handler(**kwargs)
             else:
                 result = await get_pool().offload(route.handler, **kwargs)
@@ -278,7 +285,7 @@ async def _http(app, scope, receive, send):
                                 x, (bytes, str)) else (
                                 x if isinstance(x, bytes) else x.encode())
                 result = StreamingResponse(_aiter_json(result),
-                                           media_type="application/json")
+                                           media_type="application/jsonl")
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
                 _user_hdrs = getattr(result, "headers", None) or {}
                 # StreamingResponse: iterate `body_iterator` (async or
