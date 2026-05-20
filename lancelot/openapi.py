@@ -38,11 +38,24 @@ def _field_schema(fi) -> dict:
         s["default"] = fi.default
     # OpenAPI 3.1: File() bytes / UploadFile use `contentMediaType:
     # application/octet-stream` instead of pydantic's legacy
-    # `format: binary` (FastAPI does this transform too).
-    if getattr(fi.marker, "in_", None) == "file" and s.get("format") == "binary":
-        s.pop("format")
-        s["contentMediaType"] = "application/octet-stream"
+    # `format: binary` (FastAPI does this transform too). Walk the
+    # whole schema so list[bytes] / Optional[bytes] etc. all get fixed.
+    if getattr(fi.marker, "in_", None) == "file":
+        _fix_binary(s)
     return s
+
+
+def _fix_binary(node):
+    if isinstance(node, dict):
+        if (node.get("type") == "string"
+                and node.get("format") == "binary"):
+            node.pop("format")
+            node["contentMediaType"] = "application/octet-stream"
+        for v in node.values():
+            _fix_binary(v)
+    elif isinstance(node, list):
+        for v in node:
+            _fix_binary(v)
 
 
 def parameters_for(route) -> list:
