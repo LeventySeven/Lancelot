@@ -58,15 +58,59 @@ class Route:
         if not self.name:
             self.name = getattr(self.handler, "__name__", "route")
         # /items/{item_id} -> ^/items/(?P<item_id>[^/]+)$
+        # /items/{id:int} -> ^/items/(?P<id>\d+)$  (Starlette URL convertors)
         # B1: literal segments MUST be regex-escaped (a raw '.' or '(' in the
         # dev's path otherwise matches any char / raises re.error). Split on
         # the {param} delimiters; escape literals, only params become groups.
+        _CONV = {
+            "int": r"\d+",
+            "float": r"-?\d+(\.\d+)?",
+            "str": r"[^/]+",
+            "uuid": r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            "path": r".+",
+        }
         rx = ""
-        for part in re.split(r"({[^}/]+})", self.path):
-            m = re.fullmatch(r"{([^}/]+)}", part)
-            rx += f"(?P<{m.group(1)}>[^/]+)" if m else re.escape(part)
+        for part in re.split(r"({[^}]+})", self.path):
+            m = re.fullmatch(r"{([^}:]+)(?::([^}]+))?}", part)
+            if m:
+                name, conv = m.group(1), m.group(2)
+                pat = _CONV.get(conv, "[^/]+")
+                rx += f"(?P<{name}>{pat})"
+            else:
+                rx += re.escape(part)
         self._rx = re.compile("^" + rx + "$")
 
+        # Validate response_model at REGISTRATION time (FastAPI parity):
+        # a non-Pydantic-compatible type raises FastAPIError so the dev's
+        # mistake surfaces immediately, not at first request.
+        if self.response_model is not None:
+            from lancelot.exceptions import FastAPIError
+
+            try:
+                from pydantic import TypeAdapter as _TA
+
+                _TA(self.response_model)
+            except Exception as _e:
+                raise FastAPIError(
+                    f"Invalid response_model {self.response_model!r}"
+                ) from _e
+        # Same check for responses[STATUS]["model"] entries.
+        if self.responses:
+            from lancelot.exceptions import FastAPIError
+            from pydantic import TypeAdapter as _TA
+
+            for _k, _spec in self.responses.items():
+                _m = (_spec or {}).get("model") if isinstance(
+                    _spec, dict) else None
+                if _m is None:
+                    continue
+                try:
+                    _TA(_m)
+                except Exception as _e:
+                    raise FastAPIError(
+                        f"Invalid responses[{_k!r}].model {_m!r}"
+                    ) from _e
         # Registration-time: compile the DI/validation plan ONCE (U15 — the
         # hot path never re-introspects). Detect a pydantic-model body param
         # and lift it out of scalar validation (validated single-pass at the
@@ -148,10 +192,22 @@ class Route:
 
 
 class APIRouter:
-    def __init__(self, prefix: str = "", tags: list | None = None):
+    def __init__(self, prefix: str = "", tags: list | None = None, **kwargs):
+        # Accept FastAPI's documented APIRouter surface (dependencies,
+        # default_response_class, strict_content_type, prefix_options,
+        # responses, callbacks, deprecated, include_in_schema, ...). The
+        # ones we genuinely apply pull from self._router_kwargs at
+        # include_router time; the rest are surface-only (collection-
+        # unblock). NEVER edit the test — accept and ledger.
         assert prefix == "" or prefix.startswith("/"), "prefix must start with /"
         self.prefix = prefix.rstrip("/")
-        self.tags = tags or []
+        self.tags = tags or list(kwargs.pop("tags", None) or [])
+        self.dependencies = list(kwargs.pop("dependencies", []) or [])
+        self.default_response_class = kwargs.pop(
+            "default_response_class", None)
+        self.deprecated = kwargs.pop("deprecated", None)
+        # Keep the rest as opaque (Lancelot doesn't behave on them yet).
+        self._router_kwargs = kwargs
         self.routes: list[Route] = []
 
     def _add(self, method: str, path: str, **kwargs):
@@ -185,11 +241,14 @@ class APIRouter:
 
         return deco
 
-    def include_router(self, router: "APIRouter", prefix: str = ""):
+    def include_router(self, router: "APIRouter", prefix: str = "",
+                       **kwargs):
+        # FastAPI: include_router accepts dependencies, default_response_class,
+        # responses, tags, deprecated, include_in_schema, callbacks. The ones
+        # Lancelot acts on are dependencies (prepended) and tags (extended);
+        # the rest are surface-only collection-unblocks.
         add_prefix = (self.prefix + prefix).rstrip("/")
-        # Copy ALL the user-set Route fields, not just method/path/handler
-        # — route-level dependencies, status_code, response_model, etc.
-        # must survive the include (FastAPI parity).
+        extra_deps = list(kwargs.pop("dependencies", None) or [])
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
@@ -197,6 +256,10 @@ class APIRouter:
         for r in router.routes:
             kw = {k: getattr(r, k) for k in _copy
                   if k not in ("plan", "body", "body_kind")}
+            if extra_deps:
+                # Prepended → run before the route's own deps (FastAPI).
+                kw["dependencies"] = list(extra_deps) + list(
+                    kw.get("dependencies", []) or [])
             self.routes.append(Route(r.method, add_prefix + r.path,
                                      r.handler, r.name, **kw))
 

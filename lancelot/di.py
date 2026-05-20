@@ -60,8 +60,21 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         partial_args = fn.args
         partial_kw = dict(fn.keywords or {})
         fn = fn.func
-    hints = typing.get_type_hints(fn, include_extras=True)
-    sig = inspect.signature(fn)
+    # Callable INSTANCE (FastAPI parity: `Depends(some_instance)`) — its
+    # signature is its `__call__`. typing.get_type_hints requires a real
+    # callable/class; introspect __call__ for instances.
+    if not (inspect.isfunction(fn) or inspect.ismethod(fn)
+            or inspect.isclass(fn) or inspect.isbuiltin(fn)):
+        _call = getattr(fn, "__call__", None)
+        if _call is not None:
+            hints = typing.get_type_hints(_call, include_extras=True)
+            sig = inspect.signature(_call)
+        else:
+            hints = {}
+            sig = inspect.Signature()
+    else:
+        hints = typing.get_type_hints(fn, include_extras=True)
+        sig = inspect.signature(fn)
     from lancelot.requests import Request as _Req
 
     fields, validators, deps, security, req_params = [], {}, [], [], []
@@ -88,6 +101,21 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         ):
             req_params.append(("__ws__", name))
             continue
+        from lancelot.responses import Response as _Resp
+
+        # `response: Response` — FastAPI magic for user-mutable response
+        # (set_cookie / headers / status_code). A fresh Response is built
+        # per-request and merged into the actual emit at finalize.
+        if isinstance(ann, type) and issubclass(ann, _Resp):
+            req_params.append(("__resp__", name))
+            continue
+        from lancelot.security import SecurityScopes as _SS
+
+        # `security_scopes: SecurityScopes` — FastAPI magic injectable.
+        # NOT validated; the scopes union of enclosing Security() deps.
+        if ann is _SS:
+            req_params.append(("__sscopes__", name))
+            continue
         default = p.default if p.default is not inspect.Parameter.empty else Required
         dep_marker = default if isinstance(default, Depends) else None
         if typing.get_origin(ann) is typing.Annotated:
@@ -96,6 +124,16 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
                     dep_marker = m
         if dep_marker is not None:
             dep = dep_marker.dependency
+            # FastAPI `Depends()` no-arg form: the param's annotation IS the
+            # dep callable. The annotation is typically a class (Depends()
+            # then instantiates it via the class's __init__ signature) or an
+            # instance with __call__.
+            if dep is None:
+                # Strip Annotated to get the raw type.
+                _raw = ann
+                if typing.get_origin(_raw) is typing.Annotated:
+                    _raw = typing.get_args(_raw)[0]
+                dep = _raw
             if _is_security(dep):
                 # A security scheme is invoked directly with the Request —
                 # NOT recursively compiled (its __call__(request) signature
@@ -353,14 +391,47 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
             errors.extend(errs)
         else:
             kwargs[fi.name] = value
+    _bind_req_params(plan, request, kwargs)
+    return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
+
+
+def _bind_req_params(plan, request, kwargs):
+    """Bind the magic-injectable params (Request / BackgroundTasks /
+    WebSocket / Response / SecurityScopes) into `kwargs`."""
     for entry in plan.request_params:
-        if isinstance(entry, tuple) and entry[0] == "__bg__":
-            kwargs[entry[1]] = request._background  # set by the ASGI seam
-        elif isinstance(entry, tuple) and entry[0] == "__ws__":
-            kwargs[entry[1]] = request._ws  # live WebSocket (ws seam)
+        if isinstance(entry, tuple):
+            kind, name = entry
+            if kind == "__bg__":
+                kwargs[name] = request._background
+            elif kind == "__ws__":
+                kwargs[name] = request._ws
+            elif kind == "__resp__":
+                # Lazily create a per-request scratch Response. The ASGI
+                # seam reads it after the handler to merge cookies/headers/
+                # status_code into the actual emit. NOT visible to user
+                # if they never touch it (FastAPI parity).
+                from lancelot.responses import Response as _Resp
+
+                scratch = getattr(request, "_resp_scratch", None)
+                if scratch is None:
+                    # FastAPI scratch semantics: status_code=None means the
+                    # user did NOT assign one; route.status_code (or 200)
+                    # then wins. The user assigning later replaces it.
+                    scratch = _Resp()
+                    scratch.status_code = None
+                    request._resp_scratch = scratch
+                kwargs[name] = scratch
+            elif kind == "__sscopes__":
+                from lancelot.security import SecurityScopes as _SS
+
+                # Per-route precomputed scopes union (plan.security holds
+                # (scheme, scopes_tuple)); union them. NOT enforced (M4).
+                all_scopes = []
+                for _scheme, _scopes in plan.security:
+                    all_scopes.extend(_scopes)
+                kwargs[name] = _SS(all_scopes)
         else:
             kwargs[entry] = request
-    return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
 
 
 def _is_gen_dep(call):
@@ -436,13 +507,7 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 errors.extend(errs)
             else:
                 kwargs[fi.name] = value
-        for entry in plan.request_params:
-            if isinstance(entry, tuple) and entry[0] == "__bg__":
-                kwargs[entry[1]] = request._background  # set by ASGI seam
-            elif isinstance(entry, tuple) and entry[0] == "__ws__":
-                kwargs[entry[1]] = request._ws  # live WebSocket (ws seam)
-            else:
-                kwargs[entry] = request
+        _bind_req_params(plan, request, kwargs)
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
     except BaseException as exc:
         # B4: the handler (or a dep) raised inside the `async with` body.

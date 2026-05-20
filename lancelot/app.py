@@ -2,6 +2,10 @@ from lancelot import _native
 from lancelot.routing import APIRouter, Route, Router
 
 
+class NoMatchFound(Exception):
+    """Starlette-parity: raised by App.url_path_for(name) on miss."""
+
+
 class State:
     """Mutable attribute bag (FastAPI/Starlette app.state shape)."""
 
@@ -41,6 +45,7 @@ class App:
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
+        self._user_http_middleware: list = []  # @app.middleware("http") fns
         self._register_builtin_routes()
 
     async def __call__(self, scope, receive, send):
@@ -223,19 +228,36 @@ class App:
     def head(self, p, **kw): return self._add("HEAD", p, **kw)
     def options(self, p, **kw): return self._add("OPTIONS", p, **kw)
 
-    def include_router(self, router: APIRouter, prefix: str = ""):
+    def include_router(self, router: APIRouter, prefix: str = "", **kwargs):
+        # Accepts FastAPI's documented include_router kwargs (dependencies,
+        # default_response_class, responses, tags, deprecated, ...).
+        # Lancelot acts on `dependencies` (prepended to each route); the
+        # rest are surface-only (collection-unblock).
         prefix = prefix.rstrip("/")
-        # Copy ALL user-set Route fields (dependencies, status_code,
-        # response_model, etc.) — FastAPI parity, matches the parallel
-        # fix in APIRouter.include_router.
+        extra_deps = list(kwargs.pop("dependencies", None) or [])
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
             "method", "path", "handler", "name"}
         for r in router.routes:
             kw = {k: getattr(r, k) for k in _copy}
+            if extra_deps:
+                kw["dependencies"] = list(extra_deps) + list(
+                    kw.get("dependencies", []) or [])
             self.router.add(Route(r.method, prefix + r.path, r.handler,
                                   r.name, **kw))
+
+    def middleware(self, kind: str = "http"):
+        """FastAPI `@app.middleware("http")` decorator. The wrapped fn
+        becomes a Starlette-shape `async def mw(request, call_next)` that
+        Lancelot adapts to a pure-ASGI wrapper at build time."""
+
+        def deco(fn):
+            self._user_http_middleware.append(fn)
+            self._asgi = None
+            return fn
+
+        return deco
 
     def openapi(self) -> dict:
         """Built once at first access, then memoized (FastAPI semantics:
@@ -249,12 +271,36 @@ class App:
             )
         return self._openapi_cache
 
+    def url_path_for(self, name: str, /, **path_params) -> str:
+        """Starlette parity: resolve a route's path template by handler
+        name and substitute `{param}`/`{param:conv}` placeholders. Raises
+        NoMatchFound on miss."""
+        import re
+
+        for r in self.router.routes:
+            if r.name != name:
+                continue
+            # Replace each {param} or {param:conv} with the supplied value.
+            def _sub(m):
+                key = m.group(1)
+                if key not in path_params:
+                    raise NoMatchFound(name)
+                return str(path_params[key])
+
+            return re.sub(r"\{([^}:]+)(?::[^}]+)?\}", _sub, r.path)
+        raise NoMatchFound(name)
+
     def asgi(self):
         if self._asgi is None:
             from lancelot.asgi import build_asgi
+            from lancelot.middleware import HTTPMiddlewareAdapter
 
             app = build_asgi(self)
-            # last-added wraps outermost (FastAPI/Starlette order)
+            # @app.middleware("http") fns wrap the inner ASGI app, then
+            # add_middleware-registered pure-ASGI middlewares wrap THAT.
+            # Last-added is outermost (FastAPI/Starlette order).
+            for fn in reversed(self._user_http_middleware):
+                app = HTTPMiddlewareAdapter(app, fn)
             for mw_cls, opts in reversed(self._middleware):
                 app = mw_cls(app, **opts)
             self._asgi = app

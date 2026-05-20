@@ -375,18 +375,38 @@ async def _http(app, scope, receive, send):
                         include=route.response_model_include,
                         exclude=route.response_model_exclude,
                     )
-                except ValidationError:
-                    # FastAPI 500: response-model coercion failure.
-                    await _send_json(send, 500,
-                                     b'{"detail":"Internal Server Error"}')
-                    sent = True
-                    return
+                except ValidationError as _ve:
+                    # FastAPI: response-model coercion failure raises
+                    # ResponseValidationError (the testclient sees it; a
+                    # real ASGI server logs and sends 500).
+                    from lancelot.exceptions import ResponseValidationError
+
+                    raise ResponseValidationError(
+                        _ve.errors(), body=result) from _ve
             else:
                 payload = _wire_json(result)
             # FastAPI: @app.post(..., status_code=201) sets default response
             # status when the handler returns a value (not a Response).
             default_status = route.status_code or 200
-            await _send_json(send, default_status, payload)
+            # Merge the `response: Response` scratch (set_cookie / headers /
+            # status_code) — FastAPI parity (deep/01 §6). Scratch.status_code
+            # WINS over route.status_code if non-None.
+            scratch = getattr(lreq, "_resp_scratch", None)
+            extra_hdrs = None
+            if scratch is not None:
+                if scratch.status_code is not None:
+                    default_status = scratch.status_code
+                if scratch.headers:
+                    extra_hdrs = []
+                    for k, v in scratch.headers.items():
+                        kb = str(k).lower().encode()
+                        if isinstance(v, list):
+                            for vv in v:
+                                extra_hdrs.append((kb, str(vv).encode()))
+                        else:
+                            extra_hdrs.append((kb, str(v).encode()))
+            await _send_json(send, default_status, payload,
+                             extra_headers=extra_hdrs)
             sent = True
             if lreq._background._tasks:  # FastAPI: post-send, pre-teardown
                 await lreq._background()
@@ -413,7 +433,18 @@ async def _http(app, scope, receive, send):
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": pbody})
-    except Exception:  # noqa: BLE001 - never let a handler/dep exc escape
+    except Exception as _exc:  # noqa: BLE001
+        # FastAPI: ResponseValidationError + WebSocketRequestValidationError
+        # MUST propagate (testclient asserts, ASGI server logs). Other
+        # exceptions become a 500 wire-response without leaking traceback.
+        from lancelot.exceptions import ResponseValidationError
+
+        if isinstance(_exc, ResponseValidationError):
+            if not sent:
+                await _send_json(
+                    send, 500, b'{"detail":"Internal Server Error"}')
+                sent = True
+            raise
         if not sent:
             await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
 
@@ -473,12 +504,16 @@ async def _ws(app, scope, receive, send):
             pass
 
 
-async def _send_json(send, status: int, body: bytes):
+async def _send_json(send, status: int, body: bytes, *, extra_headers=None):
+    # Starlette init_headers wire order: explicit user headers FIRST
+    # (lowercased), then content-length, then content-type LAST. Multi-value
+    # entries (multi Set-Cookie) are flattened to one header per value.
+    hdrs = list(extra_headers or [])
+    hdrs.append((b"content-length", str(len(body)).encode()))
+    hdrs.append((b"content-type", b"application/json"))
     await send({
         "type": "http.response.start",
         "status": status,
-        # Starlette init_headers wire order: content-length, content-type LAST.
-        "headers": [(b"content-length", str(len(body)).encode()),
-                    (b"content-type", b"application/json")],
+        "headers": hdrs,
     })
     await send({"type": "http.response.body", "body": body})

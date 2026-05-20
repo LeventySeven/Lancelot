@@ -18,6 +18,95 @@ Genuinely-unimplemented tail (ledgered, conformance/vendor/quarantine/
 test_p4_longtail.py): allow_origin_regex / wildcard-subdomain origins,
 `expose_headers`, `access-control-request-private-network`."""
 
+class Middleware:
+    """FastAPI/Starlette config-shape Middleware spec — a deferred
+    constructor. `Middleware(SomeMW, **opts)` is unpacked at app-build
+    time to `SomeMW(app, **opts)`. Iteration yields (cls, args, kwargs)
+    for parity with Starlette's API."""
+
+    def __init__(self, cls, *args, **kwargs):
+        self.cls = cls
+        self.args = args
+        self.kwargs = kwargs
+
+    def __iter__(self):
+        return iter((self.cls, self.args, self.kwargs))
+
+
+class HTTPMiddlewareAdapter:
+    """Adapter for `@app.middleware("http")` user fns. The wrapped fn has
+    Starlette's `async def mw(request, call_next)` shape and returns a
+    Response; we adapt it to a pure-ASGI wrapper. Lifespan/websocket
+    scopes pass through untouched."""
+
+    def __init__(self, app, fn):
+        self.app = app
+        self.fn = fn
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        from lancelot.requests import Request
+        from lancelot.responses import Response
+
+        # Build a Request from the scope so user middleware can inspect
+        # headers/method/path. Body is left empty (the inner app gets the
+        # real receive() — this Request is for inspection only).
+        hdrs = {k.decode().lower(): v.decode()
+                for k, v in scope.get("headers", [])}
+        qs = scope.get("query_string", b"").decode()
+        import urllib.parse as _up
+
+        qp = dict(_up.parse_qsl(qs))
+        req = Request(
+            method=scope.get("method", "GET"),
+            path=scope.get("path", "/"),
+            query_params=qp,
+            headers=hdrs,
+            cookies={},
+            path_params={},
+            body=b"",
+            app=None,
+        )
+
+        async def call_next(_request):
+            # Capture the inner app's response by intercepting send().
+            captured: dict = {"status": 200, "headers": [], "body": b""}
+
+            async def _send(msg):
+                t = msg["type"]
+                if t == "http.response.start":
+                    captured["status"] = msg["status"]
+                    captured["headers"] = msg.get("headers", [])
+                elif t == "http.response.body":
+                    captured["body"] += msg.get("body", b"")
+
+            await self.app(scope, receive, _send)
+            r = Response(captured["body"], status_code=captured["status"])
+            r.headers = {k.decode(): v.decode() for k, v in
+                         captured["headers"]}
+            return r
+
+        response = await self.fn(req, call_next)
+        # Emit the (possibly user-replaced) Response.
+        hdrs = []
+        for k, v in (response.headers or {}).items():
+            kb = str(k).lower().encode()
+            if isinstance(v, list):
+                for vv in v:
+                    hdrs.append((kb, str(vv).encode()))
+            else:
+                hdrs.append((kb, str(v).encode()))
+        body = response.body if isinstance(response.body, (bytes, bytearray)) \
+            else str(response.body).encode()
+        hdrs.append((b"content-length", str(len(body)).encode()))
+        hdrs.append((b"content-type", response.media_type.encode()))
+        await send({"type": "http.response.start",
+                    "status": response.status_code, "headers": hdrs})
+        await send({"type": "http.response.body", "body": body})
+
+
 _SAFELISTED = ["Accept", "Accept-Language", "Content-Language", "Content-Type"]
 
 

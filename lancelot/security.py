@@ -9,6 +9,18 @@ from dataclasses import dataclass
 from lancelot.exceptions import HTTPException
 
 
+class SecurityScopes:
+    """FastAPI-magic injectable. Holds the union of scopes the route's
+    enclosing Security() deps requested. NOT validated by pydantic
+    (annotation is treated as a marker, like Request/Response)."""
+
+    def __init__(self, scopes: list[str] | None = None):
+        self.scopes = list(scopes or [])
+        # FastAPI also exposes a precomputed space-joined str (used in
+        # WWW-Authenticate). Keep parity.
+        self.scope_str = " ".join(self.scopes)
+
+
 @dataclass
 class HTTPAuthorizationCredentials:
     scheme: str

@@ -106,10 +106,7 @@ for _n in ("APIKeyHeader", "APIKeyQuery", "APIKeyCookie", "HTTPBearer",
     setattr(_sec, _n, getattr(_lsec, _n))
 sys.modules["fastapi.security"] = _sec
 _fastapi.security = _sec
-# SecurityScopes (FastAPI primitive; minimal stub — behavior ledgered)
-_sec.SecurityScopes = type("SecurityScopes", (),
-                           {"__init__": lambda self, scopes=None:
-                            setattr(self, "scopes", scopes or [])})
+_sec.SecurityScopes = _lsec.SecurityScopes  # real impl (di.py magic-inject)
 from lancelot.params import Security as _Security  # noqa: E402
 
 _fastapi.Security = _Security
