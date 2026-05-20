@@ -160,6 +160,15 @@ def _raw_for(fi, request):
     if src == "path":
         return request.path_params.get(key), key in request.path_params
     if src == "query":
+        # Sequence-typed query params get the multi-value list (e.g.
+        # `device_ids: list[int] = Query()` reads ?device_ids=1&device_ids=2
+        # as [1, 2]); scalars get the last value (existing behavior).
+        import typing as _t
+
+        origin = _t.get_origin(fi.annotation) or fi.annotation
+        if origin in (list, tuple, set, frozenset):
+            multi = getattr(request, "query_params_multi", None) or {}
+            return multi.get(key), key in multi
         return request.query_params.get(key), key in request.query_params
     if src == "header":
         conv = getattr(fi.marker, "convert_underscores", True)
