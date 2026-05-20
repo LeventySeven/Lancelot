@@ -1,11 +1,12 @@
 from lancelot._native import _ping
 from lancelot.app import App, Lancelot, run
+from lancelot.concurrency import gather
 from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
 __all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient",
            "BackgroundTasks", "background", "WebSocket",
-           "WebSocketDisconnect", "StaticFiles", "run", "_ping"]
+           "WebSocketDisconnect", "StaticFiles", "gather", "run", "_ping"]
 __version__ = "0.0.0"
 
 
