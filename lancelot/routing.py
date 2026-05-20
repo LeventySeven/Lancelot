@@ -38,6 +38,9 @@ class Route:
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
     sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
+    # FastAPI 0.110+ feature: reject JSON-body routes when the request's
+    # Content-Type isn't JSON. None = inherit (router → app → True default).
+    strict_content_type: bool | None = None
     status_code: int | None = None  # FastAPI default response status
     # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
     response_model: Any = None
@@ -209,6 +212,9 @@ class APIRouter:
         self.default_response_class = kwargs.pop(
             "default_response_class", None)
         self.deprecated = kwargs.pop("deprecated", None)
+        # FastAPI 0.110+ feature: None = inherit from parent (router
+        # chain → app → True default).
+        self.strict_content_type = kwargs.pop("strict_content_type", None)
         # Keep the rest as opaque (Lancelot doesn't behave on them yet).
         self._router_kwargs = kwargs
         self.routes: list[Route] = []
@@ -250,11 +256,20 @@ class APIRouter:
         # responses, tags, deprecated, include_in_schema, callbacks. The ones
         # Lancelot acts on: dependencies (prepended), default_response_class
         # (applied to child routes without their own response_class), tags
-        # (extended). The rest are surface-only collection-unblocks.
+        # (extended), strict_content_type (propagated to child routes that
+        # didn't set their own). The rest are surface-only.
         add_prefix = (self.prefix + prefix).rstrip("/")
         extra_deps = list(kwargs.pop("dependencies", None) or [])
         default_rc = kwargs.pop("default_response_class",
                                 getattr(self, "default_response_class", None))
+        # Resolve strict_content_type for the children: kwarg > child
+        # router's own > this parent router's own > None (sentinel —
+        # propagate up to App).
+        sct_kw = kwargs.pop("strict_content_type", None)
+        effective_sct = sct_kw if sct_kw is not None else \
+            (getattr(router, "strict_content_type", None)
+             if getattr(router, "strict_content_type", None) is not None
+             else getattr(self, "strict_content_type", None))
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
@@ -271,6 +286,12 @@ class APIRouter:
             # parent router's default; finally None (App-level fallback).
             if kw.get("response_class") is None and default_rc is not None:
                 kw["response_class"] = default_rc
+            # Hierarchical strict_content_type: route's own > resolved
+            # effective from chain. Stays None until the App.include_router
+            # collapses to a concrete bool.
+            if kw.get("strict_content_type") is None \
+                    and effective_sct is not None:
+                kw["strict_content_type"] = effective_sct
             self.routes.append(Route(r.method, add_prefix + r.path,
                                      r.handler, r.name, **kw))
 

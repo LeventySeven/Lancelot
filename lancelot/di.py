@@ -168,6 +168,14 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
             fi.is_bucket = fi.marker.in_
         fields.append(fi)
         validators[name] = compile_validator(fi)
+    # FastAPI body rule (deep/01 §3.1.3): exactly ONE Body() scalar param,
+    # no embed=True override → the raw JSON body IS the value (not an
+    # object with that field name). Mark the field so _raw_for returns
+    # the parsed body root instead of looking up a key in a dict.
+    _body_fields = [f for f in fields if f.marker.in_ == "body"]
+    if len(_body_fields) == 1 and not getattr(
+            _body_fields[0].marker, "embed", False):
+        _body_fields[0].body_scalar = True
     return Plan(orig_callable, fields, validators, deps,
                 inspect.iscoroutinefunction(fn), security, req_params)
 
@@ -238,22 +246,28 @@ def _raw_for(fi, request):
     if src == "cookie":
         return request.cookies.get(key), key in request.cookies
     if src == "body":
-        # FastAPI: any scalar Body() param (including the implicit one
-        # produced when multiple Body params are declared) is read from
-        # a JSON-object request body keyed by the param name/alias.
-        # `Body(embed=True)` is the explicit opt-in; multi-Body routes
-        # get the same behavior implicitly. Parse once, cache.
+        # FastAPI: 2+ Body() params (or Body(embed=True) on a single one)
+        # → JSON object keyed by name. EXACTLY ONE Body() param with no
+        # explicit embed → raw JSON body IS the value (deep/01 §3.1.3).
+        # The plan flagged it at compile time (di.compile_dependant) as
+        # `fi.body_scalar`. Parse once, cache the parsed root.
         cache = getattr(request, "_body_obj_cache", _MISSING)
         if cache is _MISSING:
             import json as _json
 
             try:
-                parsed = _json.loads(request.body) if request.body else None
+                parsed = _json.loads(request.body) if request.body else _MISSING
             except Exception:  # noqa: BLE001 - malformed → field absent
-                parsed = None
-            cache = parsed if isinstance(parsed, dict) else None
-            request._body_obj_cache = cache
-        if cache is None:
+                parsed = _MISSING
+            request._body_obj_cache = parsed
+            cache = parsed
+        if getattr(fi, "body_scalar", False):
+            # Raw body IS the value (or "absent" if the request had none).
+            if cache is _MISSING:
+                return None, False
+            return cache, True
+        # Embed / multi-Body path: look up by name in the JSON object.
+        if not isinstance(cache, dict):
             return None, False
         return cache.get(key), key in cache
     if src == "file":
@@ -340,9 +354,18 @@ def _raw_for(fi, request):
         vs = form.get(key)
         if vs is None:
             return None, False
+        import types as _types
         import typing as _t
 
         ann = fi.annotation
+        # Unwrap Optional[X] / X | None / Union[X, None] so the list
+        # detection works for the common `list[str] | None = None` form.
+        _o = _t.get_origin(ann)
+        if _o is _t.Union or _o is _types.UnionType:
+            non_none = [a for a in _t.get_args(ann)
+                        if a is not type(None)]
+            if len(non_none) == 1:
+                ann = non_none[0]
         origin = _t.get_origin(ann) or ann
         is_seq = origin in (list, tuple, set, frozenset)
         return (vs if is_seq else vs[-1]), True
@@ -486,17 +509,41 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 if sr.errors:
                     errors.extend(sr.errors)
                     continue
-                if inspect.isasyncgenfunction(target):
+                # Callable INSTANCES (`obj()` where obj.__call__ is the
+                # actual function): inspect checks return False for the
+                # instance itself but True for its __call__. For
+                # functools.partial, the dispatch type lives on `.func`.
+                # Both can chain (`partial(instance)`) so we peel until we
+                # bottom out on something inspect can introspect.
+                import functools as _ft
+
+                def _unwrap(x):
+                    for _ in range(8):  # depth-limited; cycles impossible
+                        if isinstance(x, _ft.partial):
+                            x = x.func
+                            continue
+                        if (inspect.isfunction(x) or inspect.ismethod(x)
+                                or inspect.isclass(x)
+                                or inspect.isbuiltin(x)):
+                            return x
+                        c = getattr(x, "__call__", None)
+                        if c is None or c is x:
+                            return x
+                        x = c
+                    return x
+
+                _probe = _unwrap(target)
+                if inspect.isasyncgenfunction(_probe):
                     val = await stack.enter_async_context(
                         contextlib.asynccontextmanager(target)(**sr.kwargs)
                     )
-                elif inspect.isgeneratorfunction(target):
+                elif inspect.isgeneratorfunction(_probe):
                     # stdlib @contextmanager.__exit__ does gen.throw(exc) on
                     # error → the dep's `except:`/`finally:` rollback runs (B4).
                     val = stack.enter_context(
                         contextlib.contextmanager(target)(**sr.kwargs)
                     )
-                elif inspect.iscoroutinefunction(target):
+                elif inspect.iscoroutinefunction(_probe):
                     val = await target(**sr.kwargs)
                 else:
                     # Plain sync dep → bounded blocking pool, never the

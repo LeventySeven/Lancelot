@@ -88,8 +88,11 @@ class JSONResponse(Response):
             import json as _json
 
             body = _json.dumps(content, separators=(",", ":")).encode()
+        # Honor a SUBCLASS's class-attr `media_type` (FastAPI parity for
+        # `class ORJSONResponse(JSONResponse): media_type = "..."`).
+        # Resolution: explicit kwarg > subclass class attr > our default.
         super().__init__(body, status_code,
-                         media_type or "application/json")
+                         media_type or type(self).media_type)
         self.headers = headers or {}
 
 

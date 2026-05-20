@@ -108,6 +108,7 @@ class FieldInfo:
     is_bucket: str = ""  # "" | "query" | "header" | "cookie" — bucket-model
     explicit_marker: bool = False  # True if user wrote Query()/Body()/etc.
     validation_alias: str | None = None  # input-only alias (Pydantic v2)
+    body_scalar: bool = False  # single-Body-scalar pattern: raw body IS value
 
 
 def _scalar_default_marker(annotation) -> Param:
@@ -120,11 +121,20 @@ def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
     explicit = False
     if typing.get_origin(annotation) is typing.Annotated:
         args = typing.get_args(annotation)
-        real_ann = args[0]
+        inner = args[0]
+        # Python flattens nested Annotated, so `Annotated[Json[list[str]],
+        # Header()]` arrives as args = (list[str], Json, Header()). We
+        # must PRESERVE non-Param/non-Depends metadata (e.g. Pydantic
+        # `Json` marker, `StringConstraints`, ...) on the underlying
+        # type — dropping it loses the Json-parse-then-validate behavior.
+        preserved = []
         for meta in args[1:]:
             if isinstance(meta, (Param, Depends)):
                 marker = meta
                 explicit = True
+            else:
+                preserved.append(meta)
+        real_ann = typing.Annotated[(inner, *preserved)] if preserved else inner
     if isinstance(default, (Param, Depends)):
         marker = default
         default = marker.default if isinstance(marker, Param) else Required

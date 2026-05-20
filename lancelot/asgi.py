@@ -278,16 +278,29 @@ async def _http_dispatch(app, scope, receive, send):
         headers.setdefault(k, _hv.decode())
         headers_multi.setdefault(k, []).append(_hv.decode())
     # Parse cookies from the Cookie header (RFC 6265; semicolon-separated).
+    # We intentionally do NOT use http.cookies.SimpleCookie — it silently
+    # DROPS cookies whose values contain RFC-6265-illegal-but-real-world-
+    # common characters like `[`, `]`, `"`, `,`, breaking e.g. JSON-shaped
+    # cookies. FastAPI/Starlette also bypass SimpleCookie for the same
+    # reason. Our parser: split on `;`, strip whitespace, first `=` is the
+    # name/value boundary, RFC-6265 §4.1.1 quoted values are de-quoted.
     cookies: dict = {}
     if "cookie" in headers:
-        from http.cookies import SimpleCookie
-
-        try:
-            sc = SimpleCookie()
-            sc.load(headers["cookie"])
-            cookies = {k: v.value for k, v in sc.items()}
-        except Exception:  # noqa: BLE001 - malformed cookie header → empty
-            cookies = {}
+        for _piece in headers["cookie"].split(";"):
+            _piece = _piece.strip()
+            if not _piece:
+                continue
+            _i = _piece.find("=")
+            if _i <= 0:
+                continue  # malformed pair (no `=` or starts with `=`)
+            _ck = _piece[:_i].strip()
+            _cv = _piece[_i + 1:].strip()
+            # RFC 6265 §4.1.1: cookie-value MAY be quoted-string.
+            if len(_cv) >= 2 and _cv[0] == '"' and _cv[-1] == '"':
+                _cv = _cv[1:-1]
+            # First occurrence wins (Starlette parity; defends against
+            # cookie-bomb where a client re-asserts a known name).
+            cookies.setdefault(_ck, _cv)
     params = route.match(path) or {}
     lreq = LRequest(method, path, query, headers, cookies, params, body,
                     scope["app"])
@@ -300,6 +313,36 @@ async def _http_dispatch(app, scope, receive, send):
 
     body_value, body_errors = None, []
     if route.body is not None:
+        # FastAPI 0.110+ strict_content_type: a JSON-body route MUST get a
+        # JSON-ish Content-Type — but ONLY when a body is actually present.
+        # An empty body falls through to the existing "missing field"
+        # path so wholly-payload-less requests get the standard 422 shape,
+        # not a misleading content-type 422.
+        if body and getattr(route, "strict_content_type", False) \
+                and getattr(route, "body_kind", "json") == "json":
+            _ct = ""
+            for _hk, _hv in scope.get("headers", []):
+                if _hk == b"content-type":
+                    try:
+                        _ct = _hv.decode("latin-1").lower()
+                    except Exception:  # noqa: BLE001
+                        _ct = ""
+                    break
+            # Accept application/json, application/*+json (RFC 6839),
+            # and `text/json` (some old clients). Anything else → 422.
+            if "json" not in _ct:
+                from lancelot.validation import _wire_json
+
+                err_body = _wire_json({"detail": [{
+                    "type": "content_type",
+                    "loc": ["body"],
+                    "msg": ("Content-Type must be application/json "
+                            "(strict_content_type=True)"),
+                    "input": None,
+                }]})
+                await _send_json(send, 422, err_body)
+                sent = True
+                return
         bname, bval = route.body
         if body:
             if getattr(route, "body_kind", "json") == "form":
@@ -337,6 +380,18 @@ async def _http_dispatch(app, scope, receive, send):
         async with solve_async(route.plan, lreq) as res:
             errs = list(res.errors) + body_errors
             if errs:
+                # FastAPI-parity: if the user registered a handler for
+                # RequestValidationError, synthesize one and dispatch.
+                # Otherwise emit the default byte-faithful 422.
+                from lancelot.exceptions import RequestValidationError as _RVE
+
+                h = _find_exc_handler(app, _RVE(errs))
+                if h is not None:
+                    rve = _RVE(errs)
+                    await _emit_handler_response(
+                        h, lreq, rve, scope, receive, send)
+                    sent = True
+                    return
                 status, out = errors_to_422(errs)
                 await _send_json(send, status, out)
                 sent = True
@@ -635,13 +690,21 @@ async def _http_dispatch(app, scope, receive, send):
                              and scratch.status_code is not None
                              else default_status)
                 _hdrs = list(extra_hdrs or [])
+                # Pull the response object's media_type. Starlette stores
+                # it on the INSTANCE (`_r.media_type`); our own
+                # lancelot.responses.Response stores it as a CLASS attr.
+                # Either way, attribute access works.
+                _mt = getattr(_r, "media_type", None) \
+                    or getattr(_rcls, "media_type", None) \
+                    or "application/json"
+                _body_bytes = getattr(_r, "body", b"") or b""
                 _hdrs.append((b"content-length",
-                              str(len(_r.body)).encode()))
-                _hdrs.append((b"content-type",
-                              _r.media_type.encode()))
+                              str(len(_body_bytes)).encode()))
+                _hdrs.append((b"content-type", str(_mt).encode()))
                 await send({"type": "http.response.start",
                             "status": _r_status, "headers": _hdrs})
-                await send({"type": "http.response.body", "body": _r.body})
+                await send({"type": "http.response.body",
+                            "body": _body_bytes})
             else:
                 await _send_json(send, default_status, payload,
                                  extra_headers=extra_hdrs)
@@ -650,6 +713,16 @@ async def _http_dispatch(app, scope, receive, send):
                 await lreq._background()
     except HTTPException as exc:  # byte-faithful {"detail":…} + headers (MUST-11)
         if not sent:
+            # FastAPI-parity: a user-registered handler wins over the
+            # default byte-faithful 400/401/403/4xx emit. The default
+            # path stays byte-identical when no handler is registered
+            # (conformance gate).
+            h = _find_exc_handler(app, exc)
+            if h is not None:
+                await _emit_handler_response(
+                    h, lreq, exc, scope, receive, send)
+                sent = True
+                return
             ebody = _wire_json({"detail": exc.detail})
             # Starlette JSONResponse(headers=exc.headers) wire order:
             # the exception's explicit headers FIRST (names lower-cased,
@@ -671,15 +744,36 @@ async def _http_dispatch(app, scope, receive, send):
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": pbody})
-    except Exception:  # noqa: BLE001
-        # FastAPI/Starlette: in production ServerErrorMiddleware wraps and
-        # emits 500. The TestClient runs WITHOUT that wrap by default
-        # (raise_server_exceptions=True) → the original exception MUST
-        # propagate so `pytest.raises(...)` sees it. Send a 500 wire body
-        # if nothing has been sent (production-server fallback), then
-        # re-raise unconditionally — the harness's wrap decides.
+    except Exception as _exc:  # noqa: BLE001
+        # FastAPI/Starlette semantics (verified against starlette
+        # ServerErrorMiddleware): a user-registered Exception-handler
+        # emits its Response, then the ORIGINAL exception is re-raised.
+        # The harness (TestClient with raise_server_exceptions=True, or
+        # the production ASGI server's own error middleware) decides what
+        # to do with the re-raise — pytest.raises catches it; production
+        # logs and moves on.
         if not sent:
-            await _send_json(send, 500, b'{"detail":"Internal Server Error"}')
+            h = _find_exc_handler(app, _exc)
+            if h is not None:
+                try:
+                    await _emit_handler_response(
+                        h, lreq, _exc, scope, receive, send)
+                    sent = True
+                except Exception:  # noqa: BLE001
+                    # The handler itself blew up — fall through to the
+                    # default 500 emit so the operator sees the original
+                    # failure (re-raised below), not a swallowed bug.
+                    pass
+        if not sent:
+            # Starlette parity: the default 500 is PLAIN TEXT
+            # "Internal Server Error" (PlainTextResponse), NOT JSON
+            # `{"detail":...}`. Tests assert the literal text body.
+            err = b"Internal Server Error"
+            await send({"type": "http.response.start", "status": 500,
+                        "headers": [
+                            (b"content-length", str(len(err)).encode()),
+                            (b"content-type", b"text/plain; charset=utf-8")]})
+            await send({"type": "http.response.body", "body": err})
             sent = True
         raise
 
@@ -737,6 +831,72 @@ async def _ws(app, scope, receive, send):
             await ws.close(code=1011)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _find_exc_handler(app, exc):
+    """Walk `exc`'s MRO against app.exception_handlers (most-specific
+    wins). Returns the handler callable or None.
+
+    FastAPI-parity: a registered handler for `Exception` matches anything
+    derived from Exception (used for the 500 catch-all in vendored
+    test_exception_handlers.py)."""
+    handlers = getattr(app, "exception_handlers", None) or {}
+    if not handlers:
+        return None
+    for cls in type(exc).__mro__:
+        h = handlers.get(cls)
+        if h is not None:
+            return h
+    return None
+
+
+async def _emit_handler_response(handler, lreq, exc, scope, receive, send):
+    """Invoke a user exception handler with (request, exc) and emit its
+    Response. Supports BOTH Lancelot's Response shape (read .body /
+    .status_code / .headers / .media_type) AND any Starlette-shape
+    Response (ASGI-callable `response(scope, receive, send)`)."""
+    import inspect as _inspect
+
+    out = handler(lreq, exc)
+    if _inspect.isawaitable(out):
+        out = await out
+    # Starlette-shape: any ASGI-callable response (its __call__ takes
+    # scope/receive/send and emits itself). FastAPI vendored tests use
+    # `from starlette.responses import JSONResponse`.
+    if callable(out) and not hasattr(out, "body"):
+        await out(scope, receive, send)
+        return
+    if hasattr(out, "__call__") and hasattr(out, "body") \
+            and getattr(out, "media_type", None) is not None:
+        # Lancelot Response OR Starlette Response: emit directly.
+        try:
+            await out(scope, receive, send)
+            return
+        except TypeError:
+            # Lancelot Response isn't an ASGI app — fall through to
+            # the explicit emit below.
+            pass
+    # Lancelot Response (no __call__): read fields and emit manually.
+    body = getattr(out, "body", b"") or b""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    status_code = getattr(out, "status_code", 200) or 200
+    media_type = getattr(out, "media_type", "application/json") \
+        or "application/json"
+    user_hdrs = getattr(out, "headers", None) or {}
+    hdrs = []
+    for k, v in user_hdrs.items():
+        kb = str(k).lower().encode()
+        if isinstance(v, list):
+            for vv in v:
+                hdrs.append((kb, str(vv).encode()))
+        else:
+            hdrs.append((kb, str(v).encode()))
+    hdrs.append((b"content-length", str(len(body)).encode()))
+    hdrs.append((b"content-type", str(media_type).encode()))
+    await send({"type": "http.response.start", "status": status_code,
+                "headers": hdrs})
+    await send({"type": "http.response.body", "body": body})
 
 
 async def _send_json(send, status: int, body: bytes, *, extra_headers=None):

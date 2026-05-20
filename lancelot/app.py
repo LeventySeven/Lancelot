@@ -27,6 +27,8 @@ class App:
                  *, redirect_slashes: bool = True,
                  max_concurrent_requests: int | None = None,
                  drain_timeout: float = 30.0,
+                 exception_handlers: dict | None = None,
+                 strict_content_type: bool = True,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -49,6 +51,13 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
+        # FastAPI parity: app.add_exception_handler / @app.exception_handler /
+        # FastAPI(exception_handlers={ExcCls: fn}). MRO-walked at exception
+        # time so a `Exception:` catch-all also fires for subclasses.
+        self.exception_handlers: dict = dict(exception_handlers or {})
+        # FastAPI 0.110+ feature: app-wide default for content-type checking
+        # on JSON-body routes. Per-route / per-router override allowed.
+        self.strict_content_type: bool = strict_content_type
         # Graceful-shutdown flag — flipped by lifespan_shutdown,
         # `app.initiate_shutdown()`, or `app.install_signal_handlers()`.
         # /readyz returns 503 + Retry-After while True so the LB stops
@@ -153,6 +162,9 @@ class App:
         if kw.get("response_class") is None and \
                 self._default_response_class is not None:
             kw["response_class"] = self._default_response_class
+        # App-level strict_content_type fallback (route didn't override).
+        if kw.get("strict_content_type") is None:
+            kw["strict_content_type"] = self.strict_content_type
 
         def deco(fn):
             self.router.add(Route(method, path, fn, **kw))
@@ -387,6 +399,13 @@ class App:
             getattr(router, "default_response_class", None)
             or self._default_response_class,
         )
+        # Resolve effective strict_content_type — include kwarg > router's
+        # own > app's default.
+        sct_kw = kwargs.pop("strict_content_type", None)
+        effective_sct = sct_kw if sct_kw is not None else \
+            (getattr(router, "strict_content_type", None)
+             if getattr(router, "strict_content_type", None) is not None
+             else self.strict_content_type)
         import dataclasses as _dc
 
         _copy = {f.name for f in _dc.fields(Route)} - {
@@ -398,6 +417,10 @@ class App:
                     kw.get("dependencies", []) or [])
             if kw.get("response_class") is None and default_rc is not None:
                 kw["response_class"] = default_rc
+            # Collapse to a concrete bool at App level (no more inheritance
+            # to chase after this point).
+            if kw.get("strict_content_type") is None:
+                kw["strict_content_type"] = effective_sct
             self.router.add(Route(r.method, prefix + r.path, r.handler,
                                   r.name, **kw))
 
@@ -443,6 +466,24 @@ class App:
 
             return re.sub(r"\{([^}:]+)(?::[^}]+)?\}", _sub, r.path)
         raise NoMatchFound(name)
+
+    # --- FastAPI-parity exception handler surface -----------------------
+    def add_exception_handler(self, exc_class_or_status_code,
+                              handler) -> None:
+        """Register a handler for an exception CLASS (FastAPI/Starlette
+        shape). Integer status-code handlers (Starlette's other form) are
+        accepted for surface parity but not behaviorally honored — pass a
+        class. The handler receives `(request, exc)` and returns a
+        Response. Most-specific class in the exception's MRO wins."""
+        self.exception_handlers[exc_class_or_status_code] = handler
+
+    def exception_handler(self, exc_class):
+        """Decorator form: `@app.exception_handler(HTTPException)`."""
+        def deco(fn):
+            self.exception_handlers[exc_class] = fn
+            return fn
+
+        return deco
 
     # --- Tier-B.B1: graceful shutdown surface ----------------------------
     def initiate_shutdown(self) -> None:

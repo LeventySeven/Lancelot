@@ -127,18 +127,38 @@ class FormBodyValidator:
     automatically (pydantic handles it). Multipart is ledgered RED."""
 
     def __init__(self, model):
+        import types as _types
         import typing as _t
         from pydantic_core import PydanticUndefined
 
         self._model = model
         self._adapter = TypeAdapter(model)
         seq, defaults = set(), {}
+
+        def _is_seq_ann(ann) -> bool:
+            """Detect list/tuple/set — including Optional[list[T]] /
+            Union[list[T], None] / list[T] | None forms. FastAPI form
+            parsing wraps a single-value field as `["x"]` when typed."""
+            origin = _t.get_origin(ann) or ann
+            if origin in (list, tuple, set, frozenset):
+                return True
+            if origin is _t.Union or origin is _types.UnionType:
+                non_none = [a for a in _t.get_args(ann)
+                            if a is not type(None)]
+                if len(non_none) == 1:
+                    return _is_seq_ann(non_none[0])
+            return False
+
         for fname, finfo in model.model_fields.items():
             keys = {fname}
             if finfo.alias:
                 keys.add(finfo.alias)
-            origin = _t.get_origin(finfo.annotation) or finfo.annotation
-            if origin in (list, tuple, set, frozenset):
+            # Pydantic v2 validation_alias (input-only) — also used by the
+            # form parser to look up the incoming key. Include it.
+            va = getattr(finfo, "validation_alias", None)
+            if isinstance(va, str):
+                keys.add(va)
+            if _is_seq_ann(finfo.annotation):
                 seq.update(keys)
             # FastAPI Form-model: non-None defaults are pre-populated into
             # the validation input so a missing-required error's `input`
