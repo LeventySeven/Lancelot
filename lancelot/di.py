@@ -201,13 +201,27 @@ def _raw_for(fi, request):
             request._multipart_cache = form
         v = form.get(key)
         # FastAPI: `p: bytes = File()` reads the file bytes; `p:
-        # UploadFile = File()` keeps the wrapper. Coerce here so the
-        # validator sees the right shape.
+        # UploadFile = File()` keeps the wrapper. List annotations get
+        # the multi-value list; scalar annotations the last value.
         from lancelot.uploads import UploadFile as _UF
+        import typing as _t
 
-        if fi.annotation is bytes and isinstance(v, _UF):
-            v.file.seek(0)
-            v = v.file.read()
+        origin = _t.get_origin(fi.annotation) or fi.annotation
+        is_seq = origin in (list, tuple, set, frozenset)
+        if not is_seq and isinstance(v, list):
+            v = v[-1]
+        if is_seq and not isinstance(v, list):
+            v = [v] if v is not None else []
+        # Read UploadFile bytes when annotation is bytes / list[bytes]
+        elem = _t.get_args(fi.annotation)[0] if (
+            is_seq and _t.get_args(fi.annotation)) else fi.annotation
+        if elem is bytes:
+            if isinstance(v, list):
+                v = [(x.file.seek(0) or x.file.read())
+                     if isinstance(x, _UF) else x for x in v]
+            elif isinstance(v, _UF):
+                v.file.seek(0)
+                v = v.file.read()
         return v, key in form
     if src == "form":
         # application/x-www-form-urlencoded only (stdlib — no runtime dep).

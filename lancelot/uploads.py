@@ -107,9 +107,19 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
                             size=len(f["data"]))
             uf.file.write(bytes(f["data"]))
             uf.file.seek(0)
-            result[f["name"]] = uf
+            value = uf
         else:
-            result[f["name"]] = bytes(f["data"]).decode("utf-8", "replace")
+            value = bytes(f["data"]).decode("utf-8", "replace")
+        # Multi-value support: repeated `name="p"` parts collect into a list.
+        # `_raw_for` decides list-vs-scalar based on the field annotation.
+        if f["name"] in result:
+            prev = result[f["name"]]
+            if isinstance(prev, list):
+                prev.append(value)
+            else:
+                result[f["name"]] = [prev, value]
+        else:
+            result[f["name"]] = value
 
     parser = MultipartParser(boundary, callbacks={
         "on_part_begin": on_part_begin,
