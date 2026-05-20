@@ -257,10 +257,43 @@ async def _http(app, scope, receive, send):
             from lancelot.responses import Response
 
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
+                _user_hdrs = getattr(result, "headers", None) or {}
+                # StreamingResponse: iterate `body_iterator` (async or
+                # sync) and emit chunks (no Content-Length; chunked
+                # transfer). Other Response subclasses: one-shot body.
+                _iterator = getattr(result, "body_iterator", None)
+                if _iterator is not None:
+                    _hdrs = [(str(k).lower().encode(), str(v).encode())
+                             for k, v in _user_hdrs.items()]
+                    _hdrs.append((b"content-type",
+                                  result.media_type.encode()))
+                    await send({"type": "http.response.start",
+                                "status": result.status_code,
+                                "headers": _hdrs})
+                    import inspect as _isp
+
+                    if _isp.isasyncgen(_iterator) or hasattr(
+                            _iterator, "__aiter__"):
+                        async for chunk in _iterator:
+                            if isinstance(chunk, str):
+                                chunk = chunk.encode("utf-8")
+                            await send({"type": "http.response.body",
+                                        "body": chunk, "more_body": True})
+                    else:
+                        for chunk in _iterator:
+                            if isinstance(chunk, str):
+                                chunk = chunk.encode("utf-8")
+                            await send({"type": "http.response.body",
+                                        "body": chunk, "more_body": True})
+                    await send({"type": "http.response.body",
+                                "body": b"", "more_body": False})
+                    sent = True
+                    if lreq._background._tasks:
+                        await lreq._background()
+                    return
                 # Starlette init_headers wire order: explicit user headers
                 # FIRST (lowercased — Starlette parity), then content-length,
                 # then content-type LAST.
-                _user_hdrs = getattr(result, "headers", None) or {}
                 _hdrs = [(str(k).lower().encode(), str(v).encode())
                          for k, v in _user_hdrs.items()]
                 _hdrs.append((b"content-length",
