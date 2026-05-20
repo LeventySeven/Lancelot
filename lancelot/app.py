@@ -133,6 +133,28 @@ class App:
                  "input_schema": s.input_schema}
                 for s in self._tools.values()]
 
+    def mcp(self, path: str = "/mcp", *, allowed_origins=None):
+        """M2-P5b: mount a Streamable-HTTP MCP server at `path` that
+        exposes the `@app.tool` registry as JSON-RPC 2.0 over HTTP. Pass
+        `allowed_origins=[...]` to restrict (Claude Desktop / claude.ai).
+
+        Spec: modelcontextprotocol.io/specification/2025-06-18 — closes
+        the 5 gaps in Robyn's reference impl (Mcp-Session-Id roundtrip,
+        MCP-Protocol-Version validation, Origin allow-list)."""
+        from lancelot.mcp import make_handler
+
+        h = make_handler(self, allowed_origins=allowed_origins)
+
+        async def _mcp_endpoint(request: "Request"):
+            return await h(request)
+
+        # Manual route registration — needs the live Request injected.
+        from lancelot.requests import Request
+
+        _mcp_endpoint.__annotations__ = {"request": Request}
+        self.router.add(Route("POST", path, _mcp_endpoint,
+                              include_in_schema=False))
+
     def call_tool(self, name: str, **kwargs):
         """Invoke a registered tool by name. Inputs are Pydantic-validated
         (same machinery as HTTP request validation)."""

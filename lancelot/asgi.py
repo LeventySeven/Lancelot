@@ -249,15 +249,19 @@ async def _http(app, scope, receive, send):
             from lancelot.responses import Response
 
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
-                # Starlette init_headers wire order: content-length, then
-                # content-type LAST (header order is part of the wire bytes).
+                # Starlette init_headers wire order: explicit user headers
+                # FIRST (lowercased — Starlette parity), then content-length,
+                # then content-type LAST.
+                _user_hdrs = getattr(result, "headers", None) or {}
+                _hdrs = [(str(k).lower().encode(), str(v).encode())
+                         for k, v in _user_hdrs.items()]
+                _hdrs.append((b"content-length",
+                              str(len(result.body)).encode()))
+                _hdrs.append((b"content-type",
+                              result.media_type.encode()))
                 await send({"type": "http.response.start",
                             "status": result.status_code,
-                            "headers": [
-                                (b"content-length",
-                                 str(len(result.body)).encode()),
-                                (b"content-type",
-                                 result.media_type.encode())]})
+                            "headers": _hdrs})
                 await send({"type": "http.response.body", "body": result.body})
                 sent = True
                 # BackgroundTasks run AFTER the body is sent and BEFORE
