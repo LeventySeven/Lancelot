@@ -17,6 +17,15 @@ class Request:
     _ws: object = None  # live WebSocket, set by the ASGI websocket seam
     query_params_multi: dict = None  # full {k:[v,...]} — bucket-model needs
     headers_multi: dict = None  # full {k:[v,...]} — multi-value header bucket
+    _cancel_event: object = None  # asyncio.Event set on client disconnect
+
+    @property
+    def cancelled(self) -> bool:
+        """M2-P4: True after the client has disconnected mid-stream
+        (set by the ASGI seam). Handlers can poll this to short-circuit
+        upstream LLM calls and stop $$ on un-watched tokens."""
+        ev = self._cancel_event
+        return bool(ev is not None and ev.is_set())
 
     @property
     def state(self):

@@ -109,6 +109,22 @@ class App:
 
         return deco
 
+    def stream(self, path: str, **kwargs):
+        """M2-P4: typed event-stream sugar. The handler is an async
+        generator yielding `lancelot.stream.Event` items; the framework
+        owns SSE framing + cancellation propagation."""
+        import dataclasses as _dc
+
+        known = {f.name for f in _dc.fields(Route)}
+        kw = {k: v for k, v in kwargs.items() if k in known}
+        kw["is_stream"] = True
+
+        def deco(fn):
+            self.router.add(Route("GET", path, fn, **kw))
+            return fn
+
+        return deco
+
     def websocket(self, path: str, **kwargs):
         import dataclasses as _dc
 

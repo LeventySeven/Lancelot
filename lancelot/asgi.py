@@ -216,6 +216,32 @@ async def _http(app, scope, receive, send):
             # DI-surface gap (compile_dependant can't introspect an
             # instance) — ledgered, not silently narrowed: see
             # conformance/vendor/quarantine/test_p5_longtail.py item 4.
+            # M2-P4: @app.stream — handler is an async generator yielding
+            # lancelot.stream.Event; the framework owns SSE framing +
+            # cancellation propagation.
+            if getattr(route, "is_stream", False):
+                import asyncio as _asyncio
+
+                lreq._cancel_event = _asyncio.Event()
+                gen = route.handler(**kwargs)
+                await send({"type": "http.response.start", "status": 200,
+                            "headers": [
+                                (b"content-type", b"text/event-stream"),
+                                (b"cache-control", b"no-cache"),
+                                (b"x-accel-buffering", b"no")]})
+                sent = True
+                try:
+                    async for event in gen:
+                        await send({"type": "http.response.body",
+                                    "body": event.render(),
+                                    "more_body": True})
+                except _asyncio.CancelledError:
+                    lreq._cancel_event.set()
+                    raise
+                finally:
+                    await send({"type": "http.response.body",
+                                "body": b"", "more_body": False})
+                return
             if route.plan.is_async:
                 result = await route.handler(**kwargs)
             else:

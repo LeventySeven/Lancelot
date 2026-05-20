@@ -30,6 +30,7 @@ class Route:
     name: str = ""
     include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
     is_ws: bool = False  # WebSocket route (matched by scope type, not method)
+    is_stream: bool = False  # @app.stream: yields lancelot.stream.Event
     status_code: int | None = None  # FastAPI default response status
     # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
     response_model: Any = None
