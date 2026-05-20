@@ -2,6 +2,12 @@ class FastAPIError(Exception):
     """Framework-level errors (FastAPI parity name)."""
 
 
+class PydanticV1NotSupportedError(FastAPIError):
+    """FastAPI 0.115+ refuses Pydantic v1 BaseModel anywhere in route
+    annotations (param, response_model, return type, responses[*]['model']).
+    Surface this with a clear, parity-named error."""
+
+
 class RequestValidationError(ValueError):
     """422-shape validation error (FastAPI parity name)."""
 

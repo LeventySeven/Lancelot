@@ -203,20 +203,76 @@ def collect_errors(items):
     return out
 
 
+def _json_default(obj):
+    """FastAPI `jsonable_encoder`-shape fallback for json.dumps default=.
+    Handles UUID, datetime, Enum, Path, BaseModel, dataclass, set/frozenset.
+    Order matters: BaseModel before isinstance(uuid.UUID) so a Pydantic
+    field-serializer-driven encoding wins over the UUID branch.
+
+    Defensive: classes that LIE about being UUID via __class__ property
+    (asyncpg.pgproto.UUID — see test_inherited_custom_class) → str(obj).
+    Pydantic's to_jsonable_python tries `obj.int` for those and crashes."""
+    # Pydantic BaseModel — model_dump returns a JSON-safe dict.
+    try:
+        from pydantic import BaseModel as _BM
+
+        if isinstance(obj, _BM):
+            return obj.model_dump(mode="json", by_alias=True)
+    except Exception:  # noqa: BLE001
+        pass
+    # Dataclass instances.
+    try:
+        import dataclasses as _dc
+
+        if _dc.is_dataclass(obj) and not isinstance(obj, type):
+            return _dc.asdict(obj)
+    except Exception:  # noqa: BLE001
+        pass
+    import datetime as _dt
+    import decimal as _dcm
+    import enum as _enum
+    import pathlib as _pl
+    import uuid as _uuid
+
+    if isinstance(obj, (_dt.datetime, _dt.date, _dt.time)):
+        return obj.isoformat()
+    if isinstance(obj, _dt.timedelta):
+        return obj.total_seconds()
+    if isinstance(obj, _uuid.UUID):
+        # Includes types that LIE about __class__ → str() returns their
+        # display form (asyncpg pgproto.UUID, etc.).
+        return str(obj)
+    if isinstance(obj, _enum.Enum):
+        return obj.value
+    if isinstance(obj, _dcm.Decimal):
+        return float(obj)
+    if isinstance(obj, _pl.PurePath):
+        return str(obj)
+    if isinstance(obj, (set, frozenset)):
+        return list(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    raise TypeError(f"Object of type {type(obj).__name__} "
+                    f"is not JSON serializable")
+
+
 def _wire_json(obj) -> bytes:
     """The ONE wire serializer — byte-identical to Starlette/FastAPI's
     JSONResponse (compact separators, ensure_ascii=False, allow_nan=False).
-    Routes through the Rust pydantic-core seam (same as the 200 path) so the
-    422 bytes provably cannot drift from the success bytes; stdlib fallback
-    uses the exact Starlette flags."""
+    Routes through the Rust pydantic-core seam (same as the 200 path) so
+    the 422 bytes provably cannot drift from the success bytes. When the
+    fast path or stdlib chokes on a UUID/datetime/BaseModel value, falls
+    back to a FastAPI-jsonable-encoder-shape `default=` function."""
     try:
         from lancelot import _native
 
         return bytes(_native._to_json(obj))
     except Exception:  # noqa: BLE001
-        return _json.dumps(
-            obj, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8")
+        pass
+    return _json.dumps(
+        obj, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
 
 
 def errors_to_422(errors: list) -> tuple[int, bytes]:

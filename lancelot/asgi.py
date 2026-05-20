@@ -224,7 +224,28 @@ async def _http_dispatch(app, scope, receive, send):
             alt_route, _ = app.router.match(method, alt)
             if alt_route is not None:
                 qs = scope.get("query_string", b"").decode()
-                location = alt + (f"?{qs}" if qs else "")
+                # FastAPI/Starlette emit ABSOLUTE Location URLs on
+                # redirect_slashes (scheme + host[:port] + path + ?qs).
+                # Build from the ASGI scope so reverse-proxy headers /
+                # base_url overrides are honored.
+                _scheme = scope.get("scheme", "http")
+                _host = ""
+                for _hk, _hv in scope.get("headers", []):
+                    if _hk == b"host":
+                        try:
+                            _host = _hv.decode("ascii", "ignore")
+                        except Exception:  # noqa: BLE001
+                            _host = ""
+                        break
+                if not _host:
+                    server = scope.get("server")
+                    if isinstance(server, (list, tuple)) and len(server) >= 1:
+                        _host = str(server[0])
+                        if len(server) >= 2 and server[1] not in (None, 80, 443):
+                            _host = f"{_host}:{server[1]}"
+                location = f"{_scheme}://{_host}{alt}" if _host else alt
+                if qs:
+                    location += f"?{qs}"
                 await send({"type": "http.response.start", "status": 307,
                             "headers": [
                                 (b"location", location.encode()),
@@ -252,17 +273,36 @@ async def _http_dispatch(app, scope, receive, send):
     # Drain the body (ASGI more_body streaming); capped at _MAX_BODY → 413
     # (enforced just below). The ASGI path is the migration on-ramp, not the
     # fast path; a configurable/per-route limit is a P-any item.
+    # A custom ASGI middleware MAY raise HTTPException from within receive()
+    # (e.g. a content-size limiter); catch it here so the canonical
+    # {"detail":exc.detail} 4xx emits — instead of bubbling out as an
+    # unhandled server exception.
+    from lancelot.exceptions import HTTPException as _MWHE
+    from lancelot.validation import _wire_json as _mw_wire
+
     body = b""
-    while True:
-        msg = await receive()
-        if msg["type"] == "http.disconnect":
-            return
-        body += msg.get("body", b"")
-        if len(body) > _MAX_BODY:  # A4: bound the migration-path body (DoS)
-            await _send_json(send, 413, b'{"detail":"Request entity too large"}')
-            return
-        if not msg.get("more_body", False):
-            break
+    try:
+        while True:
+            msg = await receive()
+            if msg["type"] == "http.disconnect":
+                return
+            body += msg.get("body", b"")
+            if len(body) > _MAX_BODY:  # A4: bound the migration-path body
+                await _send_json(send, 413,
+                                 b'{"detail":"Request entity too large"}')
+                return
+            if not msg.get("more_body", False):
+                break
+    except _MWHE as _mw_exc:
+        ebody = _mw_wire({"detail": _mw_exc.detail})
+        hdrs = [(str(k).lower().encode(), str(v).encode())
+                for k, v in (_mw_exc.headers or {}).items()]
+        hdrs.append((b"content-length", str(len(ebody)).encode()))
+        hdrs.append((b"content-type", b"application/json"))
+        await send({"type": "http.response.start",
+                    "status": _mw_exc.status_code, "headers": hdrs})
+        await send({"type": "http.response.body", "body": ebody})
+        return
 
     # A3 (research-distillation): JSON-nesting-depth DoS guard. Runs ONLY
     # for JSON-ish content types so multipart / urlencoded / binary bodies
@@ -392,8 +432,25 @@ async def _http_dispatch(app, scope, receive, send):
     # rollback runs — B4) and is mapped to 500 here so it never escapes the
     # ASGI callable (A5).
     sent = False
+    # Function-scope yield-deps register on this stack so they tear down
+    # BETWEEN handler-return and response-emit (FastAPI scope="function").
+    # Request-scope deps stay on the inner solve_async stack and tear
+    # down AFTER the response body (B4 semantics — M1-P2).
+    import contextlib as _cl_func
+
+    _func_stack = _cl_func.AsyncExitStack()
+    await _func_stack.__aenter__()
+    _func_stack_closed = False
+
+    async def _close_func_scope():
+        nonlocal _func_stack_closed
+        if not _func_stack_closed:
+            _func_stack_closed = True
+            await _func_stack.aclose()
+
     try:
-        async with solve_async(route.plan, lreq) as res:
+        async with solve_async(route.plan, lreq,
+                               _func_stack=_func_stack) as res:
             errs = list(res.errors) + body_errors
             if errs:
                 # FastAPI-parity: if the user registered a handler for
@@ -543,6 +600,11 @@ async def _http_dispatch(app, scope, receive, send):
                 else:
                     result = await get_pool().offload(
                         route.handler, **kwargs)
+            # Tear down scope="function" yield-deps NOW (between handler
+            # return and response emit) — FastAPI parity. Request-scope
+            # deps stay on the inner solve_async stack and close after
+            # the response body finishes.
+            await _close_func_scope()
             from lancelot.responses import Response
 
             # FastAPI: a handler returning a raw async-iter / generator
@@ -886,6 +948,14 @@ async def _http_dispatch(app, scope, receive, send):
             await send({"type": "http.response.body", "body": err})
             sent = True
         raise
+    finally:
+        # Defensive: in case neither the post-handler close nor an
+        # exception-path teardown ran, close function-scope deps now.
+        # Idempotent (the helper guards against double-close).
+        try:
+            await _close_func_scope()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _ws(app, scope, receive, send):

@@ -22,6 +22,9 @@ class SubDep:
     #                       result is NOT bound to a handler kwarg (FastAPI rule)
     scopes: tuple = ()  # scopes from a Security(dep, scopes=[...]) marker,
     #                      propagated to the dep's SecurityScopes injection
+    _marker_scope: str | None = None  # Depends(scope=...) — "function" or
+    #                      "request" (default). function-scope yield-deps
+    #                      tear down BETWEEN handler-return and response.
 
 
 @dataclass
@@ -165,10 +168,49 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
             continue
         default = p.default if p.default is not inspect.Parameter.empty else Required
         dep_marker = default if isinstance(default, Depends) else None
+        # FastAPI registration-time ambiguity checks
+        # (test_ambiguous_params parity).
+        from lancelot.params import Param as _ParamCls, \
+            Path as _PathCls
+
+        _annotated_param_marker = None  # the Param() inside Annotated, if any
+        _annotated_dep_marker = None  # the Depends() inside Annotated, if any
         if typing.get_origin(ann) is typing.Annotated:
             for m in typing.get_args(ann)[1:]:
+                if isinstance(m, _ParamCls):
+                    if _annotated_param_marker is None:
+                        _annotated_param_marker = m
+                    # Path(default=...) inside Annotated → FastAPI rule:
+                    # "Path parameters cannot have a default value".
+                    if isinstance(m, _PathCls) and m.default is not Required:
+                        raise AssertionError(
+                            "Path parameters cannot have a default value")
+                    # Other Param()s with default=... inside Annotated are
+                    # also invalid — must set default via `= …` outside.
+                    if m.default is not Required:
+                        raise AssertionError(
+                            f"`{type(m).__name__}` default value cannot be "
+                            f"set in `Annotated` for {name!r}. Set the "
+                            "default value with `=` instead."
+                        )
                 if isinstance(m, Depends):
                     dep_marker = m
+                    _annotated_dep_marker = m
+        # Annotated Depends() AND `= Depends(...)` default: ambiguous.
+        if _annotated_dep_marker is not None \
+                and isinstance(p.default, Depends):
+            raise AssertionError(
+                f"Cannot specify `Depends` in `Annotated` and default "
+                f"value together for {name!r}"
+            )
+        # Annotated Param() (Query, Header, ...) AND `= Depends(...)`:
+        # ambiguous mix of body-param marker and DI marker.
+        if _annotated_param_marker is not None \
+                and isinstance(p.default, Depends):
+            raise AssertionError(
+                f"Cannot specify a FastAPI annotation in `Annotated` "
+                f"and `Depends` as a default value together for {name!r}"
+            )
         if dep_marker is not None:
             dep = dep_marker.dependency
             # FastAPI `Depends()` no-arg form: the param's annotation IS the
@@ -185,18 +227,22 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
             # the sub-dep's SecurityScopes injection (if any) sees them
             # accumulated from every Security() on its caller chain.
             _dep_scopes = tuple(getattr(dep_marker, "scopes", ()) or ())
+            # Depends(..., scope="function") asks for early teardown.
+            _marker_scope = getattr(dep_marker, "scope", None)
             if _is_security(dep):
                 # A security scheme is invoked directly with the Request —
                 # NOT recursively compiled (its __call__(request) signature
                 # is not a DI graph). Scopes (params.Security) are plumbed
                 # for OpenAPI, NOT enforced (MUST-13).
                 deps.append(SubDep(dep, None, dep_marker.use_cache, name,
-                                   scopes=_dep_scopes))
+                                   scopes=_dep_scopes,
+                                   _marker_scope=_marker_scope))
                 security.append((dep, _dep_scopes))
                 continue
             sub = compile_dependant(dep, path_params)
             deps.append(SubDep(dep, sub, dep_marker.use_cache, name,
-                               scopes=_dep_scopes))
+                               scopes=_dep_scopes,
+                               _marker_scope=_marker_scope))
             continue
         fi = extract_field(name, ann, default, path_params)
         # Bucket-model: Query()/Header()/Cookie() + BaseModel annotation →
@@ -521,12 +567,19 @@ def _is_gen_dep(call):
 
 @contextlib.asynccontextmanager
 async def solve_async(plan: Plan, request, _cache=None, _stack=None,
-                      _parent_scopes=()):
+                      _func_stack=None, _parent_scopes=()):
     """Like solve(), but `yield`-dependencies are entered as (async) context
     managers on a SHARED AsyncExitStack so their teardown runs AFTER the
     response, in reverse (LIFO) order — PEP-789 / deep/01 §5. The recursive
     calls share the owner's stack; only the owner enters/exits it (so
     teardown happens once, after the `async with solve_async(...)` block).
+
+    `_func_stack`: separate AsyncExitStack for scope="function" yield-deps.
+    These tear down BETWEEN handler-return and response-emit (FastAPI
+    semantics — `Depends(dep, scope="function")` is a request-scoped
+    resource that doesn't live through the response). The seam closes
+    this stack explicitly after the handler returns; falls back to the
+    main `stack` only when no _func_stack is provided (back-compat).
 
     `_parent_scopes`: scopes from a Security(plan, scopes=[...]) marker on
     the CALLER. Flow into SecurityScopes injection for this plan."""
@@ -541,19 +594,31 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None,
             # FastAPI Dependant.cache_key: (call, sorted_security_scopes,
             # computed_scope). Scopes are in the key ONLY when this dep
             # (or any of its transitive sub-deps) actually consumes them
-            # (`_uses_scopes` — FastAPI parity). Test ref:
-            # test_security_scopes_sub_dependency_caching:
-            #   get_db_session: _uses_scopes=False → cached once across paths
-            #   get_user_me (depends on get_current_user which takes
-            #   SecurityScopes): _uses_scopes=True → cached per accumulated
-            #   scope tuple → 2 calls on 2 paths.
+            # (`_uses_scopes` — FastAPI parity). Test refs:
+            #   test_security_scopes_sub_dependency_caching:
+            #     get_db_session: _uses_scopes=False → cached once across
+            #     paths; get_user_me (depends on get_current_user which
+            #     takes SecurityScopes): _uses_scopes=True → cached per
+            #     accumulated scope tuple → 2 calls on 2 paths.
+            # The dep's `computed_scope` (Depends(scope="function")) is
+            # ALSO part of the cache key — same callable with different
+            # lifetimes is a DIFFERENT dependency
+            # (test_dependency_yield_scope::test_two_scopes).
             _sub_plan = sub.plan
             _accum_scopes = tuple(_parent_scopes) + tuple(sub.scopes)
             _uses_scopes = bool(_sub_plan and _sub_plan.uses_scopes()) \
                 or bool(sub.scopes)
+            # Normalize: scope=None / scope="request" / "" all alias to
+            # "request" (the default) so `Depends(d)` and `Depends(d,
+            # scope="request")` share a cache entry. ONLY scope="function"
+            # is distinct (it has a different lifetime → different
+            # session/resource). Matches FastAPI's Dependant.computed_scope.
+            _norm_scope = "function" if (
+                getattr(sub, "_marker_scope", None) == "function") else "request"
             _scoped_key = (sub.call,
                            tuple(sorted(_accum_scopes))
-                           if _uses_scopes else ())
+                           if _uses_scopes else (),
+                           _norm_scope)
             if sub.use_cache and _scoped_key in cache:
                 if not sub.discard:
                     kwargs[sub.param_name] = cache[_scoped_key]
@@ -577,7 +642,7 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None,
             # sub-dep's injection. (Test ref: GH fastapi#5623 — siblings
             # see ONLY the route → caller path, not each other's scopes.)
             async with solve_async(
-                    subplan, request, cache, stack,
+                    subplan, request, cache, stack, _func_stack,
                     _parent_scopes=tuple(_parent_scopes) + tuple(sub.scopes)
                     ) as sr:
                 if sr.errors:
@@ -607,14 +672,22 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None,
                     return x
 
                 _probe = _unwrap(target)
+                # scope="function" yield-deps register on the FUNCTION
+                # stack so they tear down BETWEEN handler-return and
+                # response-emit (FastAPI parity). All others stay on the
+                # request stack and tear down AFTER the response.
+                _scope = getattr(sub, "_marker_scope", None)
+                _target_stack = _func_stack if (
+                    _scope == "function" and _func_stack is not None
+                ) else stack
                 if inspect.isasyncgenfunction(_probe):
-                    val = await stack.enter_async_context(
+                    val = await _target_stack.enter_async_context(
                         contextlib.asynccontextmanager(target)(**sr.kwargs)
                     )
                 elif inspect.isgeneratorfunction(_probe):
                     # stdlib @contextmanager.__exit__ does gen.throw(exc) on
                     # error → the dep's `except:`/`finally:` rollback runs (B4).
-                    val = stack.enter_context(
+                    val = _target_stack.enter_context(
                         contextlib.contextmanager(target)(**sr.kwargs)
                     )
                 elif inspect.iscoroutinefunction(_probe):

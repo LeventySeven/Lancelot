@@ -64,6 +64,27 @@ import lancelot.exceptions as _lexc  # noqa: E402
 
 sys.modules["fastapi.exceptions"] = _lexc
 _fastapi.exceptions = _lexc
+# fastapi.param_functions: surface alias for Query/Path/Header/Cookie/Body
+# (vendored tests do `from fastapi.param_functions import Query`).
+import lancelot.params as _lparams  # noqa: E402
+
+_pfm = types.ModuleType("fastapi.param_functions")
+for _n in ("Query", "Path", "Header", "Cookie", "Body", "Form", "File",
+           "Depends"):
+    if hasattr(_lparams, _n):
+        setattr(_pfm, _n, getattr(_lparams, _n))
+sys.modules["fastapi.param_functions"] = _pfm
+_fastapi.param_functions = _pfm
+# fastapi.routing surface — vendored docs_src/custom_request_and_route
+# subclasses APIRoute to override get_route_handler(). We expose a thin
+# shim that subclassing+overriding doesn't break route registration.
+import lancelot.routing as _lrouting  # noqa: E402
+
+_routing_mod = types.ModuleType("fastapi.routing")
+_routing_mod.APIRoute = _lrouting.Route
+_routing_mod.APIRouter = _lrouting.APIRouter
+sys.modules["fastapi.routing"] = _routing_mod
+_fastapi.routing = _routing_mod
 # FastAPI-specific deprecation marker class (vendored tests reference it).
 if not hasattr(_lexc, "FastAPIDeprecationWarning"):
     _lexc.FastAPIDeprecationWarning = type(

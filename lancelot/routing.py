@@ -92,6 +92,55 @@ class Route:
                 rx += re.escape(part)
         self._rx = re.compile("^" + rx + "$")
 
+        # FastAPI 0.115+ refuses Pydantic v1 BaseModel anywhere in the
+        # route annotations. Detect it via `pydantic.v1.BaseModel` mro
+        # check (no import-time pull — only check classes the user passes).
+        def _is_pydantic_v1(t):
+            if not isinstance(t, type):
+                # Recurse into Union/Optional/list/etc.
+                _o = typing.get_origin(t)
+                if _o is not None:
+                    return any(_is_pydantic_v1(a)
+                               for a in typing.get_args(t))
+                return False
+            try:
+                from pydantic.v1 import BaseModel as _V1BM
+            except Exception:  # noqa: BLE001
+                return False
+            return issubclass(t, _V1BM)
+
+        try:
+            _all_hints = typing.get_type_hints(self.handler)
+        except Exception:  # noqa: BLE001
+            _all_hints = {}
+        for _hn, _h in _all_hints.items():
+            if _is_pydantic_v1(_h):
+                from lancelot.exceptions import PydanticV1NotSupportedError
+
+                raise PydanticV1NotSupportedError(
+                    f"Pydantic v1 BaseModel is not supported in FastAPI "
+                    f"route annotations (param {_hn!r}). Migrate to "
+                    "Pydantic v2."
+                )
+        if self.response_model is not None and _is_pydantic_v1(
+                self.response_model):
+            from lancelot.exceptions import PydanticV1NotSupportedError
+
+            raise PydanticV1NotSupportedError(
+                "Pydantic v1 BaseModel is not supported as a "
+                "response_model. Migrate to Pydantic v2."
+            )
+        if self.responses:
+            from lancelot.exceptions import PydanticV1NotSupportedError
+
+            for _k, _spec in self.responses.items():
+                _m = (_spec or {}).get("model") if isinstance(
+                    _spec, dict) else None
+                if _m is not None and _is_pydantic_v1(_m):
+                    raise PydanticV1NotSupportedError(
+                        f"Pydantic v1 BaseModel is not supported in "
+                        f"responses[{_k!r}].model. Migrate to Pydantic v2."
+                    )
         # Validate response_model at REGISTRATION time (FastAPI parity):
         # a non-Pydantic-compatible type raises FastAPIError so the dev's
         # mistake surfaces immediately, not at first request.
@@ -106,6 +155,52 @@ class Route:
                 raise FastAPIError(
                     f"Invalid response_model {self.response_model!r}"
                 ) from _e
+        # FastAPI parity: if the handler's return annotation contains a
+        # Starlette/Lancelot Response (or subclass), reject at registration.
+        # Response isn't a valid response_model (can't validate against it).
+        # The user should set `response_class=...` instead or return Response
+        # directly without annotating.
+        _ret_hint = None
+        try:
+            _ret_hint = typing.get_type_hints(self.handler).get("return")
+        except Exception:  # noqa: BLE001
+            _ret_hint = None
+        if _ret_hint is not None:
+            import types as _ts
+
+            def _contains_response(t):
+                # Optional[X]/Union[...]: scan args
+                _o = typing.get_origin(t)
+                if _o is typing.Union or _o is _ts.UnionType:
+                    return any(_contains_response(a) for a in typing.get_args(t))
+                if not isinstance(t, type):
+                    return False
+                # Lancelot's Response
+                from lancelot.responses import Response as _LResp
+
+                if issubclass(t, _LResp):
+                    return True
+                # Starlette's Response (without importing starlette ourselves)
+                import sys as _sys
+
+                _sm = _sys.modules.get("starlette.responses")
+                if _sm is not None:
+                    _sr = getattr(_sm, "Response", None)
+                    if _sr is not None and issubclass(t, _sr):
+                        return True
+                return False
+
+            if _contains_response(_ret_hint):
+                from lancelot.exceptions import FastAPIError
+
+                raise FastAPIError(
+                    f"Invalid args for response field! Hint: check that "
+                    f"{_ret_hint!r} is a valid Pydantic field type. If you "
+                    "are using a return type annotation that is not a "
+                    "valid Pydantic field (e.g. Union[Response, dict]), "
+                    "you can disable generating the response model from "
+                    "the type annotation with `response_model=None`."
+                )
         # Same check for responses[STATUS]["model"] entries.
         if self.responses:
             from lancelot.exceptions import FastAPIError
@@ -137,6 +232,62 @@ class Route:
         # FastAPI semantics) but their validation/auth failures DO
         # propagate as 422/401/etc. Append them to plan.dependencies with
         # an unused param_name slot so solve_async runs them.
+        # FastAPI parity: a YIELD-dep with computed_scope="request" cannot
+        # depend on a YIELD-dep with computed_scope="function" — the
+        # outer's teardown lifetime would extend the inner's. Regular
+        # (non-yield) deps have no teardown so their scope is moot.
+        from lancelot.exceptions import FastAPIError as _SFE
+        import inspect as _isp
+
+        def _is_yield_dep(call):
+            if call is None:
+                return False
+            # Peel functools.partial / @wraps / instance.__call__ to find
+            # the actual function shape.
+            import functools as _ft
+
+            for _ in range(8):
+                if isinstance(call, _ft.partial):
+                    call = call.func
+                    continue
+                if hasattr(call, "__wrapped__") and call.__wrapped__ is not call:
+                    call = call.__wrapped__
+                    continue
+                if not (_isp.isfunction(call) or _isp.ismethod(call)
+                        or _isp.isclass(call) or _isp.isbuiltin(call)):
+                    c = getattr(call, "__call__", None)
+                    if c is None or c is call:
+                        break
+                    call = c
+                    continue
+                break
+            return (_isp.isgeneratorfunction(call)
+                    or _isp.isasyncgenfunction(call))
+
+        def _walk(plan):
+            for outer in plan.dependencies:
+                if outer.plan is None:
+                    continue
+                outer_yield = _is_yield_dep(outer.call)
+                outer_scope = "function" if (
+                    getattr(outer, "_marker_scope", None) == "function"
+                ) else "request"
+                if outer_yield and outer_scope == "request":
+                    for inner in outer.plan.dependencies:
+                        inner_yield = _is_yield_dep(inner.call)
+                        inner_scope = "function" if (
+                            getattr(inner, "_marker_scope", None) == "function"
+                        ) else "request"
+                        if inner_yield and inner_scope == "function":
+                            raise _SFE(
+                                f'The dependency '
+                                f'"{getattr(outer.call, "__name__", "?")}" '
+                                f'has a scope of "{outer_scope}", it cannot '
+                                f'depend on dependencies with scope '
+                                f'"{inner_scope}"'
+                            )
+                _walk(outer.plan)
+        _walk(self.plan)
         for i, dep in enumerate(self.dependencies or []):
             from lancelot.params import Depends as _Dep
 
@@ -149,7 +300,8 @@ class Route:
             self.plan.dependencies.append(SubDep(
                 dep.dependency, sub_plan, dep.use_cache,
                 f"__route_dep_{i}__", discard=True,
-                scopes=_route_scopes))
+                scopes=_route_scopes,
+                _marker_scope=getattr(dep, "scope", None)))
         # FastAPI rule (test_invalid_path_param + test_invalid_sequence_param):
         # path params must be primitive-coercible (not collection/dict/Model);
         # query/header/cookie sequences must NOT have Model/dict elements.
@@ -194,9 +346,31 @@ class Route:
                         "one of the supported types")
         self.body = None
         self.body_kind = "json"  # "json" | "form"  (multipart ledgered)
+        # FastAPI body inference is method-aware: a bare `list[T]` /
+        # `set[T]` / `tuple[T, ...]` on POST/PUT/PATCH/DELETE is a body;
+        # on GET/HEAD/OPTIONS it stays query (the multi-value form).
+        _body_methods = {"POST", "PUT", "PATCH", "DELETE"}
+        _is_body_method = self.method in _body_methods
         for fi in list(self.plan.fields):
-            if not _is_body_annotation(fi.annotation):
+            ann = fi.annotation
+            _origin = typing.get_origin(ann) or ann
+            _is_param_container = _origin in (list, set, frozenset, tuple)
+            # On NON-body methods, never lift a parameterized container
+            # into the body — `list[T]` stays a multi-value query.
+            if _is_param_container and not _is_body_method \
+                    and not fi.explicit_marker:
                 continue
+            if _is_param_container and not _is_body_method:
+                continue
+            if not _is_body_annotation(ann):
+                # Special case: on body-methods, a parameterized container
+                # of scalars with NO explicit marker is body. Otherwise
+                # skip.
+                if _is_body_method and _is_param_container \
+                        and not fi.explicit_marker:
+                    pass  # fall through to body-lift below
+                else:
+                    continue
             mk = getattr(fi.marker, "in_", None)
             # Query/Header/Cookie BUCKET model only when EXPLICIT (the user
             # wrote `= Query()`); a bare `item: Item` (implicit-Query

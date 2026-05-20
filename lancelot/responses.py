@@ -116,3 +116,15 @@ class StreamingResponse(Response):
         self.headers = headers or {}
         self.background = background
         self.body = b""  # filled on send
+
+
+# Starlette-name pass-throughs for vendored tests that import these by
+# name. We don't ship orjson/ujson (Tier-D: pydantic-only runtime); if
+# the user installs them they get the speed, but the CONTRACT — class
+# exists, returns JSON — works regardless.
+class ORJSONResponse(JSONResponse):
+    media_type = "application/json"
+
+
+class UJSONResponse(JSONResponse):
+    media_type = "application/json"

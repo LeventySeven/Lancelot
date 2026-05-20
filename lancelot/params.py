@@ -145,12 +145,28 @@ def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
         # `Json` marker, `StringConstraints`, ...) on the underlying
         # type — dropping it loses the Json-parse-then-validate behavior.
         preserved = []
+        all_param_markers = []
         for meta in args[1:]:
-            if isinstance(meta, (Param, Depends)):
+            if isinstance(meta, Depends):
+                marker = meta
+                explicit = True
+            elif isinstance(meta, Param):
+                # Collect all Param() markers — multiple are merged
+                # (test_ambiguous_params::test_multiple_annotations:
+                # `Annotated[int, Query(gt=2), Query(lt=10)]` should
+                # apply BOTH constraints).
+                all_param_markers.append(meta)
                 marker = meta
                 explicit = True
             else:
                 preserved.append(meta)
+        # Merge constraints from all Param markers into the last one.
+        if len(all_param_markers) > 1:
+            merged_constraints: dict = {}
+            for m in all_param_markers:
+                merged_constraints.update(m.constraints)
+            # Last marker wins for default + alias; merged for constraints.
+            marker.constraints = merged_constraints
         real_ann = typing.Annotated[(inner, *preserved)] if preserved else inner
     if isinstance(default, (Param, Depends)):
         marker = default

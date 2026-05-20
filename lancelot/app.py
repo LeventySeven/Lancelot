@@ -29,6 +29,7 @@ class App:
                  drain_timeout: float = 30.0,
                  exception_handlers: dict | None = None,
                  strict_content_type: bool = True,
+                 dependencies: list | None = None,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -60,6 +61,10 @@ class App:
         # FastAPI 0.110+ feature: app-wide default for content-type checking
         # on JSON-body routes. Per-route / per-router override allowed.
         self.strict_content_type: bool = strict_content_type
+        # App-wide dependencies — prepended to every route's dep list.
+        # Same semantics as `APIRouter(dependencies=[])`: validation /
+        # auth runs before the handler; the return value is discarded.
+        self.dependencies: list = list(dependencies or [])
         # Graceful-shutdown flag — flipped by lifespan_shutdown,
         # `app.initiate_shutdown()`, or `app.install_signal_handlers()`.
         # /readyz returns 503 + Retry-After while True so the LB stops
@@ -167,6 +172,11 @@ class App:
         # App-level strict_content_type fallback (route didn't override).
         if kw.get("strict_content_type") is None:
             kw["strict_content_type"] = self.strict_content_type
+        # App-level dependencies are PREPENDED to the route's own deps
+        # (FastAPI: outermost runs first).
+        if self.dependencies:
+            kw["dependencies"] = list(self.dependencies) + list(
+                kw.get("dependencies", []) or [])
 
         def deco(fn):
             self.router.add(Route(method, path, fn, **kw))
@@ -422,7 +432,10 @@ class App:
         # Lancelot acts on `dependencies` (prepended) and
         # `default_response_class` (applied to child routes without own).
         prefix = prefix.rstrip("/")
-        extra_deps = list(kwargs.pop("dependencies", None) or [])
+        # App-level dependencies prepend to include-time `dependencies`
+        # which prepend to each route's own.
+        extra_deps = list(self.dependencies) + list(
+            kwargs.pop("dependencies", None) or [])
         # Resolve effective default response class — include arg > router's
         # own default > app's own default.
         default_rc = kwargs.pop(
