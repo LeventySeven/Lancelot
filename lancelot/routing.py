@@ -73,19 +73,36 @@ class Route:
         self.plan = compile_dependant(
             self.handler, path_params=set(self._rx.groupindex)
         )
-        # FastAPI rule (test_invalid_path_param): path params must be
-        # primitive-coercible — NOT collections/dicts/BaseModels.
+        # FastAPI rule (test_invalid_path_param + test_invalid_sequence_param):
+        # path params must be primitive-coercible (not collection/dict/Model);
+        # query/header/cookie sequences must NOT have Model/dict elements.
         for fi in self.plan.fields:
-            if getattr(fi.marker, "in_", None) != "path":
-                continue
+            in_ = getattr(fi.marker, "in_", None)
             ann = fi.annotation
             origin = typing.get_origin(ann) or ann
-            if origin in (list, tuple, set, frozenset, dict) \
-                    or (isinstance(ann, type)
-                        and hasattr(ann, "model_validate")):
-                raise AssertionError(
-                    f"Path param '{fi.name}' must be a primitive type; "
-                    f"got {ann!r}")
+            args = typing.get_args(ann)
+            if in_ == "path":
+                if origin in (list, tuple, set, frozenset, dict) \
+                        or (isinstance(ann, type)
+                            and hasattr(ann, "model_validate")):
+                    raise AssertionError(
+                        f"Path param '{fi.name}' must be a primitive type; "
+                        f"got {ann!r}")
+            elif in_ in ("query", "header", "cookie") and fi.explicit_marker:
+                # Only reject when the user EXPLICITLY wrote Query()/etc. —
+                # a bare `items: list[Item]` still infers JSON body.
+                if origin in (list, tuple, set, frozenset) and args:
+                    inner = args[0]
+                    if (isinstance(inner, type)
+                            and hasattr(inner, "model_validate")) \
+                            or typing.get_origin(inner) is dict:
+                        raise AssertionError(
+                            f"{in_.title()} parameter '{fi.name}' must be "
+                            "one of the supported types")
+                elif origin is dict:
+                    raise AssertionError(
+                        f"{in_.title()} parameter '{fi.name}' must be "
+                        "one of the supported types")
         self.body = None
         self.body_kind = "json"  # "json" | "form"  (multipart ledgered)
         for fi in list(self.plan.fields):
