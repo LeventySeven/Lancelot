@@ -30,9 +30,16 @@ class ParamValidator:
             for k, v in fi.marker.constraints.items()
             if k in _CONSTRAINT_TO_AT
         ]
+        # pydantic v2's `allow_inf_nan` is a numeric Field flag, not an
+        # annotated_types metadata. Pass it via a pydantic.Field annotation.
+        ainf = fi.marker.constraints.get("allow_inf_nan")
         ann = fi.annotation
         if metas:
             ann = typing.Annotated[tuple([ann, *metas])]
+        if ainf is not None:
+            from pydantic import Field as _Pf
+
+            ann = typing.Annotated[ann, _Pf(allow_inf_nan=ainf)]
         self._adapter = TypeAdapter(ann)
 
     def validate(self, raw, *, present: bool):

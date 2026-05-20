@@ -19,6 +19,7 @@ Default = _Sentinel("Default")  # "no explicit marker" sentinel
 _CONSTRAINT_KEYS = (
     "gt", "ge", "lt", "le", "min_length", "max_length", "pattern",
     "multiple_of", "max_digits", "decimal_places",
+    "allow_inf_nan",  # pydantic v2 numeric flag (FastAPI passes it through)
 )
 
 
