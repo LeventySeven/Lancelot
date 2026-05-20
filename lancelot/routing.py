@@ -7,9 +7,9 @@ from typing import Any, Callable
 
 def _is_body_annotation(ann) -> bool:
     """FastAPI body rule (deep/01 §3.1): a pydantic model, a dataclass, a
-    bare `dict` annotation, or a container (list/set/tuple/dict) whose
-    element is a model → request body (not a scalar query param). Plain
-    scalars/scalar-containers stay query."""
+    bare `dict` annotation, a parameterized `dict[K, V]`, or a container
+    (list/set/tuple/dict) whose element is a model → request body (not a
+    scalar query param). Plain scalars/scalar-containers stay query."""
     if isinstance(ann, type) and hasattr(ann, "model_validate_json"):
         return True
     if dataclasses.is_dataclass(ann):
@@ -18,9 +18,14 @@ def _is_body_annotation(ann) -> bool:
     if ann is dict:
         return True
     origin = typing.get_origin(ann)
-    if origin in (list, set, frozenset, tuple, dict):
+    # Parameterized dict[K, V] is also a JSON object body (FastAPI parity:
+    # test_typing_python39 posts `dict[str, list[int]]`).
+    if origin is dict:
+        return True
+    if origin in (list, set, frozenset, tuple):
         return any(
-            isinstance(a, type) and hasattr(a, "model_validate_json")
+            (isinstance(a, type) and hasattr(a, "model_validate_json"))
+            or typing.get_origin(a) in (dict, list, tuple, set, frozenset)
             for a in typing.get_args(ann)
         )
     return False
@@ -138,9 +143,13 @@ class Route:
             if not isinstance(dep, _Dep):
                 continue
             sub_plan = compile_dependant(dep.dependency)
+            # Route-level Security(dep, scopes=[...]) declarations also
+            # propagate scopes to the dep's SecurityScopes injection.
+            _route_scopes = tuple(getattr(dep, "scopes", ()) or ())
             self.plan.dependencies.append(SubDep(
                 dep.dependency, sub_plan, dep.use_cache,
-                f"__route_dep_{i}__", discard=True))
+                f"__route_dep_{i}__", discard=True,
+                scopes=_route_scopes))
         # FastAPI rule (test_invalid_path_param + test_invalid_sequence_param):
         # path params must be primitive-coercible (not collection/dict/Model);
         # query/header/cookie sequences must NOT have Model/dict elements.
@@ -159,15 +168,27 @@ class Route:
             elif in_ in ("query", "header", "cookie") and fi.explicit_marker:
                 # Only reject when the user EXPLICITLY wrote Query()/etc. —
                 # a bare `items: list[Item]` still infers JSON body.
-                if origin in (list, tuple, set, frozenset) and args:
-                    inner = args[0]
+                # Unwrap Optional[X] / X | None first so the check fires
+                # on `dict | None = Query(...)` too.
+                import types as _types
+                _u_ann = ann
+                _u_origin = origin
+                _u_args = args
+                if _u_origin is typing.Union or _u_origin is _types.UnionType:
+                    _non_none = [a for a in args if a is not type(None)]
+                    if len(_non_none) == 1:
+                        _u_ann = _non_none[0]
+                        _u_origin = typing.get_origin(_u_ann) or _u_ann
+                        _u_args = typing.get_args(_u_ann)
+                if _u_origin in (list, tuple, set, frozenset) and _u_args:
+                    inner = _u_args[0]
                     if (isinstance(inner, type)
                             and hasattr(inner, "model_validate")) \
                             or typing.get_origin(inner) is dict:
                         raise AssertionError(
                             f"{in_.title()} parameter '{fi.name}' must be "
                             "one of the supported types")
-                elif origin is dict:
+                elif _u_origin is dict or _u_ann is dict:
                     raise AssertionError(
                         f"{in_.title()} parameter '{fi.name}' must be "
                         "one of the supported types")
@@ -241,6 +262,7 @@ class APIRouter:
     def patch(self, p, **kw): return self._add("PATCH", p, **kw)
     def head(self, p, **kw): return self._add("HEAD", p, **kw)
     def options(self, p, **kw): return self._add("OPTIONS", p, **kw)
+    def trace(self, p, **kw): return self._add("TRACE", p, **kw)
 
     def websocket(self, path: str):
         def deco(fn):
@@ -258,6 +280,10 @@ class APIRouter:
         # (applied to child routes without their own response_class), tags
         # (extended), strict_content_type (propagated to child routes that
         # didn't set their own). The rest are surface-only.
+        assert router is not self, (
+            "Cannot include the same APIRouter instance into itself. "
+            "Did you mean to include a different router?"
+        )
         add_prefix = (self.prefix + prefix).rstrip("/")
         extra_deps = list(kwargs.pop("dependencies", None) or [])
         default_rc = kwargs.pop("default_response_class",

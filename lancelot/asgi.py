@@ -34,13 +34,26 @@ def build_asgi(app):
 
 
 async def _lifespan(app, receive, send):
+    async def _run_on_event(kind):
+        # FastAPI on_event decorator handlers — startup runs all at
+        # startup-complete time; shutdown at shutdown-complete time.
+        # Awaitable returns are awaited; sync results are ignored.
+        import inspect as _isp
+
+        for fn in app._on_event_handlers.get(kind, []):
+            r = fn()
+            if _isp.isawaitable(r):
+                await r
+
     if app._lifespan is None:
         # Still honor the protocol (Starlette TestClient drives it).
         while True:
             msg = await receive()
             if msg["type"] == "lifespan.startup":
+                await _run_on_event("startup")
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
+                await _run_on_event("shutdown")
                 # Same rationale as above: do not auto-flip on lifespan.
                 await send({"type": "lifespan.shutdown.complete"})
                 return
@@ -313,13 +326,12 @@ async def _http_dispatch(app, scope, receive, send):
 
     body_value, body_errors = None, []
     if route.body is not None:
-        # FastAPI 0.110+ strict_content_type: a JSON-body route MUST get a
-        # JSON-ish Content-Type — but ONLY when a body is actually present.
-        # An empty body falls through to the existing "missing field"
-        # path so wholly-payload-less requests get the standard 422 shape,
-        # not a misleading content-type 422.
-        if body and getattr(route, "strict_content_type", False) \
-                and getattr(route, "body_kind", "json") == "json":
+        # FastAPI Content-Type rules for JSON-body routes:
+        #   strict=True:  any non-JSON CT (incl. missing) → 422
+        #   strict=False: missing CT is OK; an EXPLICIT non-JSON CT → 422
+        # Only enforced when a body is actually present (empty body falls
+        # through to the canonical missing-field 422).
+        if body and getattr(route, "body_kind", "json") == "json":
             _ct = ""
             for _hk, _hv in scope.get("headers", []):
                 if _hk == b"content-type":
@@ -328,16 +340,20 @@ async def _http_dispatch(app, scope, receive, send):
                     except Exception:  # noqa: BLE001
                         _ct = ""
                     break
-            # Accept application/json, application/*+json (RFC 6839),
-            # and `text/json` (some old clients). Anything else → 422.
-            if "json" not in _ct:
+            _strict = getattr(route, "strict_content_type", False)
+            # Reject when strict and CT is non-JSON (incl. missing), OR
+            # when lax and CT is present but explicitly non-JSON.
+            _ct_invalid = (
+                "json" not in _ct
+                and (_strict or (_ct and "json" not in _ct))
+            )
+            if _ct_invalid:
                 from lancelot.validation import _wire_json
 
                 err_body = _wire_json({"detail": [{
                     "type": "content_type",
                     "loc": ["body"],
-                    "msg": ("Content-Type must be application/json "
-                            "(strict_content_type=True)"),
+                    "msg": "Content-Type must be application/json",
                     "input": None,
                 }]})
                 await _send_json(send, 422, err_body)
@@ -539,19 +555,93 @@ async def _http_dispatch(app, scope, receive, send):
                 from lancelot.responses import StreamingResponse
                 import json as _json
 
+                # FastAPI: detect `-> AsyncIterable[Model]` / `Iterable[T]`
+                # on the handler and validate each yielded item against
+                # the element type. ResponseValidationError on failure.
+                _item_adapter = None
+                try:
+                    import typing as _t
+
+                    _hints = _t.get_type_hints(route.handler,
+                                               include_extras=True)
+                    _ret = _hints.get("return")
+                    _ret_origin = _t.get_origin(_ret) or _ret
+                    # iter / async-iter / generator / async-generator types
+                    _iter_origins = {
+                        c for c in (
+                            getattr(_t, "Iterable", None),
+                            getattr(_t, "AsyncIterable", None),
+                            getattr(_t, "Iterator", None),
+                            getattr(_t, "AsyncIterator", None),
+                            getattr(_t, "Generator", None),
+                            getattr(_t, "AsyncGenerator", None))
+                        if c is not None
+                    }
+                    # Also match collections.abc versions (origin of
+                    # typing.AsyncIterable is collections.abc.AsyncIterable).
+                    import collections.abc as _abc
+
+                    _iter_origins |= {
+                        _abc.Iterable, _abc.AsyncIterable, _abc.Iterator,
+                        _abc.AsyncIterator, _abc.Generator,
+                        _abc.AsyncGenerator}
+                    if _ret_origin in _iter_origins:
+                        _args = _t.get_args(_ret)
+                        if _args:
+                            from pydantic import TypeAdapter as _TA
+                            _item_adapter = _TA(_args[0])
+                except Exception:  # noqa: BLE001
+                    _item_adapter = None
+
                 async def _aiter_json(it):
+                    from lancelot.exceptions import ResponseValidationError
+                    from pydantic import ValidationError as _VE
+
                     if _isp.isasyncgen(it) or hasattr(it, "__aiter__"):
                         async for x in it:
+                            if _item_adapter is not None:
+                                try:
+                                    x = _item_adapter.validate_python(x)
+                                    yield _item_adapter.dump_json(x)
+                                    continue
+                                except _VE as _e:
+                                    raise ResponseValidationError(
+                                        _e.errors(), body=x) from _e
                             yield _json.dumps(x).encode() if not isinstance(
                                 x, (bytes, str)) else (
                                 x if isinstance(x, bytes) else x.encode())
                     else:
                         for x in it:
+                            if _item_adapter is not None:
+                                try:
+                                    x = _item_adapter.validate_python(x)
+                                    yield _item_adapter.dump_json(x)
+                                    continue
+                                except _VE as _e:
+                                    raise ResponseValidationError(
+                                        _e.errors(), body=x) from _e
                             yield _json.dumps(x).encode() if not isinstance(
                                 x, (bytes, str)) else (
                                 x if isinstance(x, bytes) else x.encode())
                 result = StreamingResponse(_aiter_json(result),
                                            media_type="application/jsonl")
+            # Duck-type for any Starlette-shape ASGI-callable response a
+            # handler may return (FileResponse, RedirectResponse,
+            # PlainTextResponse from starlette.responses, ...). Detect
+            # before the strict lancelot.responses.Response isinstance so
+            # FastAPI parity for `return FileResponse(...)` works.
+            if not isinstance(result, Response) and callable(result) \
+                    and getattr(result, "media_type", None) is not None \
+                    and getattr(result, "body_iterator", None) is None \
+                    and not hasattr(result, "body_iterator"):
+                # Some Starlette responses (FileResponse, RedirectResponse)
+                # implement __call__(scope, receive, send); delegate.
+                try:
+                    await result(scope, receive, send)
+                    sent = True
+                    return
+                except TypeError:
+                    pass  # not actually an ASGI app — fall through
             if isinstance(result, Response):  # pre-serialized (docs / openapi)
                 _user_hdrs = getattr(result, "headers", None) or {}
                 # StreamingResponse: iterate `body_iterator` (async or
@@ -566,6 +656,13 @@ async def _http_dispatch(app, scope, receive, send):
                     await send({"type": "http.response.start",
                                 "status": result.status_code,
                                 "headers": _hdrs})
+                    # Mark `sent` BEFORE iterating: if the body iterator
+                    # raises mid-stream (e.g. ResponseValidationError on
+                    # per-item validation), the outer except MUST NOT try
+                    # to emit a second http.response.start — Starlette's
+                    # TestClient asserts that. The exception still
+                    # propagates per Starlette parity (raise_server_excs).
+                    sent = True
                     import inspect as _isp
 
                     if _isp.isasyncgen(_iterator) or hasattr(
@@ -583,7 +680,6 @@ async def _http_dispatch(app, scope, receive, send):
                                         "body": chunk, "more_body": True})
                     await send({"type": "http.response.body",
                                 "body": b"", "more_body": False})
-                    sent = True
                     if lreq._background._tasks:
                         await lreq._background()
                     return
@@ -630,7 +726,12 @@ async def _http_dispatch(app, scope, receive, send):
                             and not isinstance(result, rm)):
                         _val = rm.model_validate(result, from_attributes=True)
                     else:
-                        _val = TypeAdapter(rm).validate_python(result)
+                        # `from_attributes=True` also matters for the
+                        # list[Model] / dict[str, Model] / Optional[Model]
+                        # paths — TypeAdapter recursively coerces ORM-style
+                        # objects only when this flag is set.
+                        _val = TypeAdapter(rm).validate_python(
+                            result, from_attributes=True)
                     _ta = TypeAdapter(rm)
                     payload = _ta.dump_json(
                         _val,
@@ -686,25 +787,34 @@ async def _http_dispatch(app, scope, receive, send):
                 except TypeError:
                     # Some Response subclasses take (content, status_code).
                     _r = _rcls(result, default_status)
-                _r_status = (scratch.status_code if scratch is not None
-                             and scratch.status_code is not None
-                             else default_status)
-                _hdrs = list(extra_hdrs or [])
-                # Pull the response object's media_type. Starlette stores
-                # it on the INSTANCE (`_r.media_type`); our own
-                # lancelot.responses.Response stores it as a CLASS attr.
-                # Either way, attribute access works.
-                _mt = getattr(_r, "media_type", None) \
-                    or getattr(_rcls, "media_type", None) \
-                    or "application/json"
-                _body_bytes = getattr(_r, "body", b"") or b""
-                _hdrs.append((b"content-length",
-                              str(len(_body_bytes)).encode()))
-                _hdrs.append((b"content-type", str(_mt).encode()))
-                await send({"type": "http.response.start",
-                            "status": _r_status, "headers": _hdrs})
-                await send({"type": "http.response.body",
-                            "body": _body_bytes})
+                # Starlette-shape ASGI-callable responses (FileResponse,
+                # RedirectResponse, StreamingResponse) implement
+                # `__call__(scope, receive, send)` — delegate to that so
+                # file streaming / redirect headers / etc. work correctly.
+                # `body` on these is None; reading it would emit an empty
+                # response. Lancelot's own Response subclasses store body
+                # bytes directly and we emit manually below.
+                _body_attr = getattr(_r, "body", None)
+                if _body_attr is None and callable(_r):
+                    await _r(scope, receive, send)
+                    sent = True
+                else:
+                    _r_status = (scratch.status_code
+                                 if scratch is not None
+                                 and scratch.status_code is not None
+                                 else default_status)
+                    _hdrs = list(extra_hdrs or [])
+                    _mt = getattr(_r, "media_type", None) \
+                        or getattr(_rcls, "media_type", None) \
+                        or "application/json"
+                    _body_bytes = _body_attr or b""
+                    _hdrs.append((b"content-length",
+                                  str(len(_body_bytes)).encode()))
+                    _hdrs.append((b"content-type", str(_mt).encode()))
+                    await send({"type": "http.response.start",
+                                "status": _r_status, "headers": _hdrs})
+                    await send({"type": "http.response.body",
+                                "body": _body_bytes})
             else:
                 await _send_json(send, default_status, payload,
                                  extra_headers=extra_hdrs)
@@ -806,9 +916,36 @@ async def _ws(app, scope, receive, send):
     params = route.match(path) or {}
     ws.path_params = params
     headers = {}
+    headers_multi: dict = {}
     for hk, hv in scope.get("headers", []):
-        headers.setdefault(hk.decode(), hv.decode())
-    lreq = LRequest("GET", path, {}, headers, {}, params, b"", scope["app"])
+        k = hk.decode()
+        headers.setdefault(k, hv.decode())
+        headers_multi.setdefault(k, []).append(hv.decode())
+    # Parse query params from the WS handshake (Cookie / Query DI need them).
+    from urllib.parse import parse_qs as _pqs
+
+    qs = _pqs(scope.get("query_string", b"").decode())
+    query = {k: v[-1] for k, v in qs.items()}
+    # Lenient cookie parser (same as HTTP seam — SimpleCookie drops
+    # cookies with brackets/quotes; ours keeps them).
+    cookies: dict = {}
+    if "cookie" in headers:
+        for _piece in headers["cookie"].split(";"):
+            _piece = _piece.strip()
+            if not _piece:
+                continue
+            _i = _piece.find("=")
+            if _i <= 0:
+                continue
+            _ck = _piece[:_i].strip()
+            _cv = _piece[_i + 1:].strip()
+            if len(_cv) >= 2 and _cv[0] == '"' and _cv[-1] == '"':
+                _cv = _cv[1:-1]
+            cookies.setdefault(_ck, _cv)
+    lreq = LRequest("GET", path, query, headers, cookies, params, b"",
+                    scope["app"])
+    lreq.query_params_multi = dict(qs)
+    lreq.headers_multi = headers_multi
     lreq._ws = ws
     try:
         async with solve_async(route.plan, lreq) as res:
@@ -820,7 +957,13 @@ async def _ws(app, scope, receive, send):
             if inspect.isawaitable(result):
                 result = await result
     except WebSocketDisconnect:
-        return  # client closed mid-handler — nothing to send
+        # Re-raise so Starlette's TestClient (raise_app_exceptions=True)
+        # surfaces the disconnect to the user thread. FastAPI does the
+        # same — the vendored tutorial002 / tutorial001 tests assert
+        # `pytest.raises(WebSocketDisconnect)` on the `with` block exit.
+        # In production this is wrapped by the ASGI server's WS adapter
+        # which logs and closes the socket cleanly.
+        raise
     except WebSocketException as exc:  # FastAPI-shape: close w/ code+reason
         try:
             await ws.close(code=exc.code, reason=exc.reason)
@@ -903,12 +1046,17 @@ async def _send_json(send, status: int, body: bytes, *, extra_headers=None):
     # Starlette init_headers wire order: explicit user headers FIRST
     # (lowercased), then content-length, then content-type LAST. Multi-value
     # entries (multi Set-Cookie) are flattened to one header per value.
+    # RFC 7230 §3.3.2: 1xx/204/205/304 MUST NOT include a message body.
+    # Strip body and content-related headers when the status disallows it.
+    no_body = status < 200 or status in (204, 205, 304)
     hdrs = list(extra_headers or [])
-    hdrs.append((b"content-length", str(len(body)).encode()))
-    hdrs.append((b"content-type", b"application/json"))
+    if not no_body:
+        hdrs.append((b"content-length", str(len(body)).encode()))
+        hdrs.append((b"content-type", b"application/json"))
     await send({
         "type": "http.response.start",
         "status": status,
         "headers": hdrs,
     })
-    await send({"type": "http.response.body", "body": body})
+    await send({"type": "http.response.body",
+                "body": b"" if no_body else body})

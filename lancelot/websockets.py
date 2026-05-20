@@ -5,7 +5,32 @@ Python-ASGI-seam realization the conformance/byte oracle exercises."""
 import json
 
 
-class WebSocketDisconnect(Exception):
+class _WSDMeta(type):
+    """Metaclass for WebSocketDisconnect that ALSO matches Starlette's
+    WebSocketDisconnect via duck-typing on isinstance(). The conformance
+    swap runs through Starlette's TestClient, which raises its own
+    `starlette.websockets.WebSocketDisconnect`; the vendored tests catch
+    via `from fastapi.websockets import WebSocketDisconnect` (= ours).
+    A single class hierarchy bridges this without importing Starlette at
+    `lancelot.websockets` load time (cardinal rule: pydantic-only runtime).
+    """
+
+    def __instancecheck__(cls, instance):
+        if type.__instancecheck__(cls, instance):
+            return True
+        # Cross-stack match — only when Starlette IS already loaded
+        # elsewhere (we do NOT import it ourselves).
+        import sys as _sys
+
+        sm = _sys.modules.get("starlette.websockets")
+        if sm is not None:
+            sl = getattr(sm, "WebSocketDisconnect", None)
+            if sl is not None and isinstance(instance, sl):
+                return True
+        return False
+
+
+class WebSocketDisconnect(Exception, metaclass=_WSDMeta):
     def __init__(self, code: int = 1000, reason: str = ""):
         self.code = code
         self.reason = reason

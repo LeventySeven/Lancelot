@@ -91,10 +91,21 @@ class Depends:
     use_cache: bool = True
     scope: typing.Any = None  # FastAPI security-scopes wiring; ledgered
 
+    def __hash__(self):
+        # FastAPI parity: tools (e.g. fastapi-utils) need Depends/Security
+        # to be hashable so they can dedupe them in a set. Two Depends()
+        # are equal iff they reference the same dep + same caching/scope.
+        return hash((type(self), self.dependency, self.use_cache,
+                     self.scope))
+
 
 @dataclass
 class Security(Depends):
     scopes: tuple = ()
+
+    def __hash__(self):
+        return hash((type(self), self.dependency, self.use_cache,
+                     self.scope, tuple(self.scopes)))
 
 
 @dataclass
@@ -119,6 +130,12 @@ def extract_field(name: str, annotation, default, path_params=()) -> FieldInfo:
     marker = None
     real_ann = annotation
     explicit = False
+    # PEP 695 (Py 3.12+) type aliases: `type Foo = Annotated[int, Depends(...)]`
+    # or `TypeAliasType("Foo", Annotated[...])` from typing_extensions.
+    # Unwrap to the underlying value so Depends/Query/etc. are visible.
+    _val = getattr(annotation, "__value__", None)
+    if _val is not None and type(annotation).__name__ == "TypeAliasType":
+        annotation = _val
     if typing.get_origin(annotation) is typing.Annotated:
         args = typing.get_args(annotation)
         inner = args[0]

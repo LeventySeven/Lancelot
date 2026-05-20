@@ -20,6 +20,8 @@ class SubDep:
     #                  so solve() never re-introspects a signature — U15)
     discard: bool = False  # route-level deps: run for side-effects/validation,
     #                       result is NOT bound to a handler kwarg (FastAPI rule)
+    scopes: tuple = ()  # scopes from a Security(dep, scopes=[...]) marker,
+    #                      propagated to the dep's SecurityScopes injection
 
 
 @dataclass
@@ -41,6 +43,25 @@ class Plan:
     def field(self, name):
         return next(f for f in self.fields if f.name == name)
 
+    def uses_scopes(self) -> bool:
+        """FastAPI-parity recursive check: this Plan (or anything it
+        transitively depends on) consumes SecurityScopes. Drives the
+        cache_key — if False, scopes are excluded so paths through the
+        same dep share a cache entry (test_security_scopes_sub_dependency
+        get_db_session: 1 call across both paths)."""
+        if any(isinstance(e, tuple) and e[0] == "__sscopes__"
+               for e in self.request_params):
+            return True
+        # An OpenAPI-tracked security scheme also "uses scopes".
+        if self.security:
+            return True
+        for sub in self.dependencies:
+            if sub.scopes:
+                return True
+            if sub.plan is not None and sub.plan.uses_scopes():
+                return True
+        return False
+
 
 def _is_security(obj) -> bool:
     from lancelot.security import SecurityBase
@@ -61,6 +82,15 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         partial_args = fn.args
         partial_kw = dict(fn.keywords or {})
         fn = fn.func
+    # functools.lru_cache / functools.cache / contextlib.wraps decorators
+    # store the wrapped fn on `__wrapped__`. inspect.signature would
+    # otherwise see `(*args, **kwargs)` (the wrapper's signature) and
+    # synthesize spurious query params. Peel until we bottom out.
+    for _ in range(8):
+        if hasattr(fn, "__wrapped__") and fn.__wrapped__ is not fn:
+            fn = fn.__wrapped__
+        else:
+            break
     # Callable INSTANCE (FastAPI parity: `Depends(some_instance)`) — its
     # signature is its `__call__`. typing.get_type_hints requires a real
     # callable/class; introspect __call__ for instances.
@@ -93,6 +123,12 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
         ann = hints.get(
             name, p.annotation if p.annotation is not inspect.Parameter.empty else str
         )
+        # PEP 695 (Py 3.12+) / typing_extensions TypeAliasType: unwrap to
+        # the underlying value so Depends/Query markers inside it become
+        # visible. Same logic the params.extract_field path uses.
+        _val = getattr(ann, "__value__", None)
+        if _val is not None and type(ann).__name__ == "TypeAliasType":
+            ann = _val
         if ann is _Req:  # `request: Request` → bound to the live Request
             req_params.append(name)
             continue
@@ -145,17 +181,22 @@ def compile_dependant(fn: typing.Callable, path_params=()) -> Plan:
                 if typing.get_origin(_raw) is typing.Annotated:
                     _raw = typing.get_args(_raw)[0]
                 dep = _raw
+            # Scopes from Security(...) markers travel WITH the SubDep so
+            # the sub-dep's SecurityScopes injection (if any) sees them
+            # accumulated from every Security() on its caller chain.
+            _dep_scopes = tuple(getattr(dep_marker, "scopes", ()) or ())
             if _is_security(dep):
                 # A security scheme is invoked directly with the Request —
                 # NOT recursively compiled (its __call__(request) signature
                 # is not a DI graph). Scopes (params.Security) are plumbed
                 # for OpenAPI, NOT enforced (MUST-13).
-                scopes = tuple(getattr(dep_marker, "scopes", ()) or ())
-                deps.append(SubDep(dep, None, dep_marker.use_cache, name))
-                security.append((dep, scopes))
+                deps.append(SubDep(dep, None, dep_marker.use_cache, name,
+                                   scopes=_dep_scopes))
+                security.append((dep, _dep_scopes))
                 continue
             sub = compile_dependant(dep, path_params)
-            deps.append(SubDep(dep, sub, dep_marker.use_cache, name))
+            deps.append(SubDep(dep, sub, dep_marker.use_cache, name,
+                               scopes=_dep_scopes))
             continue
         fi = extract_field(name, ann, default, path_params)
         # Bucket-model: Query()/Header()/Cookie() + BaseModel annotation →
@@ -429,9 +470,13 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
     return SolveResult(None, errors) if errors else SolveResult(kwargs, [])
 
 
-def _bind_req_params(plan, request, kwargs):
+def _bind_req_params(plan, request, kwargs, parent_scopes=()):
     """Bind the magic-injectable params (Request / BackgroundTasks /
-    WebSocket / Response / SecurityScopes) into `kwargs`."""
+    WebSocket / Response / SecurityScopes) into `kwargs`.
+
+    `parent_scopes`: scopes from the Security(this_dep, scopes=[...]) marker
+    on the CALLER of this plan. They flow into SecurityScopes injection
+    (FastAPI parity — security_scopes.scopes accumulates from the chain)."""
     for entry in plan.request_params:
         if isinstance(entry, tuple):
             kind, name = entry
@@ -458,9 +503,11 @@ def _bind_req_params(plan, request, kwargs):
             elif kind == "__sscopes__":
                 from lancelot.security import SecurityScopes as _SS
 
-                # Per-route precomputed scopes union (plan.security holds
-                # (scheme, scopes_tuple)); union them. NOT enforced (M4).
-                all_scopes = []
+                # SecurityScopes accumulates: this plan's own security
+                # tuples + every parent Security(...) declaration that
+                # routed through this dep. parent_scopes is passed by
+                # solve_async from the calling SubDep.scopes.
+                all_scopes = list(parent_scopes)
                 for _scheme, _scopes in plan.security:
                     all_scopes.extend(_scopes)
                 kwargs[name] = _SS(all_scopes)
@@ -473,12 +520,16 @@ def _is_gen_dep(call):
 
 
 @contextlib.asynccontextmanager
-async def solve_async(plan: Plan, request, _cache=None, _stack=None):
+async def solve_async(plan: Plan, request, _cache=None, _stack=None,
+                      _parent_scopes=()):
     """Like solve(), but `yield`-dependencies are entered as (async) context
     managers on a SHARED AsyncExitStack so their teardown runs AFTER the
     response, in reverse (LIFO) order — PEP-789 / deep/01 §5. The recursive
     calls share the owner's stack; only the owner enters/exits it (so
-    teardown happens once, after the `async with solve_async(...)` block)."""
+    teardown happens once, after the `async with solve_async(...)` block).
+
+    `_parent_scopes`: scopes from a Security(plan, scopes=[...]) marker on
+    the CALLER. Flow into SecurityScopes injection for this plan."""
     own = _stack is None
     stack = _stack or contextlib.AsyncExitStack()
     cache = _cache if _cache is not None else {}
@@ -487,9 +538,25 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
     try:
         kwargs, errors = {}, []
         for sub in plan.dependencies:
-            if sub.use_cache and sub.call in cache:
+            # FastAPI Dependant.cache_key: (call, sorted_security_scopes,
+            # computed_scope). Scopes are in the key ONLY when this dep
+            # (or any of its transitive sub-deps) actually consumes them
+            # (`_uses_scopes` — FastAPI parity). Test ref:
+            # test_security_scopes_sub_dependency_caching:
+            #   get_db_session: _uses_scopes=False → cached once across paths
+            #   get_user_me (depends on get_current_user which takes
+            #   SecurityScopes): _uses_scopes=True → cached per accumulated
+            #   scope tuple → 2 calls on 2 paths.
+            _sub_plan = sub.plan
+            _accum_scopes = tuple(_parent_scopes) + tuple(sub.scopes)
+            _uses_scopes = bool(_sub_plan and _sub_plan.uses_scopes()) \
+                or bool(sub.scopes)
+            _scoped_key = (sub.call,
+                           tuple(sorted(_accum_scopes))
+                           if _uses_scopes else ())
+            if sub.use_cache and _scoped_key in cache:
                 if not sub.discard:
-                    kwargs[sub.param_name] = cache[sub.call]
+                    kwargs[sub.param_name] = cache[_scoped_key]
                 continue
             target, subplan = _resolve_dep(sub, request)
             if _is_security(target):
@@ -501,11 +568,18 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 if inspect.isawaitable(val):
                     val = await val
                 if sub.use_cache:
-                    cache[sub.call] = val
+                    cache[_scoped_key] = val
                 if not sub.discard:
                     kwargs[sub.param_name] = val
                 continue
-            async with solve_async(subplan, request, cache, stack) as sr:
+            # SecurityScopes accumulates DOWN the chain: grandparent's
+            # scopes + this Security() declaration's scopes flow into the
+            # sub-dep's injection. (Test ref: GH fastapi#5623 — siblings
+            # see ONLY the route → caller path, not each other's scopes.)
+            async with solve_async(
+                    subplan, request, cache, stack,
+                    _parent_scopes=tuple(_parent_scopes) + tuple(sub.scopes)
+                    ) as sr:
                 if sr.errors:
                     errors.extend(sr.errors)
                     continue
@@ -555,7 +629,7 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
 
                     val = await get_pool().offload(target, **sr.kwargs)
             if sub.use_cache:
-                cache[sub.call] = val
+                cache[_scoped_key] = val
             if not sub.discard:
                 kwargs[sub.param_name] = val
         for fi in plan.fields:
@@ -565,15 +639,34 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                 errors.extend(errs)
             else:
                 kwargs[fi.name] = value
-        _bind_req_params(plan, request, kwargs)
+        _bind_req_params(plan, request, kwargs,
+                         parent_scopes=_parent_scopes)
         yield SolveResult(None, errors) if errors else SolveResult(kwargs, [])
     except BaseException as exc:
         # B4: the handler (or a dep) raised inside the `async with` body.
         # Feed the REAL exc_info to the stack so each yield-dep's generator
         # gets the exception thrown in at its `yield` (its `except:`/`finally:`
-        # rollback runs — PEP-789 / deep/01 §5), then re-raise.
+        # rollback runs — PEP-789 / deep/01 §5).
+        # FastAPI parity: a yield-dep that CATCHES the exception but doesn't
+        # re-raise it is a documented anti-pattern. `__aexit__` returning
+        # True means "exception suppressed by a dep"; FastAPI raises
+        # FastAPIError pointing the user at the docs instead of letting
+        # the swallow go silent.
         if own:
-            await stack.__aexit__(type(exc), exc, exc.__traceback__)
+            suppressed = await stack.__aexit__(
+                type(exc), exc, exc.__traceback__)
+            if suppressed:
+                from lancelot.exceptions import FastAPIError
+
+                raise FastAPIError(
+                    "Caught handled exception, but while raising an "
+                    "exception and a dependency with yield, the "
+                    "dependency must `raise` the same exception. Read "
+                    "more about it in the docs: "
+                    "https://fastapi.tiangolo.com/tutorial/dependencies/"
+                    "dependencies-with-yield/"
+                    "#dependencies-with-yield-and-except"
+                ) from exc
         raise
     else:
         if own:

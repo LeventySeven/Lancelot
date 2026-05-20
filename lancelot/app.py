@@ -51,6 +51,8 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
+        # @app.on_event("startup"/"shutdown") deprecated decorator handlers.
+        self._on_event_handlers: dict = {"startup": [], "shutdown": []}
         # FastAPI parity: app.add_exception_handler / @app.exception_handler /
         # FastAPI(exception_handlers={ExcCls: fn}). MRO-walked at exception
         # time so a `Exception:` catch-all also fires for subclasses.
@@ -384,6 +386,35 @@ class App:
     def patch(self, p, **kw): return self._add("PATCH", p, **kw)
     def head(self, p, **kw): return self._add("HEAD", p, **kw)
     def options(self, p, **kw): return self._add("OPTIONS", p, **kw)
+    def trace(self, p, **kw): return self._add("TRACE", p, **kw)
+
+    def on_event(self, event_type: str):
+        """FastAPI 0.92-era startup/shutdown decorator. Deprecated in
+        favor of lifespan handlers; we keep the decorator + emit the
+        FastAPIDeprecationWarning so tests asserting the warning still
+        pass. The registered fn runs at lifespan-startup / shutdown."""
+        import warnings
+
+        from lancelot.exceptions import FastAPIDeprecationWarning as _FDW
+
+        warnings.warn(
+            "on_event is deprecated, use lifespan event handlers instead.\n"
+            "Read more about it in the docs: "
+            "https://fastapi.tiangolo.com/advanced/events/",
+            _FDW,
+            stacklevel=2,
+        )
+
+        if event_type not in ("startup", "shutdown"):
+            raise ValueError(
+                f"on_event expects 'startup' or 'shutdown', got {event_type!r}"
+            )
+
+        def deco(fn):
+            self._on_event_handlers.setdefault(event_type, []).append(fn)
+            return fn
+
+        return deco
 
     def include_router(self, router: APIRouter, prefix: str = "", **kwargs):
         # Accepts FastAPI's documented include_router kwargs (dependencies,
@@ -421,7 +452,19 @@ class App:
             # to chase after this point).
             if kw.get("strict_content_type") is None:
                 kw["strict_content_type"] = effective_sct
-            self.router.add(Route(r.method, prefix + r.path, r.handler,
+            # FastAPI parity: an empty final path (no prefix AND empty
+            # route path) is invalid — raise FastAPIError at include time
+            # so the bug surfaces immediately, not at first request.
+            _final_path = prefix + r.path
+            if _final_path == "":
+                from lancelot.exceptions import FastAPIError
+
+                raise FastAPIError(
+                    "Prefix and path cannot be both empty (path operation"
+                    f" {r.method} '{r.path}'). Add a prefix to the "
+                    "router or change the path."
+                )
+            self.router.add(Route(r.method, _final_path, r.handler,
                                   r.name, **kw))
 
     def middleware(self, kind: str = "http"):
