@@ -53,6 +53,24 @@ class TransportPool:
                 return None
         return None
 
+    @staticmethod
+    def _maybe_emit_cost(resp) -> None:
+        """If the response body looks like an OpenAI/Anthropic LLM call
+        (has a `usage` block), auto-emit a gen_ai.cost event (M2-P3)."""
+        try:
+            ct = resp.headers.get("content-type", "")
+            if "json" not in ct:
+                return
+            body = resp.json()
+            if not isinstance(body, dict) or "usage" not in body:
+                return
+            from lancelot.telemetry import (cost_event_from_openai_response,
+                                            emit)
+
+            emit(cost_event_from_openai_response(body))
+        except Exception:  # noqa: BLE001 - telemetry never breaks a request
+            pass
+
     async def request(self, method: str, url: str, **kw):
         """Single outbound HTTP call with idempotent retry."""
         method = method.upper()
@@ -63,11 +81,14 @@ class TransportPool:
             # POST/PATCH/CONNECT etc. are NEVER retried — the cardinal
             # rule. Return as-is so the caller (handler) decides.
             if not idempotent:
+                self._maybe_emit_cost(resp)
                 return resp
             # Idempotent verbs retry on 5xx + 429 only.
             if resp.status_code not in (429, 500, 502, 503, 504):
+                self._maybe_emit_cost(resp)
                 return resp
             if attempt >= self.max_retries:
+                self._maybe_emit_cost(resp)
                 return resp
             wait = self._retry_after_seconds(resp)
             if wait is None:
