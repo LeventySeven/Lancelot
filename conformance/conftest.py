@@ -56,10 +56,19 @@ import lancelot.middleware as _lmw  # noqa: E402
 
 sys.modules["fastapi.middleware"] = _lmw
 _fastapi.middleware = _lmw
-# fastapi.middleware.cors / fastapi.middleware.trustedhost via the alias
+# fastapi.middleware.cors / .httpsredirect / .trustedhost / .gzip:
+# CORS uses Lancelot's native impl; the others are Starlette-provided
+# ASGI middlewares (any spec-compliant middleware works with Lancelot).
 _mw_cors = types.ModuleType("fastapi.middleware.cors")
 _mw_cors.CORSMiddleware = _lmw.CORSMiddleware
 sys.modules["fastapi.middleware.cors"] = _mw_cors
+for _sname in ("httpsredirect", "trustedhost", "gzip"):
+    try:
+        _sm = __import__(f"starlette.middleware.{_sname}",
+                         fromlist=["*"])
+        sys.modules[f"fastapi.middleware.{_sname}"] = _sm
+    except ImportError:
+        pass
 import lancelot.websockets as _lws  # noqa: E402
 
 sys.modules["fastapi.websockets"] = _lws
