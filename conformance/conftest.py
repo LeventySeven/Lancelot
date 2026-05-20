@@ -37,9 +37,21 @@ _fastapi.WebSocketDisconnect = _WSD
 _fastapi.WebSocketException = _WSE
 import lancelot.responses as _lresp  # noqa: E402
 
-for _rn in ("Response", "JSONResponse", "HTMLResponse", "PlainTextResponse"):
+for _rn in ("Response", "JSONResponse", "HTMLResponse", "PlainTextResponse",
+            "StreamingResponse"):
     if hasattr(_lresp, _rn):
         setattr(_fastapi, _rn, getattr(_lresp, _rn))
+# FileResponse / RedirectResponse: Starlette-provided ASGI responses
+# pass-through (tests/users that need them get Starlette's working impl;
+# Lancelot's asgi seam recognizes any Response subclass and emits it).
+for _srn in ("FileResponse", "RedirectResponse"):
+    try:
+        _scls = getattr(__import__(
+            "starlette.responses", fromlist=[_srn]), _srn)
+        setattr(_fastapi, _srn, _scls)
+        setattr(_lresp, _srn, _scls)
+    except (ImportError, AttributeError):
+        pass
 # `from fastapi.responses import JSONResponse` / `from fastapi import status`
 sys.modules["fastapi.responses"] = _lresp
 _fastapi.responses = _lresp
@@ -52,6 +64,10 @@ import lancelot.exceptions as _lexc  # noqa: E402
 
 sys.modules["fastapi.exceptions"] = _lexc
 _fastapi.exceptions = _lexc
+# FastAPI-specific deprecation marker class (vendored tests reference it).
+if not hasattr(_lexc, "FastAPIDeprecationWarning"):
+    _lexc.FastAPIDeprecationWarning = type(
+        "FastAPIDeprecationWarning", (DeprecationWarning,), {})
 import lancelot.middleware as _lmw  # noqa: E402
 
 sys.modules["fastapi.middleware"] = _lmw
