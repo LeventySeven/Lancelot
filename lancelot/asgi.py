@@ -323,9 +323,16 @@ async def _http(app, scope, receive, send):
                     return
                 # Starlette init_headers wire order: explicit user headers
                 # FIRST (lowercased — Starlette parity), then content-length,
-                # then content-type LAST.
-                _hdrs = [(str(k).lower().encode(), str(v).encode())
-                         for k, v in _user_hdrs.items()]
+                # then content-type LAST. List-valued entries (multi
+                # Set-Cookie) emit one header per value.
+                _hdrs = []
+                for k, v in _user_hdrs.items():
+                    kb = str(k).lower().encode()
+                    if isinstance(v, list):
+                        for vv in v:
+                            _hdrs.append((kb, str(vv).encode()))
+                    else:
+                        _hdrs.append((kb, str(v).encode()))
                 _hdrs.append((b"content-length",
                               str(len(result.body)).encode()))
                 _hdrs.append((b"content-type",

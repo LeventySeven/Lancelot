@@ -15,6 +15,45 @@ class Response:
             content if isinstance(content, (bytes, bytearray))
             else str(content).encode()
         )
+        # Multi-value headers for repeats like Set-Cookie. Stored as a
+        # plain dict for the simple case; set_cookie appends as a list.
+        if not hasattr(self, "headers"):
+            self.headers = {}
+
+    def set_cookie(self, key: str, value: str = "", max_age: int | None = None,
+                   expires=None, path: str = "/", domain: str | None = None,
+                   secure: bool = False, httponly: bool = False,
+                   samesite: str | None = "lax"):
+        """Build a Set-Cookie header. Multiple cookies accumulate via a
+        list value under the `set-cookie` key (asgi seam emits each)."""
+        parts = [f"{key}={value}"]
+        if max_age is not None:
+            parts.append(f"Max-Age={max_age}")
+        if expires is not None:
+            parts.append(f"Expires={expires}")
+        if path:
+            parts.append(f"Path={path}")
+        if domain:
+            parts.append(f"Domain={domain}")
+        if secure:
+            parts.append("Secure")
+        if httponly:
+            parts.append("HttpOnly")
+        if samesite:
+            parts.append(f"SameSite={samesite}")
+        header_value = "; ".join(parts)
+        existing = self.headers.get("set-cookie")
+        if existing is None:
+            self.headers["set-cookie"] = header_value
+        elif isinstance(existing, list):
+            existing.append(header_value)
+        else:
+            self.headers["set-cookie"] = [existing, header_value]
+
+    def delete_cookie(self, key: str, path: str = "/",
+                      domain: str | None = None):
+        self.set_cookie(key, value="", max_age=0, expires=0, path=path,
+                        domain=domain)
 
 
 class HTMLResponse(Response):
