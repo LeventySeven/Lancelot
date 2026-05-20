@@ -24,9 +24,9 @@ make m1-conformance                                 # FastAPI byte-parity gate
 $HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings
 ```
 
-If any of these go red, the chunk does not ship. The conformance floor is `passes=876` (= 90.0% of 973).
+If any of these go red, the chunk does not ship. The conformance floor is `passes=910` (= 93.5% of 973).
 
-## Current milestone state (as of m2-tierC5)
+## Current milestone state (as of m2-conformance-push)
 
 - **M0** green (Rust core, hyper/tokio/pyo3)
 - **M1-EXIT** hit at 90.0% conformance, tag `m1-exit-90`
@@ -34,18 +34,21 @@ If any of these go red, the chunk does not ship. The conformance floor is `passe
 - **M2 Tier-B** — cloud-native resilience (graceful shutdown, RED metrics, ContextVar request-id, connection cap, per-route timeout), tag `m2-tierB`
 - **M2 Tier-C** — AI primitives (canonical JSON, session-affinity, transport-pool cancellation, tool output_schema, dynamic-write audit), tag `m2-tierC`
 - **M2 Tier-C5** — marquee `@app.batch` for prefix-aware request grouping, tag `m2-tierC5`
+- **M2 conformance push** — 876 → 910 Class-A passes (93.5%), tag `m2-conformance-push`. Unlocks: `@app.exception_handler` surface, `strict_content_type`, `Json[T]` Annotated preservation, lenient cookie parser, subclass-class-attr media_type, callable-instance + partial DI, single-Body scalar pattern, Starlette plaintext 500, Optional[list[T]] form wrapping.
 
 Public surface added this milestone:
 - `lancelot.canonical.dumps_canonical(obj)` → stable JSON bytes for KV-cache stability
-- `lancelot.context.request_id` ContextVar (+ `X-Request-ID` echo on incoming)
-- `App(max_concurrent_requests=N, drain_timeout=30.0, default_response_class=...)`
+- `lancelot.context.request_id` ContextVar (+ `X-Request-ID` echo on incoming, CRLF-sanitized, 128-char bounded)
+- `App(max_concurrent_requests=N, drain_timeout=30.0, default_response_class=..., exception_handlers={ExcCls: fn}, strict_content_type=True)`
 - `App.initiate_shutdown() / drain(timeout) / install_signal_handlers()`
+- `App.add_exception_handler(ExcCls, fn)` / `@app.exception_handler(ExcCls)` decorator
 - `@app.stream(stream_interval=N, sse_keepalive=S)`
 - `@app.batch(batch_window_ms, max_batch, max_keys, key=...)`
 - `@app.middleware("http")`
 - `@app.tool(...) → tool_schemas()[i]["output_schema"]` auto-derived
 - `Response.set_session_affinity(key)`
 - Per-route `timeout=` kwarg → 504 on miss, yield-dep teardown preserved
+- Per-route / per-router `strict_content_type=True/False/None` (inherits)
 - Magic-inject types: `Request`, `BackgroundTasks`, `WebSocket`, `Response`, `SecurityScopes`
 
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
