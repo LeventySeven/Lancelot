@@ -186,8 +186,15 @@ async def _http(app, scope, receive, send):
             # the model (defaults / extra="allow" may make it succeed).
             body_value, body_errors = bval.validate_form([])
         else:
-            body_errors = [{"type": "missing", "loc": ["body", bname],
-                            "msg": "Field required", "input": None}]
+            # FastAPI: an empty body for a model route returns
+            # loc=["body"] (root-level missing) OR loc=["body", alias]
+            # depending on the field — let pydantic generate the
+            # alias-aware error via an empty-object validate.
+            body_value, body_errors = bval.validate_json(b"{}")
+            if not body_errors:
+                # No required fields → synthesize the legacy missing.
+                body_errors = [{"type": "missing", "loc": ["body", bname],
+                                "msg": "Field required", "input": None}]
 
     # Handler call + response MUST be inside the solve_async context so
     # yield-dependency teardown runs AFTER the response (PEP-789, deep/01 §5).
