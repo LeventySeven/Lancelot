@@ -214,6 +214,22 @@ def _route_models(app) -> list:
     return models
 
 
+def _strip_null_defaults(node):
+    """FastAPI rule: an Optional[T]=None field's schema omits the
+    `default: null` (the `{"type":"null"}` in anyOf already conveys
+    nullability). pydantic v2 emits `default:None` — strip it here."""
+    if isinstance(node, dict):
+        if node.get("default") is None and "anyOf" in node and any(
+                isinstance(v, dict) and v.get("type") == "null"
+                for v in node["anyOf"]):
+            del node["default"]
+        for v in node.values():
+            _strip_null_defaults(v)
+    elif isinstance(node, list):
+        for v in node:
+            _strip_null_defaults(v)
+
+
 def components_schemas(app) -> dict:
     defs = {}
     models = _route_models(app)
@@ -222,6 +238,9 @@ def components_schemas(app) -> dict:
         inputs = [(m, "validation", TypeAdapter(m).core_schema) for m in models]
         _, definitions = gen.generate_definitions(inputs=inputs)
         defs.update(definitions)
+    # Match FastAPI: strip default:null from Optional[T]=None fields.
+    for sch in defs.values():
+        _strip_null_defaults(sch)
     # Synthesize Body_<operation_id> schemas for routes with embed=True
     # scalar body params (FastAPI parity for Annotated[T, Body(embed=True)]).
     for r in app.routes:
