@@ -40,6 +40,7 @@ class App:
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
+        self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._register_builtin_routes()
 
     async def __call__(self, scope, receive, send):
@@ -108,6 +109,36 @@ class App:
             return fn
 
         return deco
+
+    def tool(self, *, name: str | None = None, description: str | None = None,
+             read_only: bool = False, scopes: list | None = None,
+             **_ignored):
+        """M2-P5: register a callable as an LLM tool. Reuses the existing
+        Pydantic/Dependant compiler — input_schema auto-derived from type
+        hints (Anthropic-tool-format shape; OpenAI/Google convert to it)."""
+        from lancelot.tool import make_tool_spec
+
+        def deco(fn):
+            spec = make_tool_spec(fn, name=name, description=description,
+                                  read_only=read_only, scopes=scopes)
+            self._tools[spec.name] = spec
+            return fn
+
+        return deco
+
+    def tool_schemas(self) -> list[dict]:
+        """Return the list of registered tools' {name, description,
+        input_schema} dicts — exactly the shape Anthropic/MCP expect."""
+        return [{"name": s.name, "description": s.description,
+                 "input_schema": s.input_schema}
+                for s in self._tools.values()]
+
+    def call_tool(self, name: str, **kwargs):
+        """Invoke a registered tool by name. Inputs are Pydantic-validated
+        (same machinery as HTTP request validation)."""
+        spec = self._tools[name]
+        validated = spec._validator(**kwargs).model_dump()
+        return spec.func(**validated)
 
     def stream(self, path: str, **kwargs):
         """M2-P4: typed event-stream sugar. The handler is an async
