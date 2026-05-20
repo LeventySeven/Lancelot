@@ -168,10 +168,12 @@ def _raw_for(fi, request):
         return h.get(k), k in h
     if src == "cookie":
         return request.cookies.get(key), key in request.cookies
-    if src == "body" and getattr(fi.marker, "embed", False):
-        # FastAPI Body(embed=True): the request body is a JSON object
-        # keyed by the param name/alias; the handler receives the unwrapped
-        # value. Parse once, cache on the request.
+    if src == "body":
+        # FastAPI: any scalar Body() param (including the implicit one
+        # produced when multiple Body params are declared) is read from
+        # a JSON-object request body keyed by the param name/alias.
+        # `Body(embed=True)` is the explicit opt-in; multi-Body routes
+        # get the same behavior implicitly. Parse once, cache.
         cache = getattr(request, "_body_obj_cache", _MISSING)
         if cache is _MISSING:
             import json as _json
