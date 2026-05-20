@@ -139,6 +139,23 @@ async def _http(app, scope, receive, send):
         if not msg.get("more_body", False):
             break
 
+    # A3 (research-distillation): JSON-nesting-depth DoS guard. Runs ONLY
+    # for JSON-ish content types so multipart / urlencoded / binary bodies
+    # are untouched. 128 is Robyn's value; raise via App config when we
+    # expose the knob.
+    if body:
+        _ct = b""
+        for _hk, _hv in scope.get("headers", []):
+            if _hk == b"content-type":
+                _ct = _hv
+                break
+        if b"json" in _ct.lower():
+            from lancelot._json_guard import exceeds_depth
+
+            if exceeds_depth(body, 128):
+                await _send_json(send, 400,
+                                 b'{"detail":"JSON body nested too deep"}')
+                return
     qs = parse_qs(scope.get("query_string", b"").decode())
     query = {k: v[-1] for k, v in qs.items()}
     query_multi = dict(qs)  # full multi-value form (bucket-model uses)
@@ -238,15 +255,65 @@ async def _http(app, scope, receive, send):
                                 (b"cache-control", b"no-cache"),
                                 (b"x-accel-buffering", b"no")]})
                 sent = True
-                try:
-                    async for event in gen:
+                # A5 (research-distillation): 15-second SSE keepalive ping
+                # on idle, so CDNs / nginx / browsers don't tear the
+                # connection down during slow LLM streams. The ping is an
+                # SSE comment line (":\n\n") — clients are required to
+                # ignore comments (RFC 8895 / WHATWG EventSource §9).
+                # A6: stream_interval — batch N events per SSE frame for
+                # high-rate token streams. Default 1 (unbuffered).
+                _ka = getattr(route, "sse_keepalive", 15.0)
+                _interval = max(1, int(getattr(route, "stream_interval", 1)))
+                _buf = bytearray()
+                _buf_count = 0
+
+                async def _flush():
+                    nonlocal _buf, _buf_count
+                    if _buf:
                         await send({"type": "http.response.body",
-                                    "body": event.render(),
-                                    "more_body": True})
+                                    "body": bytes(_buf), "more_body": True})
+                        _buf = bytearray()
+                        _buf_count = 0
+
+                _it = gen.__aiter__()
+                # Long-lived __anext__ task; shielded from wait_for so a
+                # keepalive timeout does NOT cancel the in-flight handler
+                # awaitable. We rebuild the task only after an event is
+                # consumed (one-at-a-time, no concurrency).
+                _next_task = None
+                try:
+                    while True:
+                        if _next_task is None or _next_task.done():
+                            if _next_task is None:
+                                _next_task = _asyncio.ensure_future(
+                                    _it.__anext__())
+                        try:
+                            event = await _asyncio.wait_for(
+                                _asyncio.shield(_next_task), timeout=_ka)
+                        except _asyncio.TimeoutError:
+                            # Flush any buffered events first so a slow
+                            # client doesn't lose chunks behind the ping.
+                            await _flush()
+                            await send({"type": "http.response.body",
+                                        "body": b":\n\n", "more_body": True})
+                            continue
+                        except StopAsyncIteration:
+                            _next_task = None
+                            break
+                        _next_task = None  # consumed; will rebuild
+                        _buf += event.render()
+                        _buf_count += 1
+                        if _buf_count >= _interval:
+                            await _flush()
                 except _asyncio.CancelledError:
                     lreq._cancel_event.set()
+                    if _next_task is not None and not _next_task.done():
+                        _next_task.cancel()
                     raise
                 finally:
+                    if _next_task is not None and not _next_task.done():
+                        _next_task.cancel()
+                    await _flush()
                     await send({"type": "http.response.body",
                                 "body": b"", "more_body": False})
                 return

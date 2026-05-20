@@ -46,6 +46,11 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
+        # Graceful-shutdown flag — flipped by lifespan_shutdown or a
+        # SIGTERM handler the user wires. /readyz returns 503 + Retry-After
+        # while True so the LB stops sending new traffic. (Tier-A.4 + B1
+        # foundation; full SIGTERM wiring lands with B1.)
+        self._shutting_down: bool = False
         # FastAPI parity: `FastAPI(default_response_class=ORJSONResponse)`
         # picks the response class for any route that didn't override.
         self._default_response_class = kwargs.pop(
@@ -95,8 +100,27 @@ class App:
         def _scalar():
             return HTMLResponse(scalar_html("/openapi.json", "Lancelot - Scalar"))
 
+        # /livez: cheapest possible "process alive" probe — must NEVER touch
+        # app state or DB. Returns 200 if the event loop can answer.
+        # /readyz: "ready for traffic" — 503 once graceful shutdown has been
+        # signalled; 200 otherwise. Both are k8s table-stakes and FastAPI
+        # makes you write them by hand (research/core 02_STRUCTURE 200-230).
+        def _livez():
+            return JSONResponse(b'{"status":"ok"}')
+
+        def _readyz():
+            if self._shutting_down:
+                from lancelot.responses import Response as _R
+
+                r = _R(b'{"status":"draining"}', status_code=503,
+                       media_type="application/json")
+                r.headers["retry-after"] = "1"
+                return r
+            return JSONResponse(b'{"status":"ok"}')
+
         for path, fn in (("/openapi.json", _openapi_json), ("/docs", _docs),
-                         ("/redoc", _redoc), ("/scalar", _scalar)):
+                         ("/redoc", _redoc), ("/scalar", _scalar),
+                         ("/livez", _livez), ("/readyz", _readyz)):
             self.router.add(Route("GET", path, fn, include_in_schema=False))
 
     # --- registration -----------------------------------------------------
@@ -177,15 +201,26 @@ class App:
         validated = spec._validator(**kwargs).model_dump()
         return spec.func(**validated)
 
-    def stream(self, path: str, **kwargs):
-        """M2-P4: typed event-stream sugar. The handler is an async
-        generator yielding `lancelot.stream.Event` items; the framework
-        owns SSE framing + cancellation propagation."""
+    def stream(self, path: str, *, stream_interval: int = 1,
+               sse_keepalive: float = 15.0, **kwargs):
+        """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
+        an async generator yielding `lancelot.stream.Event` items; the
+        framework owns SSE framing + cancellation propagation.
+
+        `stream_interval` (default 1, unbuffered): batch N events per SSE
+        frame — useful for high-rate token streams (vLLM 0.7 uses 5). At
+        =1 the wire is exactly one event per send (FastAPI parity).
+
+        `sse_keepalive` (default 15.0 s): emit an SSE comment line on idle
+        so CDNs / nginx / browsers don't time out during slow LLM streams.
+        Set to None or 0 to disable (not recommended)."""
         import dataclasses as _dc
 
         known = {f.name for f in _dc.fields(Route)}
         kw = {k: v for k, v in kwargs.items() if k in known}
         kw["is_stream"] = True
+        kw["stream_interval"] = stream_interval
+        kw["sse_keepalive"] = sse_keepalive
 
         def deco(fn):
             self.router.add(Route("GET", path, fn, **kw))

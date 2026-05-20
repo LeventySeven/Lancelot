@@ -35,6 +35,8 @@ class Route:
     include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
     is_ws: bool = False  # WebSocket route (matched by scope type, not method)
     is_stream: bool = False  # @app.stream: yields lancelot.stream.Event
+    stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
+    sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
     status_code: int | None = None  # FastAPI default response status
     # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
     response_model: Any = None

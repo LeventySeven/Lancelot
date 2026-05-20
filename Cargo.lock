@@ -347,6 +347,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "matchit",
  "pyo3",
  "pyo3-async-runtimes",

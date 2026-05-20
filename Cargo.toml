@@ -34,6 +34,11 @@ matchit = "0.8"
 bytes = "1"
 dhat = { version = "0.3", optional = true }
 
+# Tier-A.A1/A2: TCP_QUICKACK + TCP_FASTOPEN setsockopt on Linux. socket2
+# doesn't expose them; we call libc directly under #[cfg(target_os="linux")].
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 trybuild = "1"
 
