@@ -221,6 +221,86 @@ class App:
         validated = spec._validator(**kwargs).model_dump()
         return spec.func(**validated)
 
+    def batch(self, path: str, *, batch_window_ms: int = 50,
+              max_batch: int = 16, max_keys: int = 1024,
+              key=None, **route_kwargs):
+        """Tier-C.C5 (marquee): prefix-aware request grouping for AI
+        workloads. The HTTP route accepts ONE payload per request; the
+        wrapped handler receives a `list[Payload]` containing every
+        request that arrived during `batch_window_ms` (or up to
+        `max_batch`, whichever fires first). The framework fans the
+        handler's `list[Result]` back to each waiter by index.
+
+        Surface:
+            @app.batch("/chat", batch_window_ms=50, max_batch=10,
+                       key=lambda item: item.system_prompt)
+            async def chat(items: list[ChatRequest]) -> list[ChatResponse]:
+                # ONE upstream call covering every item in `items`
+                return await call_upstream(items)
+
+        Failure semantics: a handler exception fans out to every waiter
+        in that batch (no half-success); a wrong-length return list
+        raises RuntimeError on every waiter (contract failure).
+
+        AI logic stays user-side (cardinal rule). We just batch + fanout."""
+        import inspect as _inspect
+        import typing as _typing
+        from lancelot.batch import _BatchRegistry
+
+        window_s = batch_window_ms / 1000.0
+
+        def deco(fn):
+            # The user handler is `(items: list[T]) -> list[U]`. The HTTP
+            # route accepts ONE `T`. Extract T from `list[T]` so the
+            # synthesized route handler has the right signature for
+            # pydantic validation.
+            sig = _inspect.signature(fn)
+            params = list(sig.parameters.values())
+            if len(params) != 1:
+                raise TypeError(
+                    f"@app.batch handler must take exactly one "
+                    f"(items: list[T]) parameter; got {len(params)}"
+                )
+            hints = _typing.get_type_hints(fn)
+            list_ann = hints.get(params[0].name)
+            if list_ann is None or _typing.get_origin(list_ann) not in (
+                    list, _typing.List):  # noqa: UP006
+                raise TypeError(
+                    f"@app.batch handler's parameter must be `list[T]`, "
+                    f"got {list_ann!r}"
+                )
+            item_T = _typing.get_args(list_ann)[0]
+
+            registry = _BatchRegistry(fn, window_s, max_batch, key,
+                                      max_keys=max_keys)
+
+            # Synthesize an HTTP-level handler with one-payload signature.
+            # The body name `item` becomes the JSON-body field; matches
+            # FastAPI's `@app.post` shape exactly.
+            async def _http_handler(item):
+                return await registry.submit(item)
+
+            _http_handler.__annotations__ = {"item": item_T}
+            _http_handler.__name__ = fn.__name__
+            _http_handler.__doc__ = fn.__doc__
+            try:
+                _http_handler.__signature__ = _inspect.Signature(
+                    parameters=[_inspect.Parameter(
+                        "item", _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        annotation=item_T)]
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+            import dataclasses as _dc
+
+            known = {f.name for f in _dc.fields(Route)}
+            kw = {k: v for k, v in route_kwargs.items() if k in known}
+            self.router.add(Route("POST", path, _http_handler, **kw))
+            return fn  # original is still directly callable
+
+        return deco
+
     def stream(self, path: str, *, stream_interval: int = 1,
                sse_keepalive: float = 15.0, **kwargs):
         """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
