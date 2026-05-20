@@ -18,6 +18,8 @@ class SubDep:
     use_cache: bool
     param_name: str  # parent param this dep binds to (recorded at COMPILE time
     #                  so solve() never re-introspects a signature — U15)
+    discard: bool = False  # route-level deps: run for side-effects/validation,
+    #                       result is NOT bound to a handler kwarg (FastAPI rule)
 
 
 @dataclass
@@ -286,7 +288,8 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
     kwargs, errors = {}, []
     for sub in plan.dependencies:
         if sub.use_cache and sub.call in cache:
-            kwargs[sub.param_name] = cache[sub.call]
+            if not sub.discard:
+                kwargs[sub.param_name] = cache[sub.call]
             continue
         target, subplan = _resolve_dep(sub, request)
         if _is_security(target):
@@ -299,7 +302,8 @@ def solve(plan: Plan, request, _cache=None) -> SolveResult:
         val = target(**sr.kwargs)
         if sub.use_cache:
             cache[sub.call] = val
-        kwargs[sub.param_name] = val
+        if not sub.discard:
+            kwargs[sub.param_name] = val
     for fi in plan.fields:
         raw, present = _raw_for(fi, request)
         value, errs = plan.validators[fi.name].validate(raw, present=present)
@@ -337,7 +341,8 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
         kwargs, errors = {}, []
         for sub in plan.dependencies:
             if sub.use_cache and sub.call in cache:
-                kwargs[sub.param_name] = cache[sub.call]
+                if not sub.discard:
+                    kwargs[sub.param_name] = cache[sub.call]
                 continue
             target, subplan = _resolve_dep(sub, request)
             if _is_security(target):
@@ -350,7 +355,8 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                     val = await val
                 if sub.use_cache:
                     cache[sub.call] = val
-                kwargs[sub.param_name] = val
+                if not sub.discard:
+                    kwargs[sub.param_name] = val
                 continue
             async with solve_async(subplan, request, cache, stack) as sr:
                 if sr.errors:
@@ -379,7 +385,8 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None):
                     val = await get_pool().offload(target, **sr.kwargs)
             if sub.use_cache:
                 cache[sub.call] = val
-            kwargs[sub.param_name] = val
+            if not sub.discard:
+                kwargs[sub.param_name] = val
         for fi in plan.fields:
             raw, present = _raw_for(fi, request)
             value, errs = plan.validators[fi.name].validate(raw, present=present)

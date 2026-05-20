@@ -67,12 +67,26 @@ class Route:
         # hot path never re-introspects). Detect a pydantic-model body param
         # and lift it out of scalar validation (validated single-pass at the
         # ASGI seam). list[Model]/dataclass bodies are long-tail → P7 ratchet.
-        from lancelot.di import compile_dependant
+        from lancelot.di import compile_dependant, SubDep
         from lancelot.validation import BodyValidator, FormBodyValidator
 
         self.plan = compile_dependant(
             self.handler, path_params=set(self._rx.groupindex)
         )
+        # Route-level dependencies (dependencies=[Depends(...)]) are
+        # invoked with no kwargs-binding (their return value is discarded —
+        # FastAPI semantics) but their validation/auth failures DO
+        # propagate as 422/401/etc. Append them to plan.dependencies with
+        # an unused param_name slot so solve_async runs them.
+        for i, dep in enumerate(self.dependencies or []):
+            from lancelot.params import Depends as _Dep
+
+            if not isinstance(dep, _Dep):
+                continue
+            sub_plan = compile_dependant(dep.dependency)
+            self.plan.dependencies.append(SubDep(
+                dep.dependency, sub_plan, dep.use_cache,
+                f"__route_dep_{i}__", discard=True))
         # FastAPI rule (test_invalid_path_param + test_invalid_sequence_param):
         # path params must be primitive-coercible (not collection/dict/Model);
         # query/header/cookie sequences must NOT have Model/dict elements.
