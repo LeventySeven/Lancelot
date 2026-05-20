@@ -205,18 +205,28 @@ def _raw_for(fi, request):
         # FastAPI: `p: bytes = File()` reads the file bytes; `p:
         # UploadFile = File()` keeps the wrapper. List annotations get
         # the multi-value list; scalar annotations the last value.
+        # Optional/Union[T, None] strips the None branch.
         from lancelot.uploads import UploadFile as _UF
         import typing as _t
 
-        origin = _t.get_origin(fi.annotation) or fi.annotation
+        ann = fi.annotation
+        # Unwrap Union[X, None] / X | None / Optional[X]
+        import types as _types
+
+        _origin = _t.get_origin(ann)
+        if _origin is _t.Union or _origin is _types.UnionType:
+            non_none = [a for a in _t.get_args(ann) if a is not type(None)]
+            if len(non_none) == 1:
+                ann = non_none[0]
+        origin = _t.get_origin(ann) or ann
         is_seq = origin in (list, tuple, set, frozenset)
         if not is_seq and isinstance(v, list):
             v = v[-1]
         if is_seq and not isinstance(v, list):
             v = [v] if v is not None else []
         # Read UploadFile bytes when annotation is bytes / list[bytes]
-        elem = _t.get_args(fi.annotation)[0] if (
-            is_seq and _t.get_args(fi.annotation)) else fi.annotation
+        elem = _t.get_args(ann)[0] if (
+            is_seq and _t.get_args(ann)) else ann
         if elem is bytes:
             if isinstance(v, list):
                 v = [(x.file.seek(0) or x.file.read())
