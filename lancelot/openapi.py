@@ -82,6 +82,12 @@ def _form_fields(route):
             if getattr(fi.marker, "in_", None) == "form"]
 
 
+def _file_fields(route):
+    """Return the in-plan File() params (multipart body)."""
+    return [fi for fi in route.plan.fields
+            if getattr(fi.marker, "in_", None) == "file"]
+
+
 def _embed_body_schema_name(route):
     return f"Body_{operation_id(route)}"
 
@@ -105,10 +111,14 @@ def request_body_for(route):
         return {"content": {"application/json": {"schema": {
             "$ref": f"#/components/schemas/{_embed_body_schema_name(route)}"
         }}}, "required": True}
-    # Scalar Form() params → synthetic schema, urlencoded content-type.
+    # File() params → multipart/form-data; scalar Form() → urlencoded.
+    # FastAPI rule: presence of ANY File forces multipart for the whole body.
+    files = _file_fields(route)
     form = _form_fields(route)
-    if form:
-        return {"content": {"application/x-www-form-urlencoded": {"schema": {
+    if files or form:
+        media_type = ("multipart/form-data" if files
+                      else "application/x-www-form-urlencoded")
+        return {"content": {media_type: {"schema": {
             "$ref": f"#/components/schemas/{_embed_body_schema_name(route)}"
         }}}, "required": True}
     return None
@@ -194,9 +204,9 @@ def components_schemas(app) -> dict:
     for r in app.routes:
         if not getattr(r, "include_in_schema", True):
             continue
-        # Either Body(embed=True) scalars OR scalar Form() params synthesize
-        # a Body_<operation_id> schema (FastAPI parity).
-        fields = _embed_body_fields(r) or _form_fields(r)
+        # Body(embed=True) scalars, scalar Form() params, or File() params
+        # all synthesize a Body_<operation_id> schema (FastAPI parity).
+        fields = (_embed_body_fields(r) or _file_fields(r) + _form_fields(r))
         if not fields:
             continue
         props = {}
