@@ -178,10 +178,19 @@ class App:
 
     def tool_schemas(self) -> list[dict]:
         """Return the list of registered tools' {name, description,
-        input_schema} dicts — exactly the shape Anthropic/MCP expect."""
-        return [{"name": s.name, "description": s.description,
+        input_schema [, output_schema]} dicts — exactly the shape
+        Anthropic / OpenAI / Google / MCP expect. `output_schema` is
+        included ONLY when the tool function has a meaningful return-type
+        annotation (Tier-C.C3) — its absence is meaningful too (means
+        "the model doesn't need to know the response shape")."""
+        out = []
+        for s in self._tools.values():
+            d = {"name": s.name, "description": s.description,
                  "input_schema": s.input_schema}
-                for s in self._tools.values()]
+            if s.output_schema is not None:
+                d["output_schema"] = s.output_schema
+            out.append(d)
+        return out
 
     def mcp(self, path: str = "/mcp", *, allowed_origins=None):
         """M2-P5b: mount a Streamable-HTTP MCP server at `path` that

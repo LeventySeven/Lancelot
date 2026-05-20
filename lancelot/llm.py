@@ -71,13 +71,22 @@ class TransportPool:
         except Exception:  # noqa: BLE001 - telemetry never breaks a request
             pass
 
-    async def request(self, method: str, url: str, **kw):
-        """Single outbound HTTP call with idempotent retry."""
+    async def request(self, method: str, url: str, *,
+                      request=None, **kw):
+        """Single outbound HTTP call with idempotent retry.
+
+        Tier-C.C2: optional `request=` kwarg binds the call to a Lancelot
+        Request. When the client disconnects mid-call (request.cancelled
+        flips), the in-flight upstream HTTP call is awaited concurrently
+        with the cancel-event and cancelled the moment the event fires —
+        so the user stops paying for LLM tokens the client is no longer
+        watching."""
         method = method.upper()
         idempotent = method in _IDEMPOTENT
         attempt = 0
         while True:
-            resp = await self._client.request(method, url, **kw)
+            resp = await self._await_cancellable(
+                self._client.request(method, url, **kw), request)
             # POST/PATCH/CONNECT etc. are NEVER retried — the cardinal
             # rule. Return as-is so the caller (handler) decides.
             if not idempotent:
@@ -97,6 +106,38 @@ class TransportPool:
                            + random.random() * self.backoff_base)
             await asyncio.sleep(wait)
             attempt += 1
+
+    async def _await_cancellable(self, coro, request):
+        """Helper: await `coro`, but if `request` carries a cancel event
+        that fires first, cancel the coro and raise asyncio.CancelledError.
+        When `request` is None (or has no _cancel_event), this is a
+        zero-overhead pass-through that just awaits the coro."""
+        ev = getattr(request, "_cancel_event", None) if request else None
+        if ev is None:
+            return await coro
+        task = asyncio.ensure_future(coro)
+        wait_event = asyncio.ensure_future(ev.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {task, wait_event}, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                # Upstream finished first — clean up the wait task and
+                # return the result (or raise the upstream exception).
+                wait_event.cancel()
+                return task.result()
+            # Cancel event fired first — kill the upstream call and
+            # propagate cancellation so the handler stops.
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            raise asyncio.CancelledError("client disconnected; upstream cancelled")
+        finally:
+            if not task.done():
+                task.cancel()
+            if not wait_event.done():
+                wait_event.cancel()
 
     async def stream(self, method: str, url: str, **kw):
         """Streaming outbound — POST/PATCH never retried; idempotent

@@ -38,4 +38,15 @@ def __getattr__(name):
         import importlib
 
         return importlib.import_module("lancelot.llm")
+    if name == "canonical":
+        # Tier-C.C1: KV-cache-friendly JSON helper. Stdlib-only, cheap to
+        # import unconditionally — left lazy for surface symmetry.
+        import importlib
+
+        return importlib.import_module("lancelot.canonical")
+    if name == "context":
+        # Tier-B.B3 surface: request_id ContextVar.
+        import importlib
+
+        return importlib.import_module("lancelot.context")
     raise AttributeError(f"module 'lancelot' has no attribute {name!r}")

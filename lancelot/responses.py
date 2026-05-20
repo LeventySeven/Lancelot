@@ -55,6 +55,18 @@ class Response:
         self.set_cookie(key, value="", max_age=0, expires=0, path=path,
                         domain=domain)
 
+    def set_session_affinity(self, key: str) -> None:
+        """Tier-C.C1: hint the load-balancer to route the NEXT request from
+        this client to the same backend instance. Emitted as
+        `X-Session-Affinity: <key>` so the LB (or a sticky-session reverse
+        proxy) can hash on it. Lancelot itself does NOT enforce affinity —
+        that's the LB's job; we just expose the hint. Useful for keeping
+        an LLM conversation on the same GPU so the KV prefix cache hits."""
+        # A3 (Lancelot existing CR-safety pattern): strip CR/LF so a
+        # user-provided key can't smuggle a header injection.
+        clean = str(key).replace("\r", "").replace("\n", "")
+        self.headers["x-session-affinity"] = clean
+
 
 class HTMLResponse(Response):
     media_type = "text/html; charset=utf-8"

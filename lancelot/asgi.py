@@ -128,12 +128,19 @@ async def _http(app, scope, receive, send):
     for _hk, _hv in scope.get("headers", []):
         if _hk in (b"x-request-id", b"x-correlation-id"):
             try:
-                _rid = _hv.decode("ascii", "ignore")
-                _rid_from_client = True
+                _rid_raw = _hv.decode("ascii", "ignore")
             except Exception:  # noqa: BLE001
-                _rid = None
+                _rid_raw = ""
+            # SECURITY: A malicious client could send `X-Request-ID:
+            # foo\r\nX-Evil: y` to smuggle a response header (we echo
+            # this value back). Strip CR/LF and bound the length so a
+            # tiny client can't cost us a huge response header.
+            _rid = (_rid_raw.replace("\r", "").replace("\n", "")
+                    .replace("\x00", ""))[:128]
             if _rid:
+                _rid_from_client = True
                 break
+            _rid = None
     if not _rid:
         _rid = new_request_id()
     _rid_token = _rid_var.set(_rid)

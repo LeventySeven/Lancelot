@@ -161,6 +161,24 @@ def test_b3_incoming_x_request_id_propagates_and_echoes():
     assert seen[1] != "abc-12345" and len(seen[1]) == 32
 
 
+def test_b3_request_id_strips_crlf_to_block_header_injection():
+    """SECURITY: an incoming X-Request-ID with embedded CR/LF/NUL MUST be
+    sanitized before we echo it back, else a malicious client could
+    smuggle response headers."""
+    app = lancelot.App()
+
+    @app.get("/x")
+    def x():
+        return {"ok": True}
+
+    with TestClient(app) as c:
+        r = c.get("/x", headers={"X-Request-ID": "good\r\nX-Evil: yes"})
+    rid = r.headers.get("x-request-id", "")
+    assert "\r" not in rid and "\n" not in rid
+    # `X-Evil` MUST NOT have made it into the response headers.
+    assert "x-evil" not in {k.lower() for k in r.headers}
+
+
 def test_b3_request_id_is_isolated_per_concurrent_request():
     """Two requests served concurrently MUST see different request_ids
     (ContextVars + asyncio.Task contexts give us this for free; this test

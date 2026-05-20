@@ -29,12 +29,21 @@ class ToolSpec:
     read_only: bool = False
     scopes: list = field(default_factory=list)
     input_schema: dict = field(default_factory=dict)
+    # Tier-C.C3: output_schema auto-derived from the return-type annotation,
+    # if present. Anthropic/OpenAI/Google all accept (and use) an optional
+    # output schema; emitting one lets the model better-shape its calls.
+    # When the function has no return annotation OR returns None, this
+    # stays None (we do NOT make one up).
+    output_schema: dict | None = None
     _validator: object = None  # Pydantic core_schema for arg validation
 
 
-def _build_tool_schema(func, name: str, description: str) -> tuple[dict, object]:
+def _build_tool_schema(func, name: str, description: str) -> tuple[dict, object, dict | None]:
     """Build the {type:'object', properties, required} input schema +
-    a Pydantic TypeAdapter that validates kwargs against the signature.
+    a Pydantic TypeAdapter that validates kwargs against the signature
+    + (Tier-C.C3) an output_schema derived from the return-type
+    annotation if one is present.
+
     Reuses the SAME machinery FastAPI/Lancelot use for HTTP request
     validation — single source of truth, no second compiler."""
     from pydantic import TypeAdapter
@@ -62,7 +71,20 @@ def _build_tool_schema(func, name: str, description: str) -> tuple[dict, object]
 
     pyd_fields = {n: (a, d) for n, (a, d) in field_models.items()}
     Model = create_model(f"_Tool_{name}_Args", **pyd_fields)
-    return schema, Model
+
+    # Tier-C.C3: derive output_schema from the return-type hint, if any.
+    # Skipped (None) for: no annotation, `-> None` (no payload to schema),
+    # or any annotation TypeAdapter refuses (e.g. bare `typing.Any`).
+    output_schema: dict | None = None
+    ret_ann = hints.get("return", _inspect.Signature.empty)
+    if ret_ann is not _inspect.Signature.empty and ret_ann is not None \
+            and ret_ann is not type(None):
+        try:
+            output_schema = TypeAdapter(ret_ann).json_schema()
+        except Exception:  # noqa: BLE001 — keep the tool usable even if
+            # the return type is unschemable (e.g. some abstract Protocol)
+            output_schema = None
+    return schema, Model, output_schema
 
 
 def make_tool_spec(func, *, name: str | None = None,
@@ -72,7 +94,9 @@ def make_tool_spec(func, *, name: str | None = None,
     name = name or func.__name__
     description = description or (func.__doc__ or "").strip().splitlines()[0] \
         if func.__doc__ else (description or "")
-    schema, validator = _build_tool_schema(func, name, description)
+    schema, validator, output_schema = _build_tool_schema(
+        func, name, description)
     return ToolSpec(name=name, description=description, func=func,
                     read_only=read_only, scopes=scopes or [],
-                    input_schema=schema, _validator=validator)
+                    input_schema=schema, output_schema=output_schema,
+                    _validator=validator)
