@@ -17,7 +17,7 @@ use crate::router::Router;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request as HReq, Response as HResp, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
@@ -89,9 +89,17 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
                                 Ok::<_, std::convert::Infallible>(handle(app, r).await)
                             }
                         });
-                        let _ = AutoBuilder::new(TokioExecutor::new())
-                            .serve_connection(io, svc)
-                            .await;
+                        // R6: slow-loris hardening — cap how long a client
+                        // can dribble request headers before the connection
+                        // is dropped (Granian/nginx-class default; closes
+                        // design/01:400-402, SYNTHESIS.md:102 — Blazeio
+                        // had no header deadline, Robyn's actix had it set
+                        // to 0 disabling the gate).
+                        let mut builder = AutoBuilder::new(TokioExecutor::new());
+                        builder.http1().timer(TokioTimer::new())
+                            .header_read_timeout(
+                                std::time::Duration::from_secs(15));
+                        let _ = builder.serve_connection(io, svc).await;
                     });
                 }
             }
