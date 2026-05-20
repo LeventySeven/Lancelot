@@ -121,8 +121,12 @@ def request_body_for(route):
                                 f"#/components/schemas/{_model_name(model)}"}}
         else:
             schema = {"$ref": f"#/components/schemas/{_model_name(model)}"}
-        return {"content": {"application/json": {"schema": schema}},
-                "required": True}
+        # Form-MODEL (Annotated[Model, Form()]) → urlencoded content-type;
+        # JSON-MODEL (bare BaseModel) → application/json.
+        media_type = ("application/x-www-form-urlencoded"
+                      if getattr(route, "body_kind", "json") == "form"
+                      else "application/json")
+        return {"content": {media_type: {"schema": schema}}, "required": True}
     # FastAPI Body(embed=True) → synthetic Body_<operation_id> schema in
     # components; requestBody $refs it.
     embedded = _embed_body_fields(route)
