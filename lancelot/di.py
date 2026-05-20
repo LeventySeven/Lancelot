@@ -236,18 +236,28 @@ def _raw_for(fi, request):
                 v = v.file.read()
         return v, key in form
     if src == "form":
-        # application/x-www-form-urlencoded only (stdlib — no runtime dep).
-        # multipart/form-data + UploadFile is ledgered (needs
-        # python-multipart). Parsed once per request, cached.
+        # application/x-www-form-urlencoded via stdlib OR multipart/form-
+        # data via python-multipart (mixed File + Form routes need the
+        # multipart parse for Form fields too — file_and_form_order_9116).
+        ct = ""
+        for hk, hv in request.headers.items():
+            if hk.lower() == "content-type":
+                ct = hv
+                break
+        if "multipart/form-data" in ct:
+            # Re-use the multipart cache (text parts become str values).
+            mp = getattr(request, "_multipart_cache", None)
+            if mp is None:
+                from lancelot.uploads import parse_multipart
+
+                mp = parse_multipart(request.body, ct)
+                request._multipart_cache = mp
+            v = mp.get(key)
+            return v, key in mp
         form = getattr(request, "_form_cache", None)
         if form is None:
             import urllib.parse
 
-            ct = ""
-            for hk, hv in request.headers.items():
-                if hk.lower() == "content-type":
-                    ct = hv
-                    break
             if "application/x-www-form-urlencoded" in ct:
                 # Keep multi-value form; per-field below decides scalar/list
                 # based on the FieldInfo annotation (FastAPI parity).
