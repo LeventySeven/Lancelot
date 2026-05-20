@@ -41,6 +41,7 @@ async def _lifespan(app, receive, send):
             if msg["type"] == "lifespan.startup":
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
+                # Same rationale as above: do not auto-flip on lifespan.
                 await send({"type": "lifespan.shutdown.complete"})
                 return
     cm = app._lifespan(app)
@@ -54,6 +55,13 @@ async def _lifespan(app, receive, send):
                 return
             await send({"type": "lifespan.startup.complete"})
         elif msg["type"] == "lifespan.shutdown":
+            # NOTE: we do NOT auto-flip `_shutting_down` here. A TestClient
+            # context-exit also fires lifespan.shutdown, and if we flipped,
+            # subsequent tests reusing the same module-level `app` would
+            # see /readyz 503 + drain-refusals. The flag is a *graceful
+            # shutdown* signal — users opt-in via `app.initiate_shutdown()`
+            # or `app.install_signal_handlers()`. The lifespan hook just
+            # invokes user shutdown code.
             try:
                 await cm.__aexit__(None, None, None)
             except BaseException as e:  # noqa: BLE001
@@ -82,6 +90,103 @@ async def _http(app, scope, receive, send):
     method = scope["method"]
     path = scope["path"]
 
+    # Tier-B.B1: refuse NEW requests while draining. /readyz and /livez
+    # are still served (k8s needs them during shutdown). Sending 503 +
+    # Retry-After tells the LB to back off (RFC 9110 §15.6.4).
+    if app._shutting_down and path not in ("/livez", "/readyz"):
+        await send({"type": "http.response.start", "status": 503,
+                    "headers": [(b"retry-after", b"1"),
+                                (b"content-length", b"23"),
+                                (b"content-type", b"application/json")]})
+        await send({"type": "http.response.body",
+                    "body": b'{"detail":"draining"}'})
+        return
+    # Tier-B.B4: global concurrent-request cap → 503 + Retry-After before
+    # we acquire the slot (no half-counted state). None = unlimited (FastAPI
+    # default). Health probes bypass so an LB can still poll under load.
+    if app._max_concurrent_requests is not None \
+            and app._active_requests >= app._max_concurrent_requests \
+            and path not in ("/livez", "/readyz"):
+        await send({"type": "http.response.start", "status": 503,
+                    "headers": [(b"retry-after", b"1"),
+                                (b"content-length", b"28"),
+                                (b"content-type", b"application/json")]})
+        await send({"type": "http.response.body",
+                    "body": b'{"detail":"server overloaded"}'[:28]})
+        return
+
+    # Tier-B.B3: request-id ContextVar. The ID is taken from the incoming
+    # `X-Request-ID` / `X-Correlation-ID` if present; otherwise a fresh
+    # UUID4 is minted INTERNALLY (visible to user code via
+    # `lancelot.context.request_id.get()`) but NOT echoed back in the
+    # response — that would break FastAPI byte-parity. We only echo when
+    # the client supplied a correlation id (the standard trace handoff).
+    from lancelot.context import request_id as _rid_var, new_request_id
+
+    _rid = None
+    _rid_from_client = False
+    for _hk, _hv in scope.get("headers", []):
+        if _hk in (b"x-request-id", b"x-correlation-id"):
+            try:
+                _rid = _hv.decode("ascii", "ignore")
+                _rid_from_client = True
+            except Exception:  # noqa: BLE001
+                _rid = None
+            if _rid:
+                break
+    if not _rid:
+        _rid = new_request_id()
+    _rid_token = _rid_var.set(_rid)
+
+    # Tier-B.B1 + B4 + B2: in-flight counter is incremented exactly once
+    # here and decremented in `finally` no matter what path the response
+    # takes (200 / 5xx / cancellation). Also start the duration clock.
+    import time as _time
+
+    app._active_requests += 1
+    _t0 = _time.perf_counter()
+    _final_status_holder = [500]  # mutable so we can set it from below
+
+    async def send_with_rid(msg):
+        # Echo `x-request-id` ONLY when the client sent one (so we keep
+        # FastAPI byte-parity for the common no-correlation case).
+        # Also remember the final status for the RED-metric histogram.
+        if msg.get("type") == "http.response.start":
+            _final_status_holder[0] = msg.get("status", 500)
+            if _rid_from_client:
+                hdrs = list(msg.get("headers", []))
+                if not any(k == b"x-request-id" for k, _ in hdrs):
+                    hdrs.append((b"x-request-id",
+                                 _rid.encode("ascii", "ignore")))
+                    msg = {**msg, "headers": hdrs}
+        await send(msg)
+
+    try:
+        await _http_dispatch(app, scope, receive, send_with_rid)
+    finally:
+        app._active_requests -= 1
+        # Best-effort: never let telemetry/contextvar bookkeeping kill a
+        # request. The try blocks here are tight — only the exact call
+        # that could raise sits inside each.
+        try:
+            from lancelot.metrics import record_request
+
+            record_request(path, method, _final_status_holder[0],
+                           _time.perf_counter() - _t0)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _rid_var.reset(_rid_token)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _http_dispatch(app, scope, receive, send):
+    """The original `_http` body, factored out so the wrapper above can
+    own the per-request lifecycle (counter, request-id, RED metrics)
+    without indenting 470 lines of existing code."""
+    method = scope["method"]
+    path = scope["path"]
     # Expose app as scope['app'] (harness-design §1.3). NOTE: honoring the
     # incoming scope['state'] (request.state seeding) is DEFERRED to M1-P2,
     # when Request/DI land — there is no code reading scope['state'] yet.
@@ -321,13 +426,45 @@ async def _http(app, scope, receive, send):
             # returns the async-gen directly; calling it (no await) gives
             # the iterator to stream.
             import inspect as _isp_local
+            # Tier-B.B5: per-route timeout. asyncio.wait_for cancels the
+            # awaitable on timeout, which (via the surrounding
+            # solve_async async-with) feeds CancelledError into every
+            # active yield-dep's __exit__ — so DB rollback / file-close
+            # / etc. STILL runs (B4 semantics preserved). Streaming /
+            # async-gen handlers are not wrapped (their per-chunk
+            # cancellation already happens via request.cancelled).
+            import asyncio as _asyncio_timeout
+            _to = route.timeout
+
             if _isp_local.isasyncgenfunction(route.handler) or \
                     _isp_local.isgeneratorfunction(route.handler):
                 result = route.handler(**kwargs)
             elif route.plan.is_async:
-                result = await route.handler(**kwargs)
+                if _to is not None:
+                    try:
+                        result = await _asyncio_timeout.wait_for(
+                            route.handler(**kwargs), timeout=_to)
+                    except _asyncio_timeout.TimeoutError:
+                        await _send_json(send, 504,
+                                         b'{"detail":"Request timeout"}')
+                        sent = True
+                        return
+                else:
+                    result = await route.handler(**kwargs)
             else:
-                result = await get_pool().offload(route.handler, **kwargs)
+                if _to is not None:
+                    try:
+                        result = await _asyncio_timeout.wait_for(
+                            get_pool().offload(route.handler, **kwargs),
+                            timeout=_to)
+                    except _asyncio_timeout.TimeoutError:
+                        await _send_json(send, 504,
+                                         b'{"detail":"Request timeout"}')
+                        sent = True
+                        return
+                else:
+                    result = await get_pool().offload(
+                        route.handler, **kwargs)
             from lancelot.responses import Response
 
             # FastAPI: a handler returning a raw async-iter / generator

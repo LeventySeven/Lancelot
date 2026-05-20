@@ -38,9 +38,17 @@ class BlockingPool:
                 raise PoolFull()
             self._inflight += 1
         loop = asyncio.get_running_loop()
+        # Tier-B.B3: copy the current asyncio context (ContextVars set by
+        # the ASGI seam — request_id etc.) into the worker thread so sync
+        # handlers and yield-deps see the same per-request context. By
+        # default `run_in_executor` runs `fn` in an EMPTY context; we use
+        # `contextvars.copy_context().run(...)` to propagate.
+        import contextvars as _cv
+
+        ctx = _cv.copy_context()
         try:
             return await loop.run_in_executor(
-                self._ex, lambda: fn(*args, **kwargs))
+                self._ex, lambda: ctx.run(fn, *args, **kwargs))
         finally:
             with self._lock:
                 self._inflight -= 1
@@ -55,8 +63,11 @@ class BlockingPool:
         from FastAPI (review blocker #1). A task that raises on its own
         still propagates — that IS FastAPI's behavior."""
         loop = asyncio.get_running_loop()
+        import contextvars as _cv
+
+        ctx = _cv.copy_context()
         return await loop.run_in_executor(
-            self._ex, lambda: fn(*args, **kwargs))
+            self._ex, lambda: ctx.run(fn, *args, **kwargs))
 
     def shutdown(self):
         self._ex.shutdown(wait=False, cancel_futures=True)

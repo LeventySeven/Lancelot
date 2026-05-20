@@ -37,6 +37,7 @@ class Route:
     is_stream: bool = False  # @app.stream: yields lancelot.stream.Event
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
     sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
+    timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
     status_code: int | None = None  # FastAPI default response status
     # FastAPI route-decorator kwargs accepted-and-stored; behavior ledgered:
     response_model: Any = None

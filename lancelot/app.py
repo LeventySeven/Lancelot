@@ -24,7 +24,10 @@ class State:
 
 class App:
     def __init__(self, lifespan=None, title="Lancelot", version="0.1.0",
-                 *, redirect_slashes: bool = True, **kwargs):
+                 *, redirect_slashes: bool = True,
+                 max_concurrent_requests: int | None = None,
+                 drain_timeout: float = 30.0,
+                 **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
         FastAPI kwargs (docs_url, default_response_class, dependencies,
@@ -46,11 +49,19 @@ class App:
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
-        # Graceful-shutdown flag — flipped by lifespan_shutdown or a
-        # SIGTERM handler the user wires. /readyz returns 503 + Retry-After
-        # while True so the LB stops sending new traffic. (Tier-A.4 + B1
-        # foundation; full SIGTERM wiring lands with B1.)
+        # Graceful-shutdown flag — flipped by lifespan_shutdown,
+        # `app.initiate_shutdown()`, or `app.install_signal_handlers()`.
+        # /readyz returns 503 + Retry-After while True so the LB stops
+        # sending new traffic; the ASGI seam refuses NEW requests with
+        # 503 but lets in-flight ones complete.
         self._shutting_down: bool = False
+        # Tier-B.B1 + B4: in-flight request counter + global cap. asyncio
+        # is cooperative single-threaded so int += 1 is safe here without
+        # a lock. `max_concurrent_requests=None` means unlimited (FastAPI
+        # default behavior).
+        self._active_requests: int = 0
+        self._max_concurrent_requests: int | None = max_concurrent_requests
+        self._drain_timeout: float = drain_timeout
         # FastAPI parity: `FastAPI(default_response_class=ORJSONResponse)`
         # picks the response class for any route that didn't override.
         self._default_response_class = kwargs.pop(
@@ -343,6 +354,52 @@ class App:
 
             return re.sub(r"\{([^}:]+)(?::[^}]+)?\}", _sub, r.path)
         raise NoMatchFound(name)
+
+    # --- Tier-B.B1: graceful shutdown surface ----------------------------
+    def initiate_shutdown(self) -> None:
+        """Flip the drain flag. /readyz immediately returns 503 +
+        Retry-After; new requests are refused with 503; in-flight
+        requests run to completion. Call from a SIGTERM handler, a
+        lifespan shutdown, or a /shutdown route."""
+        self._shutting_down = True
+
+    async def drain(self, timeout: float | None = None) -> bool:
+        """Wait until all in-flight requests have completed (or `timeout`
+        seconds, whichever is first). Returns True if the drain succeeded
+        in time. Caller is responsible for `initiate_shutdown()` first."""
+        import asyncio
+
+        deadline = (timeout if timeout is not None else self._drain_timeout)
+        end = asyncio.get_event_loop().time() + max(deadline, 0.0)
+        while self._active_requests > 0:
+            remaining = end - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.05, remaining))
+        return True
+
+    def install_signal_handlers(self) -> bool:
+        """Best-effort SIGTERM / SIGINT wiring on the running event loop.
+        Returns True if handlers were installed. NO-OP (and returns False)
+        if we're not on the main thread or on Windows where loop signal
+        handling is limited — the user can still call initiate_shutdown()
+        from their own handler in those cases."""
+        import asyncio
+        import signal
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return False
+        try:
+            loop.add_signal_handler(signal.SIGTERM, self.initiate_shutdown)
+            loop.add_signal_handler(signal.SIGINT, self.initiate_shutdown)
+            return True
+        except (NotImplementedError, RuntimeError, ValueError):
+            # NotImplementedError: loop on a non-main thread on POSIX,
+            # or Windows ProactorEventLoop. RuntimeError: loop closed.
+            # ValueError: signal.signal() rejecting a non-main thread.
+            return False
 
     def asgi(self):
         if self._asgi is None:
