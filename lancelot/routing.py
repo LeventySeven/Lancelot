@@ -6,12 +6,16 @@ from typing import Any, Callable
 
 
 def _is_body_annotation(ann) -> bool:
-    """FastAPI body rule (deep/01 §3.1): a pydantic model, a dataclass, or a
-    container (list/set/tuple/dict) whose element is a model → request body
-    (not a scalar query param). Plain scalars/scalar-containers stay query."""
+    """FastAPI body rule (deep/01 §3.1): a pydantic model, a dataclass, a
+    bare `dict` annotation, or a container (list/set/tuple/dict) whose
+    element is a model → request body (not a scalar query param). Plain
+    scalars/scalar-containers stay query."""
     if isinstance(ann, type) and hasattr(ann, "model_validate_json"):
         return True
     if dataclasses.is_dataclass(ann):
+        return True
+    # Bare `dict` (any JSON object body — FastAPI accepts JSON for this).
+    if ann is dict:
         return True
     origin = typing.get_origin(ann)
     if origin in (list, set, frozenset, tuple, dict):
