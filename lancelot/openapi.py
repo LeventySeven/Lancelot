@@ -76,6 +76,12 @@ def _embed_body_fields(route):
             and getattr(fi.marker, "embed", False)]
 
 
+def _form_fields(route):
+    """Return the in-plan scalar Form() params (urlencoded body)."""
+    return [fi for fi in route.plan.fields
+            if getattr(fi.marker, "in_", None) == "form"]
+
+
 def _embed_body_schema_name(route):
     return f"Body_{operation_id(route)}"
 
@@ -97,6 +103,12 @@ def request_body_for(route):
     embedded = _embed_body_fields(route)
     if embedded:
         return {"content": {"application/json": {"schema": {
+            "$ref": f"#/components/schemas/{_embed_body_schema_name(route)}"
+        }}}, "required": True}
+    # Scalar Form() params → synthetic schema, urlencoded content-type.
+    form = _form_fields(route)
+    if form:
+        return {"content": {"application/x-www-form-urlencoded": {"schema": {
             "$ref": f"#/components/schemas/{_embed_body_schema_name(route)}"
         }}}, "required": True}
     return None
@@ -182,12 +194,14 @@ def components_schemas(app) -> dict:
     for r in app.routes:
         if not getattr(r, "include_in_schema", True):
             continue
-        embedded = _embed_body_fields(r)
-        if not embedded:
+        # Either Body(embed=True) scalars OR scalar Form() params synthesize
+        # a Body_<operation_id> schema (FastAPI parity).
+        fields = _embed_body_fields(r) or _form_fields(r)
+        if not fields:
             continue
         props = {}
         required = []
-        for fi in embedded:
+        for fi in fields:
             key = fi.alias or fi.name
             props[key] = _field_schema(fi)
             if fi.required:
