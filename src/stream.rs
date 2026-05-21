@@ -178,9 +178,11 @@ impl ChunkSink {
     /// otherwise; the permit is dropped (capacity signal only — the retrying
     /// `try_push` does the real send). RESULT: True = capacity available, retry;
     /// **False = channel closed (client disconnected) → the drain coro must
-    /// STOP** (this is the cancellation path — without it an infinite generator
-    /// would keep being driven after the client is gone). GIL is NOT held across
-    /// the await — it's a Rust future on the runtime.
+    /// STOP** (the cancellation path: without it the generator would keep being
+    /// driven after the client is gone). Disconnect is observed at the next
+    /// `try_push`, so an in-flight generator runs for AT MOST one more chunk,
+    /// then the coro returns and the gen is left suspended. GIL is NOT held
+    /// across the await — it's a Rust future on the runtime.
     fn await_capacity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         pyo3_async_runtimes::tokio::future_into_py_with_locals(

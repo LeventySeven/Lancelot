@@ -241,6 +241,52 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
 
     // Drives the asyncio loop + tokio hyper server together until SIGTERM.
     let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), server);
+    // Graceful asyncio teardown before close (audit HIGH-2): cancel lingering
+    // tasks — chiefly in-flight stream `_drain` coros, which `into_future`
+    // bridging does NOT cancel — and finalize async generators, so user
+    // `finally`/`aclose` blocks RUN (resource release) instead of a noisy
+    // "Task was destroyed but it is pending!" on close. Best-effort + bounded.
+    graceful_loop_teardown(py, &event_loop);
     event_loop.call_method0("close").ok();
     run
+}
+
+/// Cancel pending tasks + run their cancellation (and async-gen `aclose`) to
+/// completion, bounded so a slow user `finally` can't wedge shutdown. All
+/// best-effort: any error here just means we proceed to `close()` (we're
+/// already shutting down). Mirrors CPython's `asyncio.run()` finalizer.
+fn graceful_loop_teardown(py: Python<'_>, event_loop: &Bound<'_, PyAny>) {
+    let Ok(asyncio) = py.import("asyncio") else {
+        return;
+    };
+    // tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if let Ok(tasks) = asyncio.call_method1("all_tasks", (event_loop,)) {
+        let pending: Vec<Bound<'_, PyAny>> = tasks
+            .try_iter()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|t| !matches!(t.call_method0("done").and_then(|d| d.is_truthy()), Ok(true)))
+            .collect();
+        for t in &pending {
+            let _ = t.call_method0("cancel");
+        }
+        if !pending.is_empty() {
+            // loop.run_until_complete(
+            //     asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), 2.0))
+            let _ = (|| -> PyResult<()> {
+                let args = pyo3::types::PyTuple::new(py, &pending)?;
+                let kwargs = pyo3::types::PyDict::new(py);
+                kwargs.set_item("return_exceptions", true)?;
+                let gather = asyncio.call_method("gather", args, Some(&kwargs))?;
+                let bounded = asyncio.call_method1("wait_for", (gather, 2.0_f64))?;
+                event_loop.call_method1("run_until_complete", (bounded,))?;
+                Ok(())
+            })();
+        }
+    }
+    // loop.run_until_complete(loop.shutdown_asyncgens())
+    if let Ok(coro) = event_loop.call_method0("shutdown_asyncgens") {
+        let _ = event_loop.call_method1("run_until_complete", (coro,));
+    }
 }
