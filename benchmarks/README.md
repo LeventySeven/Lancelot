@@ -91,43 +91,41 @@ defensible serialization win, and it IS Lancelot's positioning.
 
 ### Streaming — /stream, N small chunks (per-core, `./characterize.sh`)
 
-AI token-stream shape (many small chunks). **This refutes the assumption that
-streaming is a Rust win:**
+AI token-stream shape (many small chunks). The R3 pump was **re-architected**
+after this benchmark first exposed it as a 16–26× regression (the original
+design did a cross-thread `call_soon_threadsafe` round-trip per `__anext__`,
+~0.8 ms/chunk). The fix drains the generator in ONE coroutine running on the
+asyncio loop, pushing chunks same-thread into a bounded channel (depth
+`LANCELOT_STREAM_BUFFER`, default 256; backpressure preserved via an
+event-driven `await_capacity` only when the channel fills):
 
-| chunks | rust `_native` req/s | starlette req/s | gap |
+| chunks | rust `_native` req/s | starlette req/s | result |
 |---:|---:|---:|:--|
-| 64 | 937 | 14,968 | starlette ~16× |
-| 256 | 237 | 5,443 | starlette ~23× |
-| 1024 | 62 | 1,537 | starlette ~25× |
+| 64 | 15,220 | 15,068 | parity |
+| 256 | **6,776** | 5,267 | rust ~1.29× |
+| 1024 | **1,788** | 1,498 | rust ~1.19× |
 
-Full-machine (64 chunks): rust 10×1 = **925** vs starlette `--workers 10` =
-**24,378**. Multiprocess does NOT help — each stream's wall-time is fixed by the
-pump's **per-chunk cross-thread asyncio-bridge round-trip (~0.8 ms/chunk)**, so
-concurrency can't hide it.
-
-**Important scope:** this is specific to the Rust **`_native` server's R3 pump**.
-Lancelot's normal streaming path — `@app.stream` under uvicorn — runs the async
-generator natively in the event loop and does **5,572 req/s** (64 chunks), ~6×
-the Rust pump. So *Lancelot streaming is fine; the Rust `_native` pump is not*.
+Before the fix these were 937 / 237 / 62 — a **16–30× recovery**. The buffer
+depth is the knob: 16 → 2.4k, 64 → 4.9k, 256 → 6.9k (knee), beyond 256 plateaus.
+256 recovers full unbounded-channel throughput while keeping memory bounded
+(≤ `depth × chunk_size` per in-flight stream).
 
 ## What this benchmark actually shows
 
 - **One-shot serialization crossover ~1–4 KB.** Small bodies → uvicorn+uvloop
   wins (per-request FFI/bridge overhead dominates). Large bodies → Lancelot's
   Rust serialization wins (Python `json.dumps` dominates), up to ~2.3× at 69 KB.
-- **The M3 "Rust hot-path = more throughput" premise is NOT universally true.**
-  For small JSON it's a regression vs uvicorn+uvloop. The **only** substantiated
-  Rust throughput win is **large (>~4 KB) one-shot serialization**.
-- **Streaming via the Rust `_native` R3 pump is a severe regression (16–26×)** —
-  the per-chunk asyncio bridge is a perf cliff, fatal for high-chunk-count
-  streams (e.g. LLM token streaming). **Stream via `lancelot.App`/uvicorn
-  instead.** The R3 pump needs re-architecture before it can carry that claim.
+- **Streaming is a Rust win after the re-architecture** — parity at 64 chunks,
+  ~1.2–1.3× above Starlette at 256–1024. The earlier "streaming is broken" result
+  was a real pump defect, now fixed (the per-chunk cross-thread bridge is gone).
+- **For small one-shot JSON, uvicorn+uvloop still wins** (per-request FFI/bridge
+  overhead). The Rust server is NOT a universal "faster server"; its throughput
+  wins are **large-payload serialization + streaming**.
 - **Deploy the Rust server multiprocess** (`SO_REUSEPORT`, 1 thread/proc), never
-  1-process-many-threads.
-- The Rust core's other value is **resilience, not req/s**: 16 MiB body cap (413),
-  connection cap, `header_read_timeout` (slow-loris), http1-only hardening,
-  graceful drain — all verified by `tests/test_m3_http_integration.py`,
-  orthogonal to throughput.
+  1-process-many-threads (it anti-scales on threads — GIL).
+- The Rust core's other value is **resilience**: 16 MiB body cap (413), connection
+  cap, `header_read_timeout` (slow-loris), http1-only, graceful drain — all in
+  `tests/test_m3_http_integration.py`, orthogonal to throughput.
 
 ## Caveats — read before quoting any number
 

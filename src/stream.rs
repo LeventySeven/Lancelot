@@ -1,27 +1,34 @@
-//! M3-R3 — the streaming Rust pump.
+//! M3-R3 — the streaming Rust pump (re-architected; see benchmarks/).
 //!
-//! A Python async generator (`async def gen(): yield ...`) is pulled chunk by
-//! chunk and written to a hyper chunked body WITHOUT holding the GIL across any
-//! `.await` and WITHOUT a per-chunk thread spawn (Robyn's documented defect,
-//! deep/04:23 — Robyn spawns a thread + reacquires the GIL per token).
+//! A Python async generator (`async def gen(): yield ...`) is written to a hyper
+//! chunked body WITHOUT holding the GIL across any `.await` and WITHOUT a
+//! per-chunk thread spawn (Robyn's documented defect, deep/04:23).
 //!
-//! Design (m07-concurrency skill — Web-API / message-passing / bounded
-//! backpressure):
-//!  - ONE long-lived tokio task pulls from the async-gen. Per chunk: a
-//!    `with_gil` SYNC scope bridges `gen.__anext__()` to a Send Rust future
-//!    (`into_future_with_locals`), then the GIL is DROPPED across `fut.await`.
-//!  - The chunk bytes are extracted in a second short `with_gil` scope and sent
-//!    over a BOUNDED mpsc channel (capacity 16). A slow client fills the channel
-//!    → `send().await` parks the pull task → backpressure propagates all the way
-//!    to the upstream LLM (no unbounded buffering).
-//!  - StopAsyncIteration ends the stream cleanly (drop the sender → body EOF).
-//!  - If the client disconnects, hyper drops the body → receiver drops →
-//!    `send()` errors → the pull loop breaks → the gen is dropped (cancellation
-//!    propagates; matches `request.cancelled`).
+//! ## Why the original per-`__anext__` design was replaced
+//! The first implementation pulled ONE chunk per `into_future_with_locals(
+//! gen.__anext__())` — i.e. one `call_soon_threadsafe` cross-thread round-trip
+//! to the asyncio loop PER chunk (the pump ran on a tokio worker thread; the
+//! loop runs elsewhere). Measured cost ~0.8 ms/chunk → streaming was a 16-26x
+//! throughput cliff vs Starlette (fatal for LLM token streaming).
 //!
-//! Hazards respected (per the skill): no `Bound<'py>`/`Python` token crosses the
-//! channel or the `.await`; the async-gen `Py<PyAny>` is `Send`+`Sync`; the
-//! channel item type is `Result<Frame<Bytes>, io::Error>` (all `Send`).
+//! ## Current design (m07-concurrency — on-loop drain + bounded backpressure)
+//!  - A small Python coroutine `_drain(gen, sink)` is bridged to a Send Rust
+//!    future ONCE for the whole stream. It runs ON the asyncio loop, so its
+//!    `async for chunk in gen` drives the generator natively (zero per-chunk
+//!    bridging) and each `sink.try_push(chunk)` is a SAME-THREAD synchronous
+//!    `try_send` into a BOUNDED channel (depth `stream_buffer()`, default 256).
+//!  - Backpressure: a full channel → `try_push` returns False → the coro
+//!    `await`s `sink.await_capacity()` (a GIL-free Rust `reserve().await`, one
+//!    cross-thread hop but ONLY when the consumer is slow) → retry. No unbounded
+//!    buffering; the bound propagates to the upstream LLM.
+//!  - End: the `_drain` `finally: sink.close()` drops the sender → body EOF.
+//!    Client disconnect → receiver drops → `try_send` returns Closed (swallowed)
+//!    → the coro finishes → gen dropped (cancellation propagates).
+//!
+//! Hazards respected: no `Bound<'py>`/`Python` token crosses the channel or any
+//! `.await`; the async-gen `Py<PyAny>` is `Send`+`Sync`; the channel item type
+//! is `Result<Frame<Bytes>, io::Error>` (all `Send`). `next_chunk` (the old
+//! per-chunk pull) is retained ONLY for the in-process `_drive_stream` test.
 use bytes::Bytes;
 use http_body_util::StreamBody;
 use hyper::body::Frame;
@@ -30,6 +37,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use pyo3_async_runtimes::TaskLocals;
 use std::io;
+use std::sync::OnceLock;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::Sender;
 
 /// Extract the wire bytes for one yielded chunk. `bytes`/`str` pass through
 /// (str → utf-8); a `lancelot.stream.Event` (or anything with `render()`)
@@ -132,61 +142,165 @@ async fn next_chunk(locals: &TaskLocals, gen: &Py<PyAny>) -> PyResult<Option<Vec
     }
 }
 
-/// The hyper streaming body for a Python async-gen. Spawns ONE pull task that
-/// feeds a bounded channel; the returned StreamBody drains it. Errors mid-stream
-/// terminate the body (the headers/200 are already committed by the caller).
+/// A Rust→Python sink the on-loop drain coroutine pushes each chunk into. The
+/// drain coro runs ON the asyncio-loop thread, so `try_push` is a SAME-THREAD
+/// synchronous channel send — no per-chunk `call_soon_threadsafe` cross-thread
+/// hop (the measured ~0.8 ms/chunk cost of the old per-`__anext__` bridge that
+/// made streaming a 16-26x cliff, see benchmarks/).
 ///
-/// `shutdown`: notified on graceful server shutdown (SIGTERM). The pull loop
-/// selects on it so an in-flight stream stops promptly instead of awaiting a
-/// coroutine on a soon-to-close event loop (audit #2). The whole pull loop is
-/// `catch_unwind`-wrapped so a Rust panic in the pull/extract path terminates
-/// the stream cleanly instead of a silent tokio task abort (audit #3 — parity
-/// with the non-streaming `await_and_serialize` catch_unwind in service.rs).
+/// Backpressure is preserved (bounded channel, depth `stream_buffer()`): on a
+/// full channel `try_push` returns False and the drain coro `await`s `await_capacity()` —
+/// an event-driven, GIL-free wait that costs ONE cross-thread hop but ONLY when
+/// the consumer is slow (rare). The fast path (channel not full) stays fully
+/// synchronous, which is where the throughput win lives.
+#[pyclass]
+struct ChunkSink {
+    tx: Option<Sender<Result<Frame<Bytes>, io::Error>>>,
+    locals: TaskLocals,
+}
+
+#[pymethods]
+impl ChunkSink {
+    /// Fast path: one yielded chunk → wire bytes → bounded `try_send`.
+    /// Returns True if sent, False if the channel is full (caller awaits
+    /// `await_capacity` then retries). A closed channel = client gone → True
+    /// (swallow; the drain ends naturally on the next loop check).
+    fn try_push(&self, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let bytes = chunk_to_bytes(obj.py(), obj)?;
+        match &self.tx {
+            Some(tx) => match tx.try_send(Ok(Frame::data(Bytes::from(bytes)))) {
+                Ok(()) => Ok(true),
+                Err(TrySendError::Full(_)) => Ok(false),
+                Err(TrySendError::Closed(_)) => Ok(true),
+            },
+            None => Ok(true),
+        }
+    }
+
+    /// Event-driven backpressure wait (returns a Python awaitable). Reserves a
+    /// permit on the bounded channel — resolves immediately if there's capacity,
+    /// otherwise parks until the consumer drains an item. Drops the permit (used
+    /// only as a capacity signal; the retrying `try_push` does the real send).
+    /// GIL is NOT held across this await — it's a Rust future on the runtime.
+    fn await_capacity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        pyo3_async_runtimes::tokio::future_into_py_with_locals(
+            py,
+            self.locals.clone(),
+            async move {
+                if let Some(tx) = tx {
+                    let _ = tx.reserve().await;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Handler raised mid-stream: the 200 + headers are already on the wire, so
+    /// emit an error frame (best-effort) and let the body truncate (Starlette
+    /// parity — it logs and closes).
+    fn fail(&self, _msg: &str) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send(Err(io::Error::other("stream handler error")));
+        }
+    }
+
+    /// Stream finished → drop the sender → receiver EOFs → body ends.
+    fn close(&mut self) {
+        self.tx.take();
+    }
+}
+
+/// Bounded stream-channel depth (chunks buffered before backpressure). Bigger =
+/// fewer `await_capacity` waits under fast producers (more throughput), at the
+/// cost of up to `depth × chunk_size` buffered per in-flight stream. Tunable via
+/// `LANCELOT_STREAM_BUFFER` (clamped [1, 4096]); default 256 — tuned so small
+/// (token-stream) chunks rarely block while keeping memory bounded.
+fn stream_buffer() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LANCELOT_STREAM_BUFFER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(256)
+            .min(4096)
+    })
+}
+
+/// The on-loop drain coroutine, compiled once. `async for` runs on the asyncio
+/// loop; each `sink.try_push` is same-thread. The inner `while` restores
+/// backpressure: a full channel → `await sink.await_capacity()` → retry.
+/// `finally: sink.close()` guarantees the body EOFs even on cancellation.
+fn drainer(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    static D: OnceLock<Py<PyAny>> = OnceLock::new();
+    if let Some(f) = D.get() {
+        return Ok(f.clone_ref(py));
+    }
+    let code = cr#"
+async def _drain(gen, sink):
+    try:
+        async for chunk in gen:
+            while not sink.try_push(chunk):
+                await sink.await_capacity()
+    except BaseException as e:
+        try:
+            sink.fail(repr(e))
+        except Exception:
+            pass
+    finally:
+        sink.close()
+"#;
+    let module = PyModule::from_code(py, code, c"_lc_drain.py", c"_lc_drain")?;
+    let f = module.getattr("_drain")?.unbind();
+    let _ = D.set(f.clone_ref(py)); // race-benign: equivalent fn either way
+    Ok(f)
+}
+
+/// The hyper streaming body for a Python async-gen. R3 re-architecture: the
+/// generator is drained by a coroutine running ON the asyncio loop (ONE bridge
+/// crossing for the whole stream via `into_future_with_locals`), pushing chunks
+/// into a BOUNDED channel same-thread — instead of the old design's one
+/// cross-thread `call_soon_threadsafe` round-trip PER `__anext__` (16-26x
+/// throughput cliff, see benchmarks/). Backpressure is preserved by the bounded
+/// channel + the drain coro's `await_capacity` retry (see `ChunkSink`). Errors
+/// mid-stream truncate the body (200 already committed).
+///
+/// `shutdown`: on SIGTERM the drive task stops awaiting the drain future; the
+/// loop closing tears the coro down (its `finally` drops the sink → body EOF).
 pub fn stream_body(
     locals: TaskLocals,
     gen: Py<PyAny>,
     shutdown: std::sync::Arc<tokio::sync::Notify>,
 ) -> StreamBody<tokio_stream::wrappers::ReceiverStream<Result<Frame<Bytes>, io::Error>>> {
     use futures::FutureExt;
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, io::Error>>(16);
-    tokio::spawn(async move {
-        let pump = std::panic::AssertUnwindSafe(async {
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    // Graceful shutdown wins — stop pulling on a loop that is
-                    // about to close.
-                    _ = shutdown.notified() => break,
-                    n = next_chunk(&locals, &gen) => n,
-                };
-                match next {
-                    Ok(Some(bytes)) => {
-                        // Bounded send → backpressure. Err = receiver dropped
-                        // (client gone) → stop pulling, drop the gen.
-                        if tx.send(Ok(Frame::data(Bytes::from(bytes)))).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break, // StopAsyncIteration → clean EOF
-                    Err(_e) => {
-                        // A handler exception mid-stream: the 200 + headers are
-                        // already on the wire, so we can't change the status.
-                        // End the body (truncated stream — same as
-                        // FastAPI/Starlette, which log and close).
-                        let _ = tx.send(Err(io::Error::other("stream handler error"))).await;
-                        break;
-                    }
-                }
-            }
-        });
-        // A panic in the pull/extract path → terminate the stream, not a
-        // silent task death.
-        if pump.catch_unwind().await.is_err() {
-            let _ = tx.send(Err(io::Error::other("stream pump panicked"))).await;
-        }
-        // gen drops here (under the task's scope); a final GIL acquire to
-        // release the Py ref happens in Py's Drop via pyo3's refcount path.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, io::Error>>(stream_buffer());
+    // Scope (GIL, sync): build the sink + drain coroutine and bridge it ONCE.
+    let driven = crate::gil::with_gil(|py| -> PyResult<_> {
+        let sink = Py::new(
+            py,
+            ChunkSink {
+                tx: Some(tx),
+                locals: locals.clone(),
+            },
+        )?;
+        let coro = drainer(py)?.bind(py).call1((gen.bind(py), sink))?;
+        pyo3_async_runtimes::into_future_with_locals(&locals, coro)
     });
+    if let Ok(fut) = driven {
+        tokio::spawn(async move {
+            // Drive the whole-stream drain to completion. A panic inside the
+            // bridge becomes a dropped future (no UB / silent task abort).
+            tokio::select! {
+                biased;
+                _ = shutdown.notified() => {}
+                _ = std::panic::AssertUnwindSafe(fut).catch_unwind() => {}
+            }
+            // On either path the sink (owned by the coro) is eventually dropped
+            // → its sender drops → rx EOFs.
+        });
+    }
+    // (Err path: sink/tx dropped in the closure → rx EOFs → empty stream.)
     StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 

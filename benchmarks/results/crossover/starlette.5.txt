@@ -1,46 +1,46 @@
 Summary:
   Success rate:	100.00%
-  Total:	8003.3309 ms
-  Slowest:	8.9437 ms
-  Fastest:	0.2055 ms
-  Average:	0.7905 ms
-  Requests/sec:	63174.9465
+  Total:	8003.6481 ms
+  Slowest:	8.9664 ms
+  Fastest:	0.2249 ms
+  Average:	0.7935 ms
+  Requests/sec:	62931.0528
 
-  Total data:	92.09 MiB
+  Total data:	91.74 MiB
   Size/request:	191 B
-  Size/sec:	11.51 MiB
+  Size/sec:	11.46 MiB
 
 Response time histogram:
-  0.206 ms [1]      |
-  1.079 ms [504016] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
-  1.953 ms [1500]   |
-  2.827 ms [24]     |
-  3.701 ms [4]      |
-  4.575 ms [3]      |
-  5.448 ms [3]      |
-  6.322 ms [3]      |
-  7.196 ms [3]      |
-  8.070 ms [2]      |
-  8.944 ms [3]      |
+  0.225 ms [1]      |
+  1.099 ms [503239] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  1.973 ms [368]    |
+  2.847 ms [4]      |
+  3.721 ms [3]      |
+  4.596 ms [3]      |
+  5.470 ms [3]      |
+  6.344 ms [3]      |
+  7.218 ms [3]      |
+  8.092 ms [2]      |
+  8.966 ms [3]      |
 
 Response time distribution:
-  10.00% in 0.7667 ms
-  25.00% in 0.7760 ms
-  50.00% in 0.7855 ms
-  75.00% in 0.7972 ms
-  90.00% in 0.8157 ms
-  95.00% in 0.8332 ms
-  99.00% in 0.8975 ms
-  99.90% in 1.3512 ms
-  99.99% in 1.9244 ms
+  10.00% in 0.7695 ms
+  25.00% in 0.7810 ms
+  50.00% in 0.7915 ms
+  75.00% in 0.8057 ms
+  90.00% in 0.8337 ms
+  95.00% in 0.8560 ms
+  99.00% in 0.9152 ms
+  99.90% in 1.0716 ms
+  99.99% in 1.3934 ms
 
 
 Details (average, fastest, slowest):
-  DNS+dialup:	0.4185 ms, 0.2318 ms, 0.5439 ms
-  DNS-lookup:	0.0046 ms, 0.0003 ms, 0.0565 ms
+  DNS+dialup:	0.5132 ms, 0.2268 ms, 0.6208 ms
+  DNS-lookup:	0.0042 ms, 0.0004 ms, 0.0399 ms
 
 Status code distribution:
-  [200] 505562 responses
+  [200] 503632 responses
 
 Error distribution:
-  [48] aborted due to deadline
+  [46] aborted due to deadline

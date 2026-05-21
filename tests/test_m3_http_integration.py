@@ -40,9 +40,21 @@ async def stream_handler(req):
         yield f"chunk{i}\n".encode()
 
 
+async def bulk_stream(req):
+    # Far more chunks than the bounded(256) stream channel → exercises the
+    # backpressure path (drain coro awaits await_capacity as the channel fills).
+    for i in range(5000):
+        yield (f"{i}\n").encode()
+
+
 port = int(sys.argv[1])
 _native.run(
-    [("GET", "/echo", echo), ("POST", "/echo", echo), ("GET", "/stream", stream_handler)],
+    [
+        ("GET", "/echo", echo),
+        ("POST", "/echo", echo),
+        ("GET", "/stream", stream_handler),
+        ("GET", "/bulk", bulk_stream),
+    ],
     host="127.0.0.1",
     port=port,
 )
@@ -118,6 +130,17 @@ def test_r3_streaming_response(server):
         assert r.status_code == 200
         chunks = list(r.iter_bytes())
     assert b"".join(chunks) == b"chunk0\nchunk1\nchunk2\n"
+
+
+def test_r3_streaming_backpressure_order_and_completeness(server):
+    # 5000 chunks through the bounded(256) channel: the re-architected on-loop
+    # drain must deliver EVERY chunk, IN ORDER, complete — exercising the
+    # await_capacity backpressure path (channel fills repeatedly). Guards against
+    # both dropped chunks and the unbounded-buffer spike regressing back in.
+    with httpx.stream("GET", f"{server}/bulk") as r:
+        assert r.status_code == 200
+        body = b"".join(r.iter_bytes())
+    assert body == b"".join(f"{i}\n".encode() for i in range(5000))
 
 
 def test_404_unknown_path(server):
