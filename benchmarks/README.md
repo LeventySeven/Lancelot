@@ -16,14 +16,16 @@ response size, and the naive "Rust is faster" framing is wrong.**
 ## How to reproduce
 
 ```bash
-# deps: oha (cargo install oha) + uvicorn[standard] (uvloop+httptools) in .venv.
-#       NONE are Lancelot runtime deps — all dev/bench-only.
-./benchmarks/run_load.sh                       # both shapes, 10s, c=50, 2 runs
+# deps: oha (cargo install oha) + uvicorn[standard] (uvloop+httptools):
+#       pip install -e '.[bench]'. NONE are Lancelot runtime deps — bench-only.
+./benchmarks/run_load.sh                       # the 4-variant comparison, 2 shapes
+./benchmarks/characterize.sh                   # payload-crossover + streaming sweeps
 DURATION=8s CONNECTIONS=500 ./benchmarks/run_load.sh
 ```
 
-`run_load.sh` measures two fair shapes; raw `oha` dumps land in
-`benchmarks/results/{percore,fullmachine}/<variant>.<run>.txt`.
+`run_load.sh` measures two fair shapes (raw dumps in
+`benchmarks/results/{percore,fullmachine}/`); `characterize.sh` sweeps payload
+size and streaming (raw dumps in `benchmarks/results/{crossover,stream}/`).
 
 ## Fairness controls
 
@@ -72,34 +74,60 @@ The Rust server's *best* config is multiprocess (1 thread each, `SO_REUSEPORT`) 
 the 1-process-many-threads model is strictly worse. Even so, on trivial echo it
 tops out ~42k vs uvicorn's ~146k.
 
-### Large ~69 KB JSON response (c=50, 8s, single process/thread)
+### Crossover sweep — /echo, growing payload (per-core, `./characterize.sh`)
 
-| Variant | req/s | p50 |
-|---|---:|---:|
-| `rust` (pydantic-core `to_json`) | **5,258** | 9.7 ms |
-| `uvicorn-starlette` (`json.dumps`) | 2,339 | 21.0 ms |
+| dict items | response bytes | rust req/s | starlette req/s | winner |
+|---:|---:|---:|---:|:--|
+| 5 | 191 B | 43,715 | 63,175 | starlette |
+| 25 | 1,012 B | 41,031 | 46,748 | starlette |
+| 100 | 4,186 B | 30,733 | 24,431 | **rust** |
+| 350 | 15,426 B | 15,879 | 8,566 | **rust** |
+| 1500 | 68,937 B | 5,328 | 2,318 | **rust** |
 
-**For large responses the Rust path wins ~2.25×** — once serialization cost
-dominates the per-request overhead, Rust-native JSON beats Python `json.dumps`.
-This is the crossover, and it's exactly Lancelot's positioning
-(transport/serialization), *not* a generic "faster server" claim.
+**The serialization crossover is ~1–4 KB.** Below it, uvicorn+uvloop's lower
+per-request overhead wins; above it, Rust-native pydantic-core `to_json` beats
+Python `json.dumps` and the margin grows to ~2.3× at 69 KB. This is the
+defensible serialization win, and it IS Lancelot's positioning.
+
+### Streaming — /stream, N small chunks (per-core, `./characterize.sh`)
+
+AI token-stream shape (many small chunks). **This refutes the assumption that
+streaming is a Rust win:**
+
+| chunks | rust `_native` req/s | starlette req/s | gap |
+|---:|---:|---:|:--|
+| 64 | 937 | 14,968 | starlette ~16× |
+| 256 | 237 | 5,443 | starlette ~23× |
+| 1024 | 62 | 1,537 | starlette ~25× |
+
+Full-machine (64 chunks): rust 10×1 = **925** vs starlette `--workers 10` =
+**24,378**. Multiprocess does NOT help — each stream's wall-time is fixed by the
+pump's **per-chunk cross-thread asyncio-bridge round-trip (~0.8 ms/chunk)**, so
+concurrency can't hide it.
+
+**Important scope:** this is specific to the Rust **`_native` server's R3 pump**.
+Lancelot's normal streaming path — `@app.stream` under uvicorn — runs the async
+generator natively in the event loop and does **5,572 req/s** (64 chunks), ~6×
+the Rust pump. So *Lancelot streaming is fine; the Rust `_native` pump is not*.
 
 ## What this benchmark actually shows
 
-- **There is a crossover by response size.** Small bodies → uvicorn+uvloop wins
-  (FFI/bridge overhead dominates). Large bodies → Lancelot's Rust serialization
-  wins (Python `json.dumps` dominates). The break-even is workload-specific and
-  not characterized precisely here.
+- **One-shot serialization crossover ~1–4 KB.** Small bodies → uvicorn+uvloop
+  wins (per-request FFI/bridge overhead dominates). Large bodies → Lancelot's
+  Rust serialization wins (Python `json.dumps` dominates), up to ~2.3× at 69 KB.
 - **The M3 "Rust hot-path = more throughput" premise is NOT universally true.**
-  For the common small-JSON API case it's a regression vs uvicorn+uvloop. The
-  defensible win is **serialization of large payloads** (and, by the same logic,
-  streaming — untested here).
+  For small JSON it's a regression vs uvicorn+uvloop. The **only** substantiated
+  Rust throughput win is **large (>~4 KB) one-shot serialization**.
+- **Streaming via the Rust `_native` R3 pump is a severe regression (16–26×)** —
+  the per-chunk asyncio bridge is a perf cliff, fatal for high-chunk-count
+  streams (e.g. LLM token streaming). **Stream via `lancelot.App`/uvicorn
+  instead.** The R3 pump needs re-architecture before it can carry that claim.
 - **Deploy the Rust server multiprocess** (`SO_REUSEPORT`, 1 thread/proc), never
   1-process-many-threads.
 - The Rust core's other value is **resilience, not req/s**: 16 MiB body cap (413),
   connection cap, `header_read_timeout` (slow-loris), http1-only hardening,
-  graceful drain, backpressured streaming pump — all verified by
-  `tests/test_m3_http_integration.py`, all orthogonal to throughput.
+  graceful drain — all verified by `tests/test_m3_http_integration.py`,
+  orthogonal to throughput.
 
 ## Caveats — read before quoting any number
 
