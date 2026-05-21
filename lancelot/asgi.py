@@ -355,8 +355,10 @@ async def _http_dispatch(app, scope, receive, send):
             # cookie-bomb where a client re-asserts a known name).
             cookies.setdefault(_ck, _cv)
     params = route.match(path) or {}
-    lreq = LRequest(method, path, query, headers, cookies, params, body,
-                    scope["app"])
+    from lancelot.requests import _BodyAccessor as _BA
+
+    lreq = LRequest(method, path, query, headers, cookies, params,
+                    _BA(body), scope["app"])
     lreq.scope_state = scope.get("state")  # honor incoming ASGI scope state
     lreq.query_params_multi = query_multi
     lreq.headers_multi = headers_multi
@@ -447,6 +449,42 @@ async def _http_dispatch(app, scope, receive, send):
         if not _func_stack_closed:
             _func_stack_closed = True
             await _func_stack.aclose()
+
+    # FastAPI custom-route extension: if the route's class OVERRODE
+    # get_route_handler (i.e. it's not the base Route's), dispatch via
+    # that opt-in path instead of the fast inline path. The wrapper
+    # callable owns body-parse + solve + serialize and returns a
+    # Response we then emit. The common-case hot path below is untouched.
+    from lancelot.routing import Route as _BaseRoute
+    if type(route).get_route_handler is not _BaseRoute.get_route_handler:
+        try:
+            _custom = route.get_route_handler()
+            _resp = await _custom(lreq)
+            await _emit_response_object(_resp, scope, receive, send, lreq)
+            sent = True
+            if lreq._background._tasks:
+                await lreq._background()
+            return
+        except HTTPException as _che:
+            # The custom handler may `raise HTTPException(...)` (e.g.
+            # mapping a RequestValidationError). Emit it byte-faithfully.
+            h = _find_exc_handler(app, _che)
+            if h is not None:
+                await _emit_handler_response(h, lreq, _che, scope,
+                                             receive, send)
+            else:
+                ebody = _wire_json({"detail": _che.detail})
+                hdrs = [(str(k).lower().encode(), str(v).encode())
+                        for k, v in (_che.headers or {}).items()]
+                hdrs.append((b"content-length", str(len(ebody)).encode()))
+                hdrs.append((b"content-type", b"application/json"))
+                await send({"type": "http.response.start",
+                            "status": _che.status_code, "headers": hdrs})
+                await send({"type": "http.response.body", "body": ebody})
+            sent = True
+            return
+        finally:
+            await _close_func_scope()
 
     try:
         async with solve_async(route.plan, lreq,
@@ -1108,6 +1146,36 @@ async def _emit_handler_response(handler, lreq, exc, scope, receive, send):
     hdrs.append((b"content-length", str(len(body)).encode()))
     hdrs.append((b"content-type", str(media_type).encode()))
     await send({"type": "http.response.start", "status": status_code,
+                "headers": hdrs})
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _emit_response_object(resp, scope, receive, send, lreq):
+    """Emit a Response object returned by a custom get_route_handler.
+    Handles Starlette-shape ASGI-callable responses (delegate to __call__)
+    AND Lancelot's Response (read body / status / headers / media_type)."""
+    # Starlette-shape ASGI-callable (FileResponse / StreamingResponse /
+    # plain Starlette Response) — body is None / it has __call__.
+    _body = getattr(resp, "body", None)
+    if _body is None and callable(resp):
+        await resp(scope, receive, send)
+        return
+    body = _body if isinstance(_body, (bytes, bytearray)) else (
+        str(_body).encode() if _body is not None else b"")
+    status = getattr(resp, "status_code", 200) or 200
+    media_type = getattr(resp, "media_type", None) or "application/json"
+    user_hdrs = getattr(resp, "headers", None) or {}
+    hdrs = []
+    for k, v in user_hdrs.items():
+        kb = str(k).lower().encode()
+        if isinstance(v, list):
+            for vv in v:
+                hdrs.append((kb, str(vv).encode()))
+        else:
+            hdrs.append((kb, str(v).encode()))
+    hdrs.append((b"content-length", str(len(body)).encode()))
+    hdrs.append((b"content-type", str(media_type).encode()))
+    await send({"type": "http.response.start", "status": status,
                 "headers": hdrs})
     await send({"type": "http.response.body", "body": body})
 

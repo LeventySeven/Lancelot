@@ -52,8 +52,15 @@ class ParamValidator:
         _bucket = "body" if _src in ("form", "file", "body") else _src
         # FastAPI/Pydantic v2: loc uses the *validation* key, so
         # validation_alias takes precedence over alias.
-        loc_prefix = [_bucket,
-                      self.fi.validation_alias or self.fi.alias or self.fi.name]
+        # Single-Body scalar (the raw body IS the value, no embed): the
+        # error loc is just ["body"] — there's no field-name wrapper
+        # (FastAPI parity, test_custom_request_and_route::tutorial002).
+        if getattr(self.fi, "body_scalar", False):
+            loc_prefix = [_bucket]
+        else:
+            loc_prefix = [
+                _bucket,
+                self.fi.validation_alias or self.fi.alias or self.fi.name]
         if not present:
             if self.fi.required:
                 return None, [{"type": "missing", "loc": loc_prefix,

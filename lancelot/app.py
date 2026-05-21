@@ -177,9 +177,11 @@ class App:
         if self.dependencies:
             kw["dependencies"] = list(self.dependencies) + list(
                 kw.get("dependencies", []) or [])
+        # Honor a custom `app.router.route_class` (FastAPI custom-route).
+        _rc = getattr(self.router, "route_class", Route)
 
         def deco(fn):
-            self.router.add(Route(method, path, fn, **kw))
+            self.router.add(_rc(method, path, fn, **kw))
             return fn
 
         return deco
@@ -477,8 +479,10 @@ class App:
                     f" {r.method} '{r.path}'). Add a prefix to the "
                     "router or change the path."
                 )
-            self.router.add(Route(r.method, _final_path, r.handler,
-                                  r.name, **kw))
+            # Preserve the source route's class (custom APIRoute survives
+            # include_router).
+            self.router.add(type(r)(r.method, _final_path, r.handler,
+                                    r.name, **kw))
 
     def middleware(self, kind: str = "http"):
         """FastAPI `@app.middleware("http")` decorator. The wrapped fn

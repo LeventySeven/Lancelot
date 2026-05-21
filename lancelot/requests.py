@@ -1,6 +1,22 @@
 from dataclasses import dataclass
 
 
+class _BodyAccessor(bytes):
+    """A `bytes` subclass that is ALSO callable as an awaitable returning
+    itself. This lets BOTH contracts coexist on `request.body`:
+      - internal hot path reads it as bytes: `len(request.body)`,
+        `request.body.decode()`, `validate_json(request.body)` — all work
+        because it IS bytes;
+      - Starlette-shape user code (custom APIRoute handlers) does
+        `await request.body()` — works because instances are callable
+        and return a coroutine yielding the raw bytes.
+    Zero hot-path cost: it's a plain bytes value everywhere except when
+    explicitly called."""
+
+    async def __call__(self):
+        return bytes(self)
+
+
 @dataclass
 class Request:
     method: str

@@ -391,6 +391,84 @@ class Route:
         m = self._rx.match(path)
         return m.groupdict() if m else None
 
+    def get_route_handler(self):
+        """FastAPI extension point: returns an `async (request) -> Response`
+        callable. Custom `APIRoute` subclasses override this to wrap the
+        original handler (logging, timing, custom error mapping, ...).
+
+        The BASE implementation runs the full dispatch (body parse +
+        dependency solve + handler + serialization) and returns a
+        `lancelot.responses.Response`. On request-validation failure it
+        RAISES `RequestValidationError` so a wrapper can catch it (the
+        ASGI seam catches it otherwise and emits the canonical 422).
+
+        This path is taken ONLY when `route_class` is customized — the
+        common-case hot path in `asgi._http_dispatch` is untouched."""
+        route = self
+
+        async def _handler(request):
+            from lancelot.di import solve_async
+            from lancelot.exceptions import RequestValidationError
+            from lancelot.responses import JSONResponse, Response
+            from lancelot.validation import _wire_json
+
+            # Body parse (mirrors the seam's pre-solve body handling).
+            body_value, body_errors = None, []
+            raw = bytes(getattr(request, "body", b"") or b"")
+            if route.body is not None:
+                bname, bval = route.body
+                if raw:
+                    if getattr(route, "body_kind", "json") == "form":
+                        import urllib.parse as _up
+
+                        pairs = _up.parse_qsl(raw.decode("latin-1"),
+                                              keep_blank_values=True)
+                        body_value, body_errors = bval.validate_form(pairs)
+                    else:
+                        body_value, body_errors = bval.validate_json(raw)
+                elif getattr(route, "body_kind", "json") == "form":
+                    body_value, body_errors = bval.validate_form([])
+                else:
+                    body_value, body_errors = bval.validate_json(b"{}")
+            import contextlib as _cl
+
+            fstack = _cl.AsyncExitStack()
+            await fstack.__aenter__()
+            try:
+                async with solve_async(route.plan, request,
+                                       _func_stack=fstack) as res:
+                    errs = list(res.errors) + body_errors
+                    if errs:
+                        raise RequestValidationError(errs, body=raw)
+                    kwargs = dict(res.kwargs)
+                    if route.body is not None:
+                        kwargs[route.body[0]] = body_value
+                    import inspect as _isp
+
+                    if route.plan.is_async:
+                        result = await route.handler(**kwargs)
+                    else:
+                        from lancelot.pool import get_pool
+
+                        result = await get_pool().offload(
+                            route.handler, **kwargs)
+                    await fstack.aclose()
+            finally:
+                if not fstack._exit_callbacks:  # already closed → no-op
+                    pass
+                try:
+                    await fstack.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+            # A handler that already returns a Response passes through.
+            if isinstance(result, Response):
+                return result
+            payload = _wire_json(result)
+            return JSONResponse(payload,
+                                status_code=route.status_code or 200)
+
+        return _handler
+
 
 class APIRouter:
     def __init__(self, prefix: str = "", tags: list | None = None, **kwargs):
@@ -410,6 +488,10 @@ class APIRouter:
         # FastAPI 0.110+ feature: None = inherit from parent (router
         # chain → app → True default).
         self.strict_content_type = kwargs.pop("strict_content_type", None)
+        # Custom APIRoute subclass — routes registered on this router are
+        # instantiated as `route_class` so a user's get_route_handler
+        # override is honored (FastAPI custom-request-and-route feature).
+        self.route_class = kwargs.pop("route_class", Route)
         # Keep the rest as opaque (Lancelot doesn't behave on them yet).
         self._router_kwargs = kwargs
         self.routes: list[Route] = []
@@ -422,9 +504,10 @@ class APIRouter:
 
         known = {f.name for f in _dc.fields(Route)}
         kw = {k: v for k, v in kwargs.items() if k in known}
+        _rc = self.route_class
 
         def deco(fn):
-            self.routes.append(Route(method, self.prefix + path, fn, **kw))
+            self.routes.append(_rc(method, self.prefix + path, fn, **kw))
             return fn
 
         return deco
@@ -492,8 +575,8 @@ class APIRouter:
             if kw.get("strict_content_type") is None \
                     and effective_sct is not None:
                 kw["strict_content_type"] = effective_sct
-            self.routes.append(Route(r.method, add_prefix + r.path,
-                                     r.handler, r.name, **kw))
+            self.routes.append(type(r)(r.method, add_prefix + r.path,
+                                       r.handler, r.name, **kw))
 
 
 class Router:
@@ -514,6 +597,10 @@ class Router:
         self._const_paths: set[str] = set()
         # regex-tier: routes with `{param}` placeholders + WS routes.
         self._dyn: list[Route] = []
+        # FastAPI: `app.router.route_class = MyAPIRoute` — routes added
+        # via @app.get/etc. after this is set use the custom class so a
+        # get_route_handler override is honored.
+        self.route_class = Route
 
     def add(self, route: Route):
         self.routes.append(route)
