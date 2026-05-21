@@ -11,7 +11,7 @@
 //! API note (deviation from the plan's literal code, deliberate): the plan
 //! expected pyo3 0.27 to still expose `Python::with_gil` / `allow_threads` and
 //! to rename to `attach` / `detach` only at the 0.28 bump. pyo3 0.27.2 **already
-//! deprecates** `with_gil`/`allow_threads`, so we use `attach`/`detach` now —
+//! deprecates** `with_gil`/`allow_threads`, so `with_gil` wraps `attach` now —
 //! this matches the plan's stated "written 0.28-clean" intent and keeps the
 //! build warning-free (an M0 Definition-of-Done requirement).
 use pyo3::prelude::*;
@@ -24,13 +24,10 @@ pub fn with_gil<R>(f: impl for<'py> FnOnce(Python<'py>) -> R) -> R {
     Python::attach(f)
 }
 
-/// Explicit GIL-release marker for blocking sections (used by dispatch to drop
-/// the GIL around the Python `await`). `R: Send` + the closure `: Send` satisfy
-/// pyo3's `Ungil` bound — i.e. nothing GIL-bound may cross the release.
-#[inline]
-pub fn detach<R: Send>(py: Python<'_>, f: impl FnOnce() -> R + Send) -> R {
-    py.detach(f)
-}
+// (No `detach` wrapper: the GIL is released *structurally* — every `.await`
+// sits OUTSIDE a `with_gil` scope, so there is no GIL to drop at the await
+// point. An explicit `py.detach` marker would imply a release pattern this
+// crate doesn't use, so it's intentionally absent.)
 
 /// RAII guard for a freshly-created asyncio event loop (m12-lifecycle skill:
 /// manual cleanup is the anti-pattern → use Drop). A loop owns a kqueue +

@@ -47,15 +47,28 @@ fn main() {
             })
             .expect("probe setup");
 
+        // Build both ReqParts UP FRONT — their String/Vec allocations must
+        // happen before the measured `before` snapshot, otherwise they'd be
+        // counted against the framework's per-request delta. `call_async` now
+        // takes `ReqParts` (R2), not a bare `Bytes`.
+        let mk_parts = || lancelot::dispatch::ReqParts {
+            method: "POST".to_string(),
+            path: "/".to_string(),
+            query_string: String::new(),
+            headers: Vec::new(),
+            body: body.clone(),
+        };
+        let parts_warm = mk_parts();
+        let parts_meas = mk_parts();
+
         let driver = {
             let locals = locals.clone();
-            let body = body.clone();
             async move {
                 // Warm once (amortize one-time imports / first-call setup).
-                let _ = lancelot::dispatch::call_async(locals.clone(), h_warm, body.clone()).await;
+                let _ = lancelot::dispatch::call_async(locals.clone(), h_warm, parts_warm).await;
                 let before = dhat::HeapStats::get();
                 // The measured steady dispatch.
-                let _ = lancelot::dispatch::call_async(locals.clone(), h_meas, body.clone()).await;
+                let _ = lancelot::dispatch::call_async(locals.clone(), h_meas, parts_meas).await;
                 let after = dhat::HeapStats::get();
                 Ok::<_, lancelot::pyo3::PyErr>(
                     after.total_blocks.saturating_sub(before.total_blocks),

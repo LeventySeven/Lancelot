@@ -8,6 +8,8 @@ A backend framework like FastAPI / Robyn that optimizes **HTTP transport / seria
 
 **AI logic stays on the user side** — LangGraph, agent loops, vector stores, prompt orchestration. We own the byte path; the user owns the agent. This is the user's restated rule; every "should we build X" decision flows from it.
 
+**Honest perf envelope (do not oversell — see "Rust server perf envelope" below).** The Rust core's win is **serialization of large payloads + streaming + resilience**, NOT raw small-request throughput. A fair benchmark (2026-05-21) shows uvicorn+uvloop *beats* our Rust server on tiny responses; the Rust path only pulls ahead once Rust-native serialization outweighs its per-request FFI/asyncio-bridge overhead. Lead with serialization/streaming/resilience, never "faster server".
+
 ## Cardinal rules
 
 1. **No bullshit, no useless logic.** Every change must change the byte path or the operator experience. If it doesn't, it shouldn't ship.
@@ -85,9 +87,24 @@ These are left RED (not excluded/gamed). Each would require violating a cardinal
 
 If a future change makes any of these legitimately fixable (e.g. a real BaseHTTPMiddleware streaming impl lands for other reasons), revisit. Until then, the floor stays at 974 and these stay counted as failures.
 
+## Rust server perf envelope (honest benchmark, 2026-05-21)
+
+`benchmarks/` (oha, Apple M5, loopback). A fairness-review agent caught the first cut as rigged (10-thread Rust vs single-thread uvicorn on its slow h11 stack, falsely "1.64× faster"). The CORRECTED benchmark (uvicorn on uvloop+httptools, matched workers):
+
+- **Tiny 23 B response → uvicorn+uvloop WINS** (~1.56× per-core: 69.9k vs Rust 44.8k; full-machine 124k vs 34k). The Rust path pays ~0.5 ms/request for the pyo3 FFI + cross-thread asyncio-bridge round-trip; uvloop runs the coroutine natively same-thread.
+- **Large ~69 KB JSON → Rust WINS ~2.25×** (5.26k vs 2.34k). Rust serializes via pydantic-core `to_json`; Starlette default `JSONResponse` = Python `json.dumps` (the bottleneck). This is the crossover and IS the positioning.
+- **The Rust server ANTI-SCALES with tokio threads** (1→10 workers: 44.8k→34k) — Python is GIL-serialized through one asyncio loop per process. **Deploy MULTIPROCESS** (`SO_REUSEPORT` via `bind_reuseport`, `LANCELOT_WORKERS=1`/proc, N procs), NEVER 1-process-many-threads.
+- New operator knob: **`LANCELOT_WORKERS`** env overrides `cpu::worker_count()` (clamped [1,64]; invalid/0 → cgroup/logical detection).
+- Hardening this session: server is now **HTTP/1.1-only** (`hyper::http1::Builder` replaced `AutoBuilder`, which served unguarded h2c — the slow-loris `header_read_timeout` was http1-only; this server is cleartext-behind-a-TLS-proxy so h2c was untested+unguarded). Fixed stale `alloc_probe.rs` (alloc gate=3); removed dead `gil::detach`.
+
+Run it: `./benchmarks/run_load.sh` (both shapes; raw dumps in `benchmarks/results/{percore,fullmachine}/`).
+
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
 
 These are tempting; the research teardowns + the no-bullshit rule say not to build them. If a future agent (or human) is about to spend cycles on one of these, **stop and check this list first.**
+
+- ❌ **Claim/pursue small-request throughput as the Rust selling point** — the honest benchmark shows uvicorn+uvloop wins there. Lead with large-payload serialization + streaming + resilience instead (see perf envelope above).
+- ❌ **Deploy the Rust server 1-process-many-threads** — it anti-scales (GIL). Multiprocess via `SO_REUSEPORT` is the only scaling model.
 
 - ❌ **Custom JSON serializer (orjson / ujson)** — Pydantic v2 `TypeAdapter.dump_json` is already Rust-core fast. FastAPI's own ledger marks orjson/ujson responses deprecated.
 - ❌ **OpenAPI callbacks / webhooks** — rare, complex, no payoff for AI/cloud/startup positioning.

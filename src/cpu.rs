@@ -2,9 +2,26 @@
 //! (containers report host CPUs, not the cgroup quota → thread explosion).
 use std::path::Path;
 
-/// Effective worker count: cgroup quota if present, else logical CPUs, clamped [1, 64].
+/// Effective worker count: an explicit `LANCELOT_WORKERS` override wins (the
+/// operator-facing `--workers` equivalent — needed where cgroup detection can't
+/// see the real allocation, e.g. macOS / non-cgroup hosts, or to pin width);
+/// else cgroup quota if present, else logical CPUs. Clamped [1, 64].
 pub fn worker_count() -> usize {
-    workers_from(Path::new("/sys/fs/cgroup"), num_cpus_fallback())
+    let detected = workers_from(Path::new("/sys/fs/cgroup"), num_cpus_fallback());
+    apply_override(std::env::var("LANCELOT_WORKERS").ok(), detected)
+}
+
+/// Apply the `LANCELOT_WORKERS` override: a positive integer pins the count
+/// (clamped to 64); anything missing/invalid/zero falls back to `detected`.
+fn apply_override(env: Option<String>, detected: usize) -> usize {
+    match env
+        .as_deref()
+        .map(str::trim)
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        Some(n) if n >= 1 => n.min(64),
+        _ => detected,
+    }
 }
 
 fn num_cpus_fallback() -> usize {
@@ -53,5 +70,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(workers_from(&dir, 8), 8);
         assert_eq!(workers_from(&dir, 999), 64);
+    }
+
+    #[test]
+    fn workers_override_wins_when_valid() {
+        // A valid positive override pins the count (clamped to 64), regardless
+        // of detected width — the operator-facing --workers knob.
+        assert_eq!(apply_override(Some("1".into()), 10), 1);
+        assert_eq!(apply_override(Some(" 4 ".into()), 10), 4);
+        assert_eq!(apply_override(Some("999".into()), 10), 64);
+        // Missing / invalid / zero → fall back to detected.
+        assert_eq!(apply_override(None, 10), 10);
+        assert_eq!(apply_override(Some("0".into()), 10), 10);
+        assert_eq!(apply_override(Some("nope".into()), 10), 10);
+        assert_eq!(apply_override(Some("".into()), 10), 10);
     }
 }

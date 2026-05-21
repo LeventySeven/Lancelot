@@ -18,8 +18,7 @@ use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, Request as HReq, Response as HResp, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder as AutoBuilder;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
@@ -212,15 +211,25 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
                         let app = app.clone();
                         async move { Ok::<_, std::convert::Infallible>(handle(app, r).await) }
                     });
-                    // R6: slow-loris hardening — cap how long a client
-                    // can dribble request headers before the connection
-                    // is dropped (Granian/nginx-class default; closes
-                    // design/01:400-402, SYNTHESIS.md:102 — Blazeio
-                    // had no header deadline, Robyn's actix had it set
-                    // to 0 disabling the gate).
-                    let mut builder = AutoBuilder::new(TokioExecutor::new());
+                    // HTTP/1.1 ONLY (deliberate, audit MEDIUM-1). The prior
+                    // `AutoBuilder` auto-negotiated HTTP/2 cleartext (h2c) on
+                    // the same socket, but the slow-loris `header_read_timeout`
+                    // below applies only to the h1 path — so an h2c client got
+                    // an UNGUARDED connection. This server binds cleartext TCP
+                    // with no TLS (it sits behind a TLS-terminating proxy);
+                    // real h2 arrives via TLS+ALPN at that proxy, and h2c is
+                    // neither a goal nor tested here. Serving an unhardened,
+                    // untested protocol path violates the no-bullshit rule, so
+                    // we restrict to h1 explicitly. If h2 becomes a goal it is
+                    // a deliberate addition WITH its own connection limits.
+                    //
+                    // R6: slow-loris hardening — cap how long a client can
+                    // dribble request headers before the connection is dropped
+                    // (Granian/nginx-class default; closes design/01:400-402,
+                    // SYNTHESIS.md:102 — Blazeio had no header deadline, Robyn's
+                    // actix had it set to 0 disabling the gate).
+                    let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
-                        .http1()
                         .timer(TokioTimer::new())
                         .header_read_timeout(std::time::Duration::from_secs(15));
                     let _ = builder.serve_connection(io, svc).await;

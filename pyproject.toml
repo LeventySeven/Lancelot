@@ -8,6 +8,12 @@ version = "0.0.0"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.7"]
 
+# Runtime dep stays pydantic-ONLY (cardinal rule). These extras are opt-in and
+# never pulled by `import lancelot`. `bench` = the load-comparison baselines
+# (benchmarks/); the `oha` load tool is a separate Rust binary (cargo install oha).
+[project.optional-dependencies]
+bench = ["uvicorn[standard]>=0.30"]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 module-name = "lancelot._native"
