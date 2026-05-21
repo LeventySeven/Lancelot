@@ -13,6 +13,7 @@ pub mod router;
 pub mod serialize;
 pub mod service;
 pub mod socket;
+pub mod stream;
 
 #[pyfunction]
 fn _ping() -> &'static str {
@@ -47,6 +48,7 @@ fn run(
             router,
             handlers,
             locals,
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         },
         host,
         port,
@@ -71,5 +73,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::ffi::request::_test_make_request, m)?)?;
     m.add_function(wrap_pyfunction!(crate::serialize::_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(crate::dispatch::_drive, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::stream::_drive_stream, m)?)?;
     Ok(())
 }

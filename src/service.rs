@@ -12,9 +12,10 @@
 //! call spins the asyncio loop AND the tokio runtime together. `call_async` is
 //! the 3-arg `(TaskLocals, Py<PyAny>, Bytes)` form from Task 8. Handler errors
 //! map to 500 (no `.expect`/panic across the FFI seam).
-use crate::dispatch::{call_async, ReqParts};
+use crate::dispatch::{await_and_serialize, build_result, Dispatched, ReqParts};
 use crate::router::Router;
 use bytes::Bytes;
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, Request as HReq, Response as HResp, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -23,6 +24,11 @@ use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use std::sync::Arc;
+
+/// Uniform response body: a one-shot Full (regular JSON) OR a chunked stream
+/// (R3 async-gen). BoxBody erases the two into one type so `handle` has a
+/// single return type for the hyper service_fn.
+type RespBody = BoxBody<Bytes, std::io::Error>;
 
 /// Max request body the production path will buffer before returning 413
 /// (audit CRITICAL #1 — the M0 path collected unbounded bodies, a trivial
@@ -33,16 +39,27 @@ pub struct App {
     pub router: Router,
     pub handlers: Vec<Py<PyAny>>, // slot -> handler
     pub locals: TaskLocals,       // the server's asyncio loop + context
+    // Notified on graceful shutdown (SIGTERM) so in-flight R3 stream pumps
+    // stop pulling before the event loop closes (audit #2).
+    pub shutdown: std::sync::Arc<tokio::sync::Notify>,
 }
 
-fn plain(status: StatusCode, body: &'static [u8]) -> HResp<Full<Bytes>> {
+fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
     HResp::builder()
         .status(status)
-        .body(Full::new(Bytes::from_static(body)))
+        .body(Full::new(Bytes::from_static(body)).map_err(|e| match e {}).boxed())
         .unwrap()
 }
 
-async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
+fn json_ok(body: Vec<u8>) -> HResp<RespBody> {
+    HResp::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .unwrap()
+}
+
+async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     // R2: capture the REAL query string + headers (was dropped in M0).
@@ -51,10 +68,11 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
         .headers()
         .iter()
         .map(|(k, v)| {
-            (
-                k.as_str().to_ascii_lowercase(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
+            // Starlette decodes header values as latin-1 (1 byte → 1 char),
+            // which is lossless for arbitrary bytes — unlike from_utf8_lossy
+            // which corrupts non-UTF-8 with replacement chars (audit #9).
+            let val: String = v.as_bytes().iter().map(|&b| b as char).collect();
+            (k.as_str().to_ascii_lowercase(), val)
         })
         .collect();
     let slot = match app.router.route(&method, &path) {
@@ -82,25 +100,39 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
         headers,
         body,
     };
-    // R7: catch_unwind at the FFI seam — any panic in the dispatch
-    // future (Python code, pyo3 conversions, anywhere) becomes a 500
-    // INSTEAD of killing the worker. Closes the documented Robyn defect
-    // (deep/04:17 — panic=abort with no catch_unwind kills the worker
-    // with no supervisor). `panic = "unwind"` is set in Cargo.toml so
-    // this is actionable.
-    use futures::FutureExt;
-    let dispatched = std::panic::AssertUnwindSafe(
-        call_async(app.locals.clone(), handler, parts)
-    ).catch_unwind().await;
+    // Scope 1 (GIL): build the Request, call the handler, classify the result.
+    // Wrapped in catch_unwind so a panic in the call (pyo3 conversion, etc.)
+    // is a 500, not a worker kill (R7). `build_result` is sync (no .await).
+    let classified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::gil::with_gil(|py| build_result(py, &app.locals, handler, parts))
+    }));
+    let dispatched = match classified {
+        Ok(Ok(d)) => d,
+        _ => return plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+    };
     match dispatched {
-        Ok(Ok(json)) => HResp::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(json)))
-            .unwrap(),
-        Ok(Err(_)) => plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
-        Err(_panicked) => plain(
-            StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+        // R3: async-gen → chunked streaming body (no per-chunk thread/GIL).
+        Dispatched::Stream(gen, content_type) => {
+            let body =
+                crate::stream::stream_body(app.locals.clone(), gen, app.shutdown.clone());
+            HResp::builder()
+                .status(StatusCode::OK)
+                .header("content-type", content_type)
+                .body(body.boxed())
+                .unwrap()
+        }
+        // Regular awaitable → await (GIL dropped) + serialize. R7:
+        // catch_unwind so a panic anywhere in the future becomes a 500.
+        Dispatched::Value(fut) => {
+            use futures::FutureExt;
+            let done = std::panic::AssertUnwindSafe(await_and_serialize(fut))
+                .catch_unwind()
+                .await;
+            match done {
+                Ok(Ok(json)) => json_ok(json),
+                _ => plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+            }
+        }
     }
 }
 
@@ -122,7 +154,15 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
                 .map_err(|e| PyOSError::new_err(e.to_string()))?;
         loop {
             tokio::select! {
-                _ = sigterm.recv() => break, // graceful: stop accepting
+                _ = sigterm.recv() => {
+                    // Graceful: stop accepting, then tell in-flight R3 stream
+                    // pumps to stop pulling BEFORE the event loop closes
+                    // (audit #2 — otherwise a pump awaits a coroutine on a
+                    // closing loop). A brief drain lets them observe it.
+                    app.shutdown.notify_waiters();
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    break;
+                }
                 accepted = listener.accept() => {
                     let (stream, _) = match accepted { Ok(v) => v, Err(_) => continue };
                     let app = app.clone();

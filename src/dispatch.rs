@@ -46,16 +46,7 @@ pub async fn call_async(
     // R2: the REAL method/path/query/headers are moved into the Request here
     // (was hardcoded "POST"/"/echo" in M0).
     let fut = crate::gil::with_gil(|py| -> PyResult<_> {
-        let req = Bound::new(
-            py,
-            Request::new(
-                parts.method,
-                parts.path,
-                parts.query_string,
-                parts.headers,
-                parts.body,
-            ),
-        )?;
+        let req = build_request(py, parts)?;
         let coro = handler.bind(py).call1((req,))?;
         pyo3_async_runtimes::into_future_with_locals(&locals, coro)
     })?;
@@ -64,6 +55,60 @@ pub async fn call_async(
     let result: Py<PyAny> = fut.await?;
 
     // Scope 3: one-pass serialize (pydantic-core).
+    crate::gil::with_gil(|py| to_json_bytes(py, result.bind(py)))
+}
+
+/// Build the lazy Request pyclass from the owned parts (GIL held).
+fn build_request<'py>(py: Python<'py>, parts: ReqParts) -> PyResult<Bound<'py, Request>> {
+    Bound::new(
+        py,
+        Request::new(
+            parts.method,
+            parts.path,
+            parts.query_string,
+            parts.headers,
+            parts.body,
+        ),
+    )
+}
+
+/// The Send future that resolves a regular handler coroutine to its result.
+pub type ResultFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>;
+
+/// What a handler call produced: a streaming async-gen (R3) or a regular
+/// coroutine future. Detection happens in ONE GIL scope (build_result) so the
+/// hot path branches without a second introspection.
+pub enum Dispatched {
+    /// `async def gen(): yield ...` — the async-iterator object to pump, plus
+    /// the response content-type (SSE vs JSON-lines; audit #4).
+    Stream(Py<PyAny>, String),
+    /// A regular awaitable; await it (GIL dropped) then serialize.
+    Value(ResultFuture),
+}
+
+/// Scope 1 (GIL held): build the Request, call the handler, and classify the
+/// result. An async-gen result short-circuits to streaming WITHOUT bridging a
+/// coroutine future; a regular awaitable is bridged to a Send `ResultFuture`.
+pub fn build_result(
+    py: Python<'_>,
+    locals: &TaskLocals,
+    handler: Py<PyAny>,
+    parts: ReqParts,
+) -> PyResult<Dispatched> {
+    let req = build_request(py, parts)?;
+    let result = handler.bind(py).call1((req,))?;
+    if let Some(gen) = crate::stream::as_async_iter(&result) {
+        let ct = crate::stream::stream_media_type(&result);
+        return Ok(Dispatched::Stream(gen, ct));
+    }
+    let fut = pyo3_async_runtimes::into_future_with_locals(locals, result)?;
+    Ok(Dispatched::Value(Box::pin(fut)))
+}
+
+/// Drop the GIL across the awaitable, then serialize the result (Scope 3).
+pub async fn await_and_serialize(fut: ResultFuture) -> PyResult<Vec<u8>> {
+    let result: Py<PyAny> = fut.await?;
     crate::gil::with_gil(|py| to_json_bytes(py, result.bind(py)))
 }
 

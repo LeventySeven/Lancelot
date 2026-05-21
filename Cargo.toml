@@ -19,6 +19,8 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.27", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
+# R3 streaming pump: ReceiverStream adapts the bounded mpsc → hyper StreamBody.
+tokio-stream = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 http-body-util = "0.1"
