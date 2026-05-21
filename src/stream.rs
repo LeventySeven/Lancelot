@@ -81,15 +81,26 @@ pub fn as_async_iter(obj: &Bound<'_, PyAny>) -> Option<Py<PyAny>> {
 /// object may carry a `media_type` (e.g. "text/event-stream" for SSE Event
 /// streams); otherwise default to JSON-lines (audit #4 — don't force SSE
 /// bytes under an application/jsonl header).
+///
+/// SECURITY (m06-error-handling): `media_type` is user-controlled. Strip CR/
+/// LF/control bytes + reject non-ASCII so it can never (a) inject a response
+/// header (CRLF) nor (b) make hyper's `HeaderValue` parse fail and panic the
+/// `.unwrap()` in the connection task. Falls back to the JSON-lines default
+/// if the cleaned value is empty/invalid.
 pub fn stream_media_type(obj: &Bound<'_, PyAny>) -> String {
+    const DEFAULT: &str = "application/jsonl";
     if let Ok(mt) = obj.getattr("media_type") {
         if let Ok(s) = mt.extract::<String>() {
-            if !s.is_empty() {
-                return s;
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii() && !c.is_ascii_control())
+                .collect();
+            if !cleaned.is_empty() {
+                return cleaned;
             }
         }
     }
-    "application/jsonl".to_string()
+    DEFAULT.to_string()
 }
 
 /// Pull the next chunk: bridge `gen.__anext__()` to a Rust future (GIL held,
@@ -152,11 +163,7 @@ pub fn stream_body(
                     Ok(Some(bytes)) => {
                         // Bounded send → backpressure. Err = receiver dropped
                         // (client gone) → stop pulling, drop the gen.
-                        if tx
-                            .send(Ok(Frame::data(Bytes::from(bytes))))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(Ok(Frame::data(Bytes::from(bytes)))).await.is_err() {
                             break;
                         }
                     }
@@ -166,9 +173,7 @@ pub fn stream_body(
                         // already on the wire, so we can't change the status.
                         // End the body (truncated stream — same as
                         // FastAPI/Starlette, which log and close).
-                        let _ = tx
-                            .send(Err(io::Error::other("stream handler error")))
-                            .await;
+                        let _ = tx.send(Err(io::Error::other("stream handler error"))).await;
                         break;
                     }
                 }
@@ -190,9 +195,18 @@ pub fn stream_body(
 /// Exercises the GIL choreography + StopAsyncIteration path without standing up
 /// an HTTP server.
 #[pyfunction]
-pub fn _drive_stream(py: Python<'_>, fi: &crate::ffi::fninfo::FnInfo) -> PyResult<Vec<Py<PyBytes>>> {
+pub fn _drive_stream(
+    py: Python<'_>,
+    fi: &crate::ffi::fninfo::FnInfo,
+) -> PyResult<Vec<Py<PyBytes>>> {
     let handler = fi.handler.clone_ref(py);
-    let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
+    // RAII loop guard (m12-lifecycle) — closed on every exit path incl. run?.
+    let guard = crate::gil::EventLoop::new(
+        py.import("asyncio")?
+            .call_method0("new_event_loop")?
+            .unbind(),
+    );
+    let event_loop = guard.bind(py);
     let locals = TaskLocals::new(event_loop.clone()).copy_context(py)?;
 
     let driver = {
@@ -215,8 +229,8 @@ pub fn _drive_stream(py: Python<'_>, fi: &crate::ffi::fninfo::FnInfo) -> PyResul
         }
     };
 
-    let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), driver);
-    let _ = event_loop.call_method0("close");
+    // `guard` closes the loop in Drop on every exit path (incl. `run?`).
+    let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop, driver);
     let chunks = run?;
     Ok(chunks
         .into_iter()

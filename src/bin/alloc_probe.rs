@@ -29,15 +29,13 @@ fn main() {
         lancelot::pyo3::Python::initialize();
         let body = bytes::Bytes::from_static(b"{\"a\":1}");
 
-        let (h_warm, h_meas, locals, event_loop) = lancelot::pyo3::Python::attach(
-            |py| -> lancelot::pyo3::PyResult<_> {
+        let (h_warm, h_meas, locals, event_loop) =
+            lancelot::pyo3::Python::attach(|py| -> lancelot::pyo3::PyResult<_> {
                 let el = py.import("asyncio")?.call_method0("new_event_loop")?;
-                let locals =
-                    pyo3_async_runtimes::TaskLocals::new(el.clone()).copy_context(py)?;
-                let code = std::ffi::CString::new(
-                    "async def h(req):\n    return {'echo': req.json()}\n",
-                )
-                .unwrap();
+                let locals = pyo3_async_runtimes::TaskLocals::new(el.clone()).copy_context(py)?;
+                let code =
+                    std::ffi::CString::new("async def h(req):\n    return {'echo': req.json()}\n")
+                        .unwrap();
                 let m = lancelot::pyo3::types::PyModule::from_code(
                     py,
                     &code,
@@ -46,21 +44,18 @@ fn main() {
                 )?;
                 let h = m.getattr("h")?;
                 Ok((h.clone().unbind(), h.unbind(), locals, el.unbind()))
-            },
-        )
-        .expect("probe setup");
+            })
+            .expect("probe setup");
 
         let driver = {
             let locals = locals.clone();
             let body = body.clone();
             async move {
                 // Warm once (amortize one-time imports / first-call setup).
-                let _ = lancelot::dispatch::call_async(locals.clone(), h_warm, body.clone())
-                    .await;
+                let _ = lancelot::dispatch::call_async(locals.clone(), h_warm, body.clone()).await;
                 let before = dhat::HeapStats::get();
                 // The measured steady dispatch.
-                let _ = lancelot::dispatch::call_async(locals.clone(), h_meas, body.clone())
-                    .await;
+                let _ = lancelot::dispatch::call_async(locals.clone(), h_meas, body.clone()).await;
                 let after = dhat::HeapStats::get();
                 Ok::<_, lancelot::pyo3::PyErr>(
                     after.total_blocks.saturating_sub(before.total_blocks),

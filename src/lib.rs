@@ -70,7 +70,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_class::<crate::ffi::FnInfo>()?;
     m.add_class::<crate::ffi::Request>()?;
-    m.add_function(wrap_pyfunction!(crate::ffi::request::_test_make_request, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::ffi::request::_test_make_request,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(crate::serialize::_to_json, m)?)?;
     m.add_function(wrap_pyfunction!(crate::dispatch::_drive, m)?)?;
     m.add_function(wrap_pyfunction!(crate::stream::_drive_stream, m)?)?;

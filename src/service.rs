@@ -35,6 +35,14 @@ type RespBody = BoxBody<Bytes, std::io::Error>;
 /// remote memory-DoS). Matches the Python ASGI seam's _MAX_BODY (16 MiB).
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
+/// Max concurrent connections the accept loop will serve (domain-web skill:
+/// an unbounded `loop { accept; spawn }` is a DoS-amplification vector — a
+/// connection flood spawns unbounded tasks). A bounded Semaphore acquired
+/// BEFORE accept gives kernel-backlog backpressure (the OS buffers, then
+/// refuses SYNs) rather than buffering accepted-but-unserved connections in
+/// memory. Permit is held for the connection's lifetime, released on close.
+const MAX_CONNECTIONS: usize = 1024;
+
 pub struct App {
     pub router: Router,
     pub handlers: Vec<Py<PyAny>>, // slot -> handler
@@ -47,7 +55,11 @@ pub struct App {
 fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
     HResp::builder()
         .status(status)
-        .body(Full::new(Bytes::from_static(body)).map_err(|e| match e {}).boxed())
+        .body(
+            Full::new(Bytes::from_static(body))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
         .unwrap()
 }
 
@@ -113,8 +125,7 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     match dispatched {
         // R3: async-gen → chunked streaming body (no per-chunk thread/GIL).
         Dispatched::Stream(gen, content_type) => {
-            let body =
-                crate::stream::stream_body(app.locals.clone(), gen, app.shutdown.clone());
+            let body = crate::stream::stream_body(app.locals.clone(), gen, app.shutdown.clone());
             HResp::builder()
                 .status(StatusCode::OK)
                 .header("content-type", content_type)
@@ -146,47 +157,69 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
     let event_loop = app.locals.event_loop(py);
     let app = Arc::new(app);
 
+    // Bounded concurrent connections (domain-web). Acquire a permit BEFORE
+    // accepting → backpressure lands in the kernel listen backlog, not in an
+    // unbounded pile of spawned tasks.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
     let server = async move {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| PyOSError::new_err(e.to_string()))?;
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .map_err(|e| PyOSError::new_err(e.to_string()))?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| PyOSError::new_err(e.to_string()))?;
+        // Graceful-shutdown helper: drain in-flight R3 stream pumps before the
+        // event loop closes (audit #2), then signal the loop to stop.
+        macro_rules! graceful_break {
+            () => {{
+                app.shutdown.notify_waiters();
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                break;
+            }};
+        }
         loop {
-            tokio::select! {
-                _ = sigterm.recv() => {
-                    // Graceful: stop accepting, then tell in-flight R3 stream
-                    // pumps to stop pulling BEFORE the event loop closes
-                    // (audit #2 — otherwise a pump awaits a coroutine on a
-                    // closing loop). A brief drain lets them observe it.
-                    app.shutdown.notify_waiters();
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    break;
-                }
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted { Ok(v) => v, Err(_) => continue };
-                    let app = app.clone();
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(stream);
-                        let svc = hyper::service::service_fn(move |r| {
-                            let app = app.clone();
-                            async move {
-                                Ok::<_, std::convert::Infallible>(handle(app, r).await)
-                            }
-                        });
-                        // R6: slow-loris hardening — cap how long a client
-                        // can dribble request headers before the connection
-                        // is dropped (Granian/nginx-class default; closes
-                        // design/01:400-402, SYNTHESIS.md:102 — Blazeio
-                        // had no header deadline, Robyn's actix had it set
-                        // to 0 disabling the gate).
-                        let mut builder = AutoBuilder::new(TokioExecutor::new());
-                        builder.http1().timer(TokioTimer::new())
-                            .header_read_timeout(
-                                std::time::Duration::from_secs(15));
-                        let _ = builder.serve_connection(io, svc).await;
+            // Acquire a connection permit — but keep SIGTERM responsive even
+            // when saturated (don't block shutdown waiting for a free slot).
+            let permit = tokio::select! {
+                biased;
+                _ = sigterm.recv() => graceful_break!(),
+                p = conn_limit.clone().acquire_owned() => match p {
+                    Ok(p) => p,
+                    Err(_) => break, // semaphore closed
+                },
+            };
+            // Have a slot; accept — still abort promptly on SIGTERM.
+            let (stream, _) = tokio::select! {
+                biased;
+                _ = sigterm.recv() => { drop(permit); graceful_break!(); }
+                accepted = listener.accept() => match accepted {
+                    Ok(v) => v,
+                    Err(_) => continue, // permit drops here → slot freed
+                },
+            };
+            {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    // Permit held for the connection's whole lifetime;
+                    // released here on close → frees a slot for accept.
+                    let _permit = permit;
+                    let io = TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |r| {
+                        let app = app.clone();
+                        async move { Ok::<_, std::convert::Infallible>(handle(app, r).await) }
                     });
-                }
+                    // R6: slow-loris hardening — cap how long a client
+                    // can dribble request headers before the connection
+                    // is dropped (Granian/nginx-class default; closes
+                    // design/01:400-402, SYNTHESIS.md:102 — Blazeio
+                    // had no header deadline, Robyn's actix had it set
+                    // to 0 disabling the gate).
+                    let mut builder = AutoBuilder::new(TokioExecutor::new());
+                    builder
+                        .http1()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(std::time::Duration::from_secs(15));
+                    let _ = builder.serve_connection(io, svc).await;
+                });
             }
         }
         Ok(())

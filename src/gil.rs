@@ -14,6 +14,7 @@
 //! deprecates** `with_gil`/`allow_threads`, so we use `attach`/`detach` now —
 //! this matches the plan's stated "written 0.28-clean" intent and keeps the
 //! build warning-free (an M0 Definition-of-Done requirement).
+use pyo3::prelude::*;
 use pyo3::Python;
 
 /// Run `f` while holding the GIL. `f` is a synchronous `FnOnce`, so `.await`
@@ -29,4 +30,51 @@ pub fn with_gil<R>(f: impl for<'py> FnOnce(Python<'py>) -> R) -> R {
 #[inline]
 pub fn detach<R: Send>(py: Python<'_>, f: impl FnOnce() -> R + Send) -> R {
     py.detach(f)
+}
+
+/// RAII guard for a freshly-created asyncio event loop (m12-lifecycle skill:
+/// manual cleanup is the anti-pattern → use Drop). A loop owns a kqueue +
+/// self-pipe fd pair; forgetting `close()` leaks them. Holding the loop in
+/// this guard guarantees `close()` runs on EVERY scope exit — including an
+/// early `?` between loop-creation and the run — exactly once, under the GIL.
+///
+/// Per-call paths (`_drive`, `_drive_stream`) build a fresh loop each call, so
+/// the leak there accumulates; this guard closes it deterministically. (The
+/// server's loop is process-lifetime / TaskLocals-owned and closed once.)
+pub struct EventLoop {
+    // Option so Drop can `take()` the Py without moving out of &mut self (E0509).
+    obj: Option<pyo3::Py<pyo3::PyAny>>,
+}
+
+impl EventLoop {
+    /// Wrap an owned loop object (from `asyncio.new_event_loop()`).
+    pub fn new(obj: pyo3::Py<pyo3::PyAny>) -> Self {
+        Self { obj: Some(obj) }
+    }
+
+    /// Borrow the loop as an owned `Bound` for passing to
+    /// `run_until_complete` / `TaskLocals::new` (both want a Bound).
+    pub fn bind<'py>(&self, py: Python<'py>) -> pyo3::Bound<'py, pyo3::PyAny> {
+        // SAFETY of unwrap: `obj` is Some for the guard's whole lifetime;
+        // only Drop takes it, after which `bind` is never called.
+        self.obj
+            .as_ref()
+            .expect("event loop already taken")
+            .bind(py)
+            .clone()
+    }
+}
+
+impl Drop for EventLoop {
+    fn drop(&mut self) {
+        if let Some(lp) = self.obj.take() {
+            // Re-attach the GIL (reentrant — safe whether or not a caller
+            // token is live) to close the loop, then the Py ref drops here
+            // under the GIL. `close()` errors are ignored (idempotent /
+            // best-effort cleanup — the loop has already finished running).
+            with_gil(|py| {
+                let _ = lp.bind(py).call_method0("close");
+            });
+        }
+    }
 }

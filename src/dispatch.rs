@@ -128,7 +128,14 @@ pub fn _drive(
     // loop (audit #4 — the loop owns a kqueue + self-pipe fd pair).
     let handlers: Vec<Py<PyAny>> = (0..n).map(|_| fi.handler.clone_ref(py)).collect();
     let body = Bytes::copy_from_slice(body);
-    let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
+    // RAII: the loop is closed on EVERY exit path by the guard's Drop
+    // (m12-lifecycle) — no hand-rolled close-on-each-path.
+    let guard = crate::gil::EventLoop::new(
+        py.import("asyncio")?
+            .call_method0("new_event_loop")?
+            .unbind(),
+    );
+    let event_loop = guard.bind(py);
     let locals = TaskLocals::new(event_loop.clone()).copy_context(py)?;
 
     let driver = {
@@ -153,9 +160,9 @@ pub fn _drive(
                 match joined {
                     Ok(r) => out.push(r?),
                     Err(e) => {
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                            format!("dispatch task failed: {e}"),
-                        ))
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "dispatch task failed: {e}"
+                        )))
                     }
                 }
             }
@@ -165,10 +172,9 @@ pub fn _drive(
 
     // Runs the Python event loop AND the tokio runtime until `driver` resolves;
     // manages the GIL internally (released while the loop selects / tasks await).
-    // The loop is closed on EVERY exit path (audit #4): capture the run result,
-    // always close (best-effort, never strand fds), then propagate.
-    let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), driver);
-    let _ = event_loop.call_method0("close");
+    // `guard` closes the loop in Drop on every exit path — including the `run?`
+    // early-return below (audit #4 / m12-lifecycle).
+    let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop, driver);
     let (results, wall): (Vec<Vec<u8>>, f64) = run?;
 
     // Scope 3 (GIL): hand the serialized bytes back to Python.
