@@ -28,7 +28,9 @@ $HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings
 
 If any of these go red, the chunk does not ship. The conformance floor is `passes=974` (= 99.6% of 978).
 
-## Current milestone state (as of m2-conformance-push4)
+## Current milestone state (as of m3-batch-validated)
+
+**This session (2026-05-21/22) — honest validation + M4 scoping.** Benchmarked the claimed wins under real load (oha). Found the Rust server's true envelope (wins large-payload serialization + streaming; loses tiny one-shot to uvicorn+uvloop; anti-scales w/ threads → multiprocess) AND found+fixed TWO headline features that shipped BROKEN for their real use case: the R3 streaming pump (16-26× regression → re-architected to parity-to-1.3×) and `@app.batch` (timer-flush self-cancel → 500 on awaiting handlers → fixed, validated ~12×/~16×). Tags: `m3-bench-honest`, `m3-bench-characterize`, `m3-stream-rearch`, `m3-stream-shutdown`, `m3-batch-validated`. **M2-M3 are complete; the next milestone is M4 "Prove & Harden" — see `docs/plans/M4-PLAN-PROVE-AND-HARDEN.md`** (thesis: shipped + green unit tests ≠ works under load; validate-then-harden the rest before any new surface).
 
 - **M0** green (Rust core, hyper/tokio/pyo3)
 - **M1-EXIT** hit at 90.0% conformance, tag `m1-exit-90`
@@ -120,7 +122,8 @@ These are tempting; the research teardowns + the no-bullshit rule say not to bui
 
 ## Where to look for things
 
-- Plan + roadmap: `docs/plans/M2-M3-PLAN-FROM-RESEARCH.md`
+- Plan + roadmap: `docs/plans/M2-M3-PLAN-FROM-RESEARCH.md` (M2-M3, complete); `docs/plans/M4-PLAN-PROVE-AND-HARDEN.md` (M4, next — validate-under-load + harden)
+- Benchmarks: `benchmarks/` (`run_load.sh`, `characterize.sh`, `run_batch.sh`) + `benchmarks/README.md` (honest perf envelope)
 - Research distillations: `researchfms/{robyn,fastapi,blazeio,core,teardowns}/` (the `.git` inside this dir is OFF-LIMITS)
 - Conformance harness: `conformance/{classify.py,ratchet.py,runner.py,conftest.py}`
 - Floor: `conformance/parity_floor.txt` — passes=876
