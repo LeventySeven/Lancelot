@@ -38,7 +38,6 @@ use pyo3::types::{PyBytes, PyString};
 use pyo3_async_runtimes::TaskLocals;
 use std::io;
 use std::sync::OnceLock;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 
 /// Extract the wire bytes for one yielded chunk. `bytes`/`str` pass through
@@ -162,36 +161,36 @@ struct ChunkSink {
 #[pymethods]
 impl ChunkSink {
     /// Fast path: one yielded chunk → wire bytes → bounded `try_send`.
-    /// Returns True if sent, False if the channel is full (caller awaits
-    /// `await_capacity` then retries). A closed channel = client gone → True
-    /// (swallow; the drain ends naturally on the next loop check).
+    /// Returns True iff the chunk was sent. False means "not sent" for EITHER
+    /// reason (full OR closed); the caller then `await`s `await_capacity`, which
+    /// disambiguates (full → wait+retry; closed → stop). On Full the bytes are
+    /// dropped and recomputed on the retry with the same chunk (rare; no loss).
     fn try_push(&self, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
         let bytes = chunk_to_bytes(obj.py(), obj)?;
         match &self.tx {
-            Some(tx) => match tx.try_send(Ok(Frame::data(Bytes::from(bytes)))) {
-                Ok(()) => Ok(true),
-                Err(TrySendError::Full(_)) => Ok(false),
-                Err(TrySendError::Closed(_)) => Ok(true),
-            },
-            None => Ok(true),
+            Some(tx) => Ok(tx.try_send(Ok(Frame::data(Bytes::from(bytes)))).is_ok()),
+            None => Ok(false),
         }
     }
 
-    /// Event-driven backpressure wait (returns a Python awaitable). Reserves a
-    /// permit on the bounded channel — resolves immediately if there's capacity,
-    /// otherwise parks until the consumer drains an item. Drops the permit (used
-    /// only as a capacity signal; the retrying `try_push` does the real send).
-    /// GIL is NOT held across this await — it's a Rust future on the runtime.
+    /// Event-driven backpressure wait (returns a Python awaitable). `reserve()`
+    /// resolves immediately if there's capacity, parks until the consumer drains
+    /// otherwise; the permit is dropped (capacity signal only — the retrying
+    /// `try_push` does the real send). RESULT: True = capacity available, retry;
+    /// **False = channel closed (client disconnected) → the drain coro must
+    /// STOP** (this is the cancellation path — without it an infinite generator
+    /// would keep being driven after the client is gone). GIL is NOT held across
+    /// the await — it's a Rust future on the runtime.
     fn await_capacity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         pyo3_async_runtimes::tokio::future_into_py_with_locals(
             py,
             self.locals.clone(),
             async move {
-                if let Some(tx) = tx {
-                    let _ = tx.reserve().await;
-                }
-                Ok(())
+                Ok(match tx {
+                    Some(tx) => tx.reserve().await.is_ok(),
+                    None => false,
+                })
             },
         )
     }
@@ -242,7 +241,10 @@ async def _drain(gen, sink):
     try:
         async for chunk in gen:
             while not sink.try_push(chunk):
-                await sink.await_capacity()
+                # full -> await_capacity True (retry); client gone -> False (stop,
+                # leaving the generator suspended -> no runaway generation).
+                if not await sink.await_capacity():
+                    return
     except BaseException as e:
         try:
             sink.fail(repr(e))

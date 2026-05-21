@@ -143,6 +143,17 @@ def test_r3_streaming_backpressure_order_and_completeness(server):
     assert body == b"".join(f"{i}\n".encode() for i in range(5000))
 
 
+def test_r3_stream_disconnect_then_server_still_serves(server):
+    # Open a long stream, read ONE chunk, abandon it (client disconnect mid-
+    # stream). The drain coro must observe the closed channel via await_capacity
+    # and STOP (cancellation), not wedge a worker. Then a normal request must
+    # still succeed — liveness guard for the disconnect path.
+    with httpx.stream("GET", f"{server}/bulk") as r:
+        assert r.status_code == 200
+        next(r.iter_bytes())  # one chunk, then the `with` closes the connection
+    assert httpx.get(f"{server}/echo").status_code == 200
+
+
 def test_404_unknown_path(server):
     assert httpx.get(f"{server}/nope").status_code == 404
 
