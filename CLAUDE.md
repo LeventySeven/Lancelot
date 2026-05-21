@@ -24,9 +24,9 @@ make m1-conformance                                 # FastAPI byte-parity gate
 $HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings
 ```
 
-If any of these go red, the chunk does not ship. The conformance floor is `passes=971` (= 99.3% of 978).
+If any of these go red, the chunk does not ship. The conformance floor is `passes=974` (= 99.6% of 978).
 
-## Current milestone state (as of m2-conformance-push3)
+## Current milestone state (as of m2-conformance-push4)
 
 - **M0** green (Rust core, hyper/tokio/pyo3)
 - **M1-EXIT** hit at 90.0% conformance, tag `m1-exit-90`
@@ -36,6 +36,7 @@ If any of these go red, the chunk does not ship. The conformance floor is `passe
 - **M2 Tier-C5** — marquee `@app.batch` for prefix-aware request grouping, tag `m2-tierC5`
 - **M2 conformance push** — 876 → 910 Class-A passes (93.5%), tag `m2-conformance-push`. Unlocks: `@app.exception_handler` surface, `strict_content_type`, `Json[T]` Annotated preservation, lenient cookie parser, subclass-class-attr media_type, callable-instance + partial DI, single-Body scalar pattern, Starlette plaintext 500, Optional[list[T]] form wrapping.
 - **M2 conformance push 2** — 910 → 948 Class-A passes (97.4%), tag `m2-conformance-push2`. Unlocks: yield-dep swallowed-exception → FastAPIError, SecurityScopes chain propagation + per-scope cache_key, stream item validation, lru_cache/wraps unwrap in DI, 204/205/304/1xx no-body emit, Depends/Security hashable, include_router empty-path/self guards, TRACE method, list[Model]/dict[Model] response coercion, Starlette ASGI-callable response delegation (FileResponse/RedirectResponse), @app.on_event decorator, PEP 695 TypeAliasType unwrap, lax-mode explicit-CT enforcement, WS metaclass for Starlette cross-stack disconnect, WS query/cookie at handshake.
+- **M2 conformance push 4** — 971 → 974 Class-A passes (99.6%), tag `m2-conformance-push4`. Custom `APIRoute` extension: `Route.get_route_handler()` (opt-in; hot path untouched), `Router.route_class` / `APIRouter(route_class=...)`, `_BodyAccessor` (bytes-subclass that's also `await request.body()`-callable), single-Body-scalar error loc `["body"]`. **The 4 remaining failures are documented no-bullshit-boundary divergences — see "Conformance ceiling" below.**
 - **M2 conformance push 3** — 948 → 971 Class-A passes (99.3%), tag `m2-conformance-push3`. Unlocks: scope="function" / "request" yield-dep semantics with separate AsyncExitStacks (function-scope tears down BETWEEN handler-return and response-emit; request-scope after); scope-aware cache_key normalization; `FastAPI(dependencies=[...])` app-level deps; registration-time scope-incompatibility check (request-scope yield-dep can't depend on function-scope yield-dep); Response-in-return-annotation → FastAPIError; `PydanticV1NotSupportedError` for pydantic.v1 anywhere in route annotations; `Annotated[..., Path/Query(default=...)]` ambiguity assertions; multi-Param constraint merge (`Annotated[int, Query(gt=2), Query(lt=10)]`); absolute Location URLs on 307 redirect_slashes; middleware-receive HTTPException catch; `_wire_json` jsonable-encoder fallback (UUID, datetime, BaseModel, Decimal, Path, set, bytes — and asyncpg-style LYING UUID classes via str()); method-aware body inference (parameterized container on POST/PUT/PATCH is body, on GET stays query); fastapi.param_functions + fastapi.routing swap surfaces; ORJSONResponse / UJSONResponse pass-through.
 
 Public surface added this milestone:
@@ -57,6 +58,17 @@ Public surface added this milestone:
 - `Depends(dep, scope="function")` — yield-dep teardown runs BETWEEN handler-return and response-emit (vs default "request" = after the response body)
 - `FastAPI(dependencies=[Depends(...)])` — app-level deps prepended to every route
 - Magic-inject types: `Request`, `BackgroundTasks`, `WebSocket`, `Response`, `SecurityScopes`
+
+## Conformance ceiling (the 4 remaining Class-A failures @ 99.6%)
+
+These are left RED (not excluded/gamed). Each would require violating a cardinal rule to "fix":
+
+1. **`test_dependency_contextmanager::test_background_tasks`** — asserts a user `@app.middleware` sees global state BEFORE request-scope yield-dep teardown. FastAPI achieves this only via `BaseHTTPMiddleware`'s anyio task-group streaming (call_next returns while the inner app keeps running). Our middleware adapter is synchronous-capture; replicating the streaming model is a large risky refactor that endangers the 11 passing yield-dep tests. Not worth it for one assertion.
+2. **`test_dump_json_fast_path::test_explicit_response_class_uses_json_dumps`** — mocks `starlette.responses.json.dumps` and asserts it's called. We serialize via pydantic-core/`_native` (faster, no double-encode); we're arguably *more* correct. Matching the mock means coupling to a Starlette internal.
+3. **`test_tutorial/test_templates/test_tutorial001`** — vendored test does `shutil.copytree("./docs_src/...")` assuming cwd = the FastAPI repo root. Our harness runs from `conformance/`. Pure environmental; "fixing" = harness-gaming.
+4. **`test_tutorial/test_wsgi`** (collection error) — needs the optional `a2wsgi` package. Excluded under the pydantic-only runtime rule (Tier-D).
+
+If a future change makes any of these legitimately fixable (e.g. a real BaseHTTPMiddleware streaming impl lands for other reasons), revisit. Until then, the floor stays at 974 and these stay counted as failures.
 
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
 
