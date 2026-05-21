@@ -59,6 +59,21 @@ Public surface added this milestone:
 - `FastAPI(dependencies=[Depends(...)])` — app-level deps prepended to every route
 - Magic-inject types: `Request`, `BackgroundTasks`, `WebSocket`, `Response`, `SecurityScopes`
 
+## M3 — Rust hot-path swaps (COMPLETE)
+
+All 7 R-swaps from `docs/plans/2026-05-20-...:R-swaps` are landed. Each gated by criterion bench + `clippy -D warnings` + unsafe-checker skill audit + a verification agent (the plan's per-swap discipline):
+- **R1** const-tier routing — shipped (Python-side router).
+- **R2** lazy request proxy — `m3-r2`. The M0 dispatch HARDCODED `Request("POST","/echo")`; now threads real method/path/query/headers (lazy, OnceLock-cached getters). `src/ffi/request.rs`, `src/dispatch.rs` (`ReqParts`).
+- **R3** streaming pump — `m3-r3`. `src/stream.rs`: async-gen → bounded-mpsc → hyper `StreamBody`; GIL dropped across each `__anext__` await; backpressure + cancellation + shutdown-aware. `_drive_stream` in-process test helper.
+- **R4** single-pass `validate_json` — via pydantic-core (`Request.json` uses `from_json`).
+- **R5** Rust serialize — via pydantic-core (`serialize::_to_json`; R3 JSON-lines).
+- **R6** `header_read_timeout` + body cap — shipped + audit-hardened.
+- **R7** `catch_unwind` FFI panic safety — shipped; extended to the R3 pull task.
+
+**Rust-core audit (2 deep-review agents + unsafe-checker skill) fixed real bugs:** CRITICAL unbounded-body memory-DoS on the `run()` path (→ 16 MiB `Limited` → 413); router `.expect()` panic on duplicate/malformed routes (→ `PyValueError` at startup); `_drive` event-loop fd leak; slot-bounds panic outside `catch_unwind`; stream-pump shutdown leak; latin-1 header decode. **GIL-across-await invariant verified CLEAN** in all new code. The only `unsafe` is the `libc::setsockopt` in `socket.rs` (TCP_QUICKACK/FASTOPEN, SAFETY-commented). Rust bench: `cargo bench --bench router_bench` (static route ~12ns, param ~22ns).
+
+Rust gate (run alongside the Python gate): `$HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings` + `cargo test --release --lib`. Wheel rebuild after Rust changes: `PATH="$HOME/.cargo/bin:$PATH" .venv/bin/maturin develop --release`.
+
 ## Conformance ceiling (the 4 remaining Class-A failures @ 99.6%)
 
 These are left RED (not excluded/gamed). Each would require violating a cardinal rule to "fix":
