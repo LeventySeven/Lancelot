@@ -74,9 +74,19 @@ class _BatchGroup:
         async with self.lock:
             batch = self.pending
             self.pending = []
-            if self.timer_task is not None and not self.timer_task.done():
-                self.timer_task.cancel()
+            timer = self.timer_task
             self.timer_task = None
+        # Cancel a still-pending timer ONLY when flushing from a different task
+        # (the max_batch / flush_now path) — never the timer's OWN task. The
+        # timer-window flush runs INSIDE `_wait_then_flush`; cancelling
+        # `self.timer_task` there cancels the current task, and the
+        # CancelledError lands on the next `await` (the user handler in
+        # `_run_batch`), poisoning the whole batch with CancelledError. A
+        # max_batch flush that drains first leaves the pending timer to fire on
+        # an empty `pending` (→ early return), so cancelling it is just cleanup,
+        # not correctness — and must be skipped for self.
+        if timer is not None and not timer.done() and timer is not asyncio.current_task():
+            timer.cancel()
         if not batch:
             return
         await self._run_batch(batch)

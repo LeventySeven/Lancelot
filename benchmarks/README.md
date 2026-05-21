@@ -127,6 +127,32 @@ depth is the knob: 16 → 2.4k, 64 → 4.9k, 256 → 6.9k (knee), beyond 256 pla
   cap, `header_read_timeout` (slow-loris), http1-only, graceful drain — all in
   `tests/test_m3_http_integration.py`, orthogonal to throughput.
 
+## `@app.batch` (C5 marquee) effectiveness — `./run_batch.sh`
+
+Does prefix-aware request grouping actually coalesce concurrent same-key requests
+into fewer upstream calls, and does it win when the upstream is the bottleneck?
+Model: a simulated upstream LLM with a shared **concurrency cap** (the realistic
+constraint — providers rate-limit concurrent calls and bill per call). Both the
+batched route and the per-request `/solo` baseline hit the SAME capped upstream.
+
+Upstream cap=8, 50 ms/call, window=50 ms, max_batch=16, c=200:
+
+| route | req/s | upstream calls | coalescing (items/call) |
+|---|---:|---:|---:|
+| `/solo` (one call per request) | 179 | 1432 | 1.0 |
+| `/batch` (`@app.batch`) | **2,165** | 1084 (for 17,320 items) | **15.98** |
+
+**~12× throughput and ~16× fewer upstream calls** against a rate-limited backend
+— the coalescing ratio sits right at `max_batch`, i.e. batches fill nearly every
+time under load. For a per-call-billed LLM API this is a direct ~16× cost cut on
+the batched path. The win is real whenever the upstream (not the framework) is
+the bottleneck; with an unbounded/free upstream the two converge.
+
+> This benchmark also EXPOSED a critical bug: the timer-window flush cancelled
+> its own task, poisoning any **awaiting** batch handler (the real use case) with
+> `CancelledError` → 500. The existing tests used non-awaiting handlers and
+> missed it. Fixed (`lancelot/batch.py`) + regression-tested before these numbers.
+
 ## Caveats — read before quoting any number
 
 1. **Loopback only**, no real network RTT/TLS/NIC. Compresses relative gaps.

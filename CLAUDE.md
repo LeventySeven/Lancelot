@@ -100,6 +100,8 @@ If a future change makes any of these legitimately fixable (e.g. a real BaseHTTP
 
 Run it: `./benchmarks/run_load.sh` (4-variant, 2 shapes) + `./benchmarks/characterize.sh` (crossover + streaming sweeps); raw dumps in `benchmarks/results/`.
 
+**`@app.batch` (C5 marquee) — validated + a CRITICAL bug fixed (`./benchmarks/run_batch.sh`).** Against a rate-limited upstream (cap 8, 50ms/call, c=200): batched 2,165 rps vs solo 179 (~12×), coalescing ratio 15.98 (≈ max_batch) — ~16× fewer upstream calls. The effectiveness bench EXPOSED that the timer-window flush cancelled its OWN task (`_flush` → `self.timer_task.cancel()` while running inside it), poisoning any **awaiting** batch handler (the real use case) with CancelledError → 500. Existing tests used non-awaiting handlers and missed it. Fixed in `lancelot/batch.py` (skip cancel when `timer is asyncio.current_task()`); regression test `test_c5_awaiting_handler_on_timer_flush_succeeds`.
+
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
 
 These are tempting; the research teardowns + the no-bullshit rule say not to build them. If a future agent (or human) is about to spend cycles on one of these, **stop and check this list first.**

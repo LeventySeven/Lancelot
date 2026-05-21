@@ -76,6 +76,28 @@ def test_c5_window_coalesces_concurrent_requests_into_one_call():
     assert len(calls) < 3, f"no coalescing: {len(calls)} calls for 3 requests"
 
 
+def test_c5_awaiting_handler_on_timer_flush_succeeds():
+    """REGRESSION (effectiveness bench finding): a batch handler that AWAITS
+    (the REAL use case — one upstream LLM call) and is flushed by the TIMER
+    WINDOW (not max_batch) must succeed. The timer-triggered `_flush` ran inside
+    the timer task and cancelled `self.timer_task` — i.e. itself — so the
+    cancellation propagated into the awaiting handler and fanned out to every
+    waiter as CancelledError (500). Handlers with no `await` (like the other
+    tests here) never hit it, which is why it shipped. Pin the awaiting path."""
+    app = lancelot.App()
+
+    @app.batch("/b", batch_window_ms=40, max_batch=100)
+    async def b(items: list[_Q]) -> list[dict]:
+        await asyncio.sleep(0.01)  # a real upstream await — the whole point
+        return [{"echo": it.text} for it in items]
+
+    with TestClient(app) as c:
+        r = c.post("/b", json={"text": "solo"})
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"echo": "solo"}
+
+
 # ---------- max_batch immediate flush ----------------------------------
 
 def test_c5_max_batch_flushes_immediately_without_waiting_window():
