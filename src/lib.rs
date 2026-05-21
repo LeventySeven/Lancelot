@@ -34,7 +34,11 @@ fn run(
     let mut router = crate::router::Router::new();
     let mut handlers = Vec::with_capacity(routes.len());
     for (i, (method, path, h)) in routes.into_iter().enumerate() {
-        router.add(&method, &path, i);
+        // Propagate a duplicate/malformed-route error as a clean Python
+        // ValueError at startup instead of panicking across the FFI seam.
+        router
+            .add(&method, &path, i)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         handlers.push(h);
     }
     crate::service::serve(

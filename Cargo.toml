@@ -41,6 +41,11 @@ libc = "0.2"
 
 [dev-dependencies]
 trybuild = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "router_bench"
+harness = false
 
 [features]
 dhat-heap = ["dep:dhat"]

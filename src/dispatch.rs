@@ -22,17 +22,40 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3_async_runtimes::TaskLocals;
 
-/// Per-request choreography. `handler`/`body` are `Send` Rust-owned values;
+/// The Send, Rust-owned slice of a request that crosses the `.await` boundary
+/// (M3-R2). All owned values (String / Vec / Bytes) — no GIL-bound token, no
+/// borrow of the hyper request — so the dispatch future stays `Send` and
+/// nothing pins the GIL across the handler await.
+pub struct ReqParts {
+    pub method: String,
+    pub path: String,
+    pub query_string: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+/// Per-request choreography. `handler`/`parts` are `Send` Rust-owned values;
 /// nothing GIL-bound (`Python`/`Bound`) crosses the `.await`.
 pub async fn call_async(
     locals: TaskLocals,
     handler: Py<PyAny>,
-    body: Bytes,
+    parts: ReqParts,
 ) -> PyResult<Vec<u8>> {
     // Scope 1: build the coroutine and bridge it to a Rust future. The bridge
     // (`call_soon_threadsafe`) is synchronous — no `.await` in this GIL scope.
+    // R2: the REAL method/path/query/headers are moved into the Request here
+    // (was hardcoded "POST"/"/echo" in M0).
     let fut = crate::gil::with_gil(|py| -> PyResult<_> {
-        let req = Bound::new(py, Request::new("POST".into(), "/echo".into(), body))?;
+        let req = Bound::new(
+            py,
+            Request::new(
+                parts.method,
+                parts.path,
+                parts.query_string,
+                parts.headers,
+                parts.body,
+            ),
+        )?;
         let coro = handler.bind(py).call1((req,))?;
         pyo3_async_runtimes::into_future_with_locals(&locals, coro)
     })?;
@@ -55,11 +78,13 @@ pub fn _drive(
     body: &[u8],
     n: usize,
 ) -> PyResult<(Vec<Py<PyBytes>>, f64)> {
-    // Scope 1 (GIL held via the inbound `py`): loop, task-locals, handler clones.
-    let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
-    let locals = TaskLocals::new(event_loop.clone()).copy_context(py)?;
+    // Scope 1 (GIL held via the inbound `py`): handler clones + task-locals.
+    // Build the loop LAST so a setup failure above can't strand an unclosed
+    // loop (audit #4 — the loop owns a kqueue + self-pipe fd pair).
     let handlers: Vec<Py<PyAny>> = (0..n).map(|_| fi.handler.clone_ref(py)).collect();
     let body = Bytes::copy_from_slice(body);
+    let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
+    let locals = TaskLocals::new(event_loop.clone()).copy_context(py)?;
 
     let driver = {
         let locals = locals.clone();
@@ -67,11 +92,27 @@ pub fn _drive(
             let t0 = std::time::Instant::now();
             let mut set = tokio::task::JoinSet::new();
             for h in handlers {
-                set.spawn(call_async(locals.clone(), h, body.clone()));
+                let parts = ReqParts {
+                    method: "POST".into(),
+                    path: "/echo".into(),
+                    query_string: String::new(),
+                    headers: Vec::new(),
+                    body: body.clone(),
+                };
+                set.spawn(call_async(locals.clone(), h, parts));
             }
             let mut out: Vec<Vec<u8>> = Vec::with_capacity(set.len());
             while let Some(joined) = set.join_next().await {
-                out.push(joined.expect("dispatch task panicked")?);
+                // A panicked dispatch task maps to a PyErr (audit #6) instead
+                // of `.expect()` aborting the whole JoinSet.
+                match joined {
+                    Ok(r) => out.push(r?),
+                    Err(e) => {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            format!("dispatch task failed: {e}"),
+                        ))
+                    }
+                }
             }
             Ok::<_, PyErr>((out, t0.elapsed().as_secs_f64()))
         }
@@ -79,10 +120,10 @@ pub fn _drive(
 
     // Runs the Python event loop AND the tokio runtime until `driver` resolves;
     // manages the GIL internally (released while the loop selects / tasks await).
-    // Clone for the call (it consumes the loop); keep the handle to close it
-    // afterwards — an unclosed loop leaks a kqueue + self-pipe fd pair per call.
+    // The loop is closed on EVERY exit path (audit #4): capture the run result,
+    // always close (best-effort, never strand fds), then propagate.
     let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), driver);
-    event_loop.call_method0("close")?;
+    let _ = event_loop.call_method0("close");
     let (results, wall): (Vec<Vec<u8>>, f64) = run?;
 
     // Scope 3 (GIL): hand the serialized bytes back to Python.

@@ -12,10 +12,10 @@
 //! call spins the asyncio loop AND the tokio runtime together. `call_async` is
 //! the 3-arg `(TaskLocals, Py<PyAny>, Bytes)` form from Task 8. Handler errors
 //! map to 500 (no `.expect`/panic across the FFI seam).
-use crate::dispatch::call_async;
+use crate::dispatch::{call_async, ReqParts};
 use crate::router::Router;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, Request as HReq, Response as HResp, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
@@ -23,6 +23,11 @@ use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use std::sync::Arc;
+
+/// Max request body the production path will buffer before returning 413
+/// (audit CRITICAL #1 — the M0 path collected unbounded bodies, a trivial
+/// remote memory-DoS). Matches the Python ASGI seam's _MAX_BODY (16 MiB).
+const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub struct App {
     pub router: Router,
@@ -40,15 +45,43 @@ fn plain(status: StatusCode, body: &'static [u8]) -> HResp<Full<Bytes>> {
 async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
+    // R2: capture the REAL query string + headers (was dropped in M0).
+    let query_string = req.uri().query().unwrap_or("").to_string();
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_ascii_lowercase(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
     let slot = match app.router.route(&method, &path) {
         Some(s) => s,
         None => return plain(StatusCode::NOT_FOUND, b"not found"),
     };
-    let body = match req.into_body().collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => Bytes::new(),
+    // Audit #5: bounds-checked slot lookup (router/handlers desync would
+    // otherwise panic OUTSIDE catch_unwind). Should be unreachable given the
+    // 1:1 build in lib.rs, but enforce rather than assume.
+    let handler = match app.handlers.get(slot) {
+        Some(h) => crate::gil::with_gil(|py| h.clone_ref(py)),
+        None => return plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
     };
-    let handler = crate::gil::with_gil(|py| app.handlers[slot].clone_ref(py));
+    // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
+    // allocation per connection (remote memory-DoS). A truncated/aborted
+    // body is a 400, NOT a silent empty-body 200.
+    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, b"request entity too large"),
+    };
+    let parts = ReqParts {
+        method,
+        path,
+        query_string,
+        headers,
+        body,
+    };
     // R7: catch_unwind at the FFI seam — any panic in the dispatch
     // future (Python code, pyo3 conversions, anywhere) becomes a 500
     // INSTEAD of killing the worker. Closes the documented Robyn defect
@@ -57,7 +90,7 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<Full<Bytes>> {
     // this is actionable.
     use futures::FutureExt;
     let dispatched = std::panic::AssertUnwindSafe(
-        call_async(app.locals.clone(), handler, body)
+        call_async(app.locals.clone(), handler, parts)
     ).catch_unwind().await;
     match dispatched {
         Ok(Ok(json)) => HResp::builder()
