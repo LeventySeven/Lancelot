@@ -89,6 +89,11 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         .collect();
     let slot = match app.router.route(&method, &path) {
         Some(s) => s,
+        // 405 if the path exists under another method; 404 otherwise
+        // (HTTP semantics / FastAPI parity — domain-web).
+        None if app.router.matches_any_method(&path) => {
+            return plain(StatusCode::METHOD_NOT_ALLOWED, b"method not allowed")
+        }
         None => return plain(StatusCode::NOT_FOUND, b"not found"),
     };
     // Audit #5: bounds-checked slot lookup (router/handlers desync would

@@ -30,6 +30,13 @@ impl Router {
         let m = self.by_method.get(method)?;
         m.at(path).ok().map(|hit| *hit.value)
     }
+
+    /// True if `path` matches a route under ANY method — lets the seam emit
+    /// 405 Method Not Allowed (path exists, wrong method) vs 404 (no such
+    /// path), matching HTTP semantics / FastAPI (domain-web).
+    pub fn matches_any_method(&self, path: &str) -> bool {
+        self.by_method.values().any(|m| m.at(path).is_ok())
+    }
 }
 
 #[cfg(test)]
@@ -52,5 +59,15 @@ mod tests {
         r.add("GET", "/x", 0).unwrap();
         // Same path twice → matchit Conflict → clean Err (no panic).
         assert!(r.add("GET", "/x", 1).is_err());
+    }
+
+    #[test]
+    fn wrong_method_is_405_not_404() {
+        let mut r = Router::new();
+        r.add("GET", "/echo", 0).unwrap();
+        // DELETE /echo: no GET-match, but the path exists → 405 candidate.
+        assert_eq!(r.route("DELETE", "/echo"), None);
+        assert!(r.matches_any_method("/echo")); // → seam emits 405
+        assert!(!r.matches_any_method("/nope")); // → seam emits 404
     }
 }
