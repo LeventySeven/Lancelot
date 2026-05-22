@@ -8,15 +8,27 @@ A backend framework like FastAPI / Robyn that optimizes **HTTP transport / seria
 
 **AI logic stays on the user side** — LangGraph, agent loops, vector stores, prompt orchestration. We own the byte path; the user owns the agent. This is the user's restated rule; every "should we build X" decision flows from it.
 
-**Honest perf envelope (do not oversell — see "Rust server perf envelope" below).** The Rust core's substantiated throughput wins are **large-payload (>~4 KB) one-shot serialization** and **streaming** (after the R3 re-architecture — now parity-to-1.3× over Starlette); its other value is **resilience** (body/conn caps, slow-loris, drain). A fair benchmark (2026-05-21) shows uvicorn+uvloop still *beats* our Rust server on tiny one-shot responses (per-request FFI/bridge overhead). Lead with large-payload serialization + streaming + resilience, never a blanket "faster server".
+## Core goals (the byte-path mission — what we optimize, and the proven wins)
+
+We own the **byte path** (transport / serialization / streaming / resilience) for AI/cloud/web/startups; the user owns the agent. Concretely, lead with these *validated* wins:
+
+- **Const tier** — fixed responses (health probes, static/cached) served prebaked from Rust, zero-GIL: ~183k req/s, **~2.8× uvicorn+uvloop** (`const_routes`).
+- **Large-payload serialization** — pydantic-core `to_json` beats Python `json.dumps`: **~2.3× at 69 KB** (crossover ~1–4 KB).
+- **Streaming for AI** — re-architected R3 pump (parity-to-1.3× vs Starlette), bounded backpressure, graceful drain, client-disconnect → upstream cancellation (C2). The marquee.
+- **`@app.batch`** — prefix-aware request coalescing: **~12× throughput / ~16× fewer upstream calls** vs a rate-limited LLM backend. No analogue in FastAPI/Robyn/Blazeio.
+- **Cloud resilience** — body cap, connection cap, slow-loris, per-route timeout, graceful drain, RED metrics, request-id, /livez+/readyz — all validated under adversarial load.
+- **FastAPI byte-parity** — 974/978 = 99.6% conformance.
+
+**Honest perf envelope (do not oversell).** uvicorn+uvloop still *beats* our Rust server on tiny *handler* one-shot responses (per-request FFI/asyncio-bridge overhead) — which is why the **const tier** exists for the fixed-response case. Never claim a blanket "faster server"; lead with the wins above.
 
 ## Cardinal rules
 
-1. **No bullshit, no useless logic.** Every change must change the byte path or the operator experience. If it doesn't, it shouldn't ship.
-2. **Runtime dep = `pydantic>=2.7` only.** Everything else is lazy-imported or test-only. Never let `import lancelot` pull `httpx`, `opentelemetry`, `python_multipart`, etc.
-3. **Vendored FastAPI tests are SACRED.** `conformance/vendor/fastapi/` is sha256-verified against the FastAPI 0.136.1 sdist. NEVER edit those test files. The "swap" in `conformance/conftest.py` is the only legal indirection.
-4. **`researchfms/.git` is OFF-LIMITS.** That's a separate nested repo. Always use `git -C "$LC"` so the cwd hazard never bites.
-5. **Don't tag with a red gate.** Conformance ratchet + clippy + internal tests all green before a tag is pushed.
+1. **No bullshit, no useless logic.** Every change must change the byte path or the operator experience. If it doesn't, it shouldn't ship. Corollary: before building, check it isn't already provided (e.g. compression = Starlette `GZipMiddleware` + the proxy) or a non-bottleneck (e.g. `@app.stream` per-chunk perf — LLM streaming is upstream-rate-limited).
+2. **Validate under REAL load, not just unit tests.** Shipped + green unit tests ≠ works under load — this milestone found **FOUR** headline features broken for their real use case (R3 streaming pump, `@app.batch` self-cancel, graceful drain, C2 cancellation), every one green on in-process `TestClient` tests. Any transport/streaming/resilience feature gets a real-server (subprocess + HTTP) adversarial/load test that exercises the path the bug would live on (the *awaiting* handler, the *flooded* cap, the *disconnecting* client).
+3. **Runtime dep = `pydantic>=2.7` only.** Everything else is lazy-imported or test-only. Never let `import lancelot` pull `httpx`, `opentelemetry`, `python_multipart`, etc. (Rust-side deps are fine — they're not Python runtime imports.)
+4. **Vendored FastAPI tests are SACRED.** `conformance/vendor/fastapi/` is sha256-verified against the FastAPI 0.136.1 sdist. NEVER edit those test files. The "swap" in `conformance/conftest.py` is the only legal indirection.
+5. **`researchfms/.git` is OFF-LIMITS.** That's a separate nested repo. Always use `git -C "$LC"` so the cwd hazard never bites.
+6. **Don't tag with a red gate.** Conformance ratchet + clippy + fmt + internal tests all green before a tag is pushed.
 
 ## After every chunk
 
