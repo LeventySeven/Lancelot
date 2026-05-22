@@ -70,9 +70,16 @@ at full machine. Two reasons, both real and architectural:
 | 10 processes × 1 thread (`SO_REUSEPORT`) | 42,454 |
 | `uvicorn-starlette --workers 10` (for scale) | 145,668 |
 
-The Rust server's *best* config is multiprocess (1 thread each, `SO_REUSEPORT`) —
-the 1-process-many-threads model is strictly worse. Even so, on trivial echo it
-tops out ~42k vs uvicorn's ~146k.
+The 1-process-many-threads model is strictly worse (GIL contention). **macOS
+caveat (important):** these runs are on macOS, where `SO_REUSEPORT` does NOT
+load-balance — all connections hit ONE of the 10 processes (verified:
+`tests/test_m4_deploy.py`). So the "10 processes" row is effectively a
+single-process measurement (≈ the 44.8k per-core number) and is a **no-distribution
+FLOOR, not the Linux ceiling.** On Linux, `SO_REUSEPORT` distributes across the N
+processes and the Rust server scales with cores (like uvicorn's `--workers`,
+which distributes on macOS too because it uses `fork`+shared-fd `accept`, not
+`SO_REUSEPORT`). Don't read the macOS multiprocess number as a Linux scaling
+limit. See `docs/deploy.md`.
 
 ### Crossover sweep — /echo, growing payload (per-core, `./characterize.sh`)
 
