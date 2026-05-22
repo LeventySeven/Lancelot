@@ -43,7 +43,10 @@ The repositioned pitch (locked in CLAUDE.md): **transport/serialization/streamin
 | V1.4 | Graceful drain under in-flight streams + requests: SIGTERM mid-load → in-flight finish (or bounded-timeout), user generator `finally` runs, no dropped/corrupted bodies. | Partially done this session (stream `finally` verified); extend to mixed load. | Load + SIGTERM; assert clean completion + cleanup. |
 | V1.5 | Per-route `timeout=` (B5): handler past deadline → 504, yield-dep teardown runs, slot freed. Validate under concurrency. | Differentiator; correctness-tested only. | Concurrent slow handlers; assert 504s + no leak. |
 
-### Tier-V2 — AI primitives under load (the part that justifies the pitch)
+### Tier-V2 — AI primitives under load (the part that justifies the pitch) — ✅ COMPLETE (tag `m4-v2-complete`)
+
+> Status (2026-05-22): `tests/test_m4_ai_load.py` + `test_m4_canonical.py`. V2.1 (@app.batch multi-key fairness + max_keys cap) held; V2.3 (C1 `dumps_canonical` determinism — order-invariant property over 200 random structures, NaN-reject, cost <3× plain) held. **V2.2 (TransportPool cancellation) was BROKEN** — on a real client disconnect the in-flight upstream call ran to completion (the C2 "stop paying for unwatched tokens" claim never fired; nothing polled `receive()` for `http.disconnect` during the handler — the 4th feature broken under load). FIXED: a disconnect-watcher in the `@app.stream` branch sets `_cancel_event` → `_await_cancellable` cancels the upstream. Scope: streaming path (the real LLM shape); plain handlers still run to completion on disconnect (ASGI/FastAPI parity).
+
 
 | # | Item | Why | Done = |
 |---|------|-----|--------|
