@@ -144,11 +144,13 @@ fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
         .unwrap()
 }
 
-fn json_ok(body: Vec<u8>) -> HResp<RespBody> {
+fn json_ok(body: Bytes) -> HResp<RespBody> {
     HResp::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        // `body` is already `Bytes` (pydantic-core output copied once in
+        // serialize.rs) — no second Vec→Bytes alloc here.
+        .body(Full::new(body).map_err(|e| match e {}).boxed())
         .unwrap()
 }
 

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyBytes;
@@ -30,19 +31,21 @@ fn to_json_fn(py: Python<'_>) -> Option<Py<PyAny>> {
 /// One-pass typed serialization: delegate to pydantic_core.to_json (Rust core,
 /// bytes out, no intermediate dict, no second json.dumps). Falls back to stdlib
 /// json only if pydantic_core is unavailable.
-pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     if let Some(f) = to_json_fn(py) {
-        let out = f.bind(py).call1((value,))?; // -> bytes
-                                               // pyo3 0.27.2 deprecates downcast in favour of Bound::cast.
-        return Ok(out.cast::<PyBytes>()?.as_bytes().to_vec());
+        let out = f.bind(py).call1((value,))?; // -> bytes (cast, not deprecated downcast)
+                                               // Copy straight into `Bytes` — kills the second
+                                               // Vec→Bytes alloc the response/stream path did (perf:
+                                               // one fewer alloc + memcpy per response/chunk).
+        return Ok(Bytes::copy_from_slice(out.cast::<PyBytes>()?.as_bytes()));
     }
     let json = py.import("json")?;
     let s: String = json.call_method1("dumps", (value,))?.extract()?;
-    Ok(s.into_bytes())
+    Ok(Bytes::from(s.into_bytes()))
 }
 
 #[pyfunction]
 pub fn _to_json<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Py<PyBytes>> {
-    let bytes = to_json_bytes(py, &value)?;
+    let bytes = to_json_bytes(py, &value)?; // Bytes derefs to &[u8] for PyBytes::new
     Ok(PyBytes::new(py, &bytes).unbind())
 }

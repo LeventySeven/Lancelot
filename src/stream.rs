@@ -45,26 +45,30 @@ use tokio::sync::mpsc::Sender;
 /// uses its render(); everything else is serialized via the pydantic-core
 /// JSON seam + a trailing newline (JSON-lines, matching the ASGI seam's
 /// `application/jsonl` auto-wrap).
-fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Bytes> {
+    // Build `Bytes` directly (no Vec→Bytes second copy): the common bytes/str
+    // token-stream chunks copy once; the channel send takes the `Bytes` as-is.
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(b.as_bytes().to_vec());
+        return Ok(Bytes::copy_from_slice(b.as_bytes()));
     }
     if let Ok(s) = obj.cast::<PyString>() {
-        return Ok(s.to_str()?.as_bytes().to_vec());
+        return Ok(Bytes::copy_from_slice(s.to_str()?.as_bytes()));
     }
     if obj.hasattr("render")? {
         let r = obj.call_method0("render")?;
         if let Ok(b) = r.cast::<PyBytes>() {
-            return Ok(b.as_bytes().to_vec());
+            return Ok(Bytes::copy_from_slice(b.as_bytes()));
         }
         if let Ok(s) = r.cast::<PyString>() {
-            return Ok(s.to_str()?.as_bytes().to_vec());
+            return Ok(Bytes::copy_from_slice(s.to_str()?.as_bytes()));
         }
     }
     // Fallback: JSON-encode the object + newline (JSON-lines).
-    let mut v = crate::serialize::to_json_bytes(py, obj)?;
-    v.push(b'\n');
-    Ok(v)
+    let json = crate::serialize::to_json_bytes(py, obj)?;
+    let mut buf = bytes::BytesMut::with_capacity(json.len() + 1);
+    buf.extend_from_slice(&json);
+    buf.extend_from_slice(b"\n");
+    Ok(buf.freeze())
 }
 
 /// Obtain the async-iterator from a handler result. A handler may return the
@@ -116,7 +120,7 @@ pub fn stream_media_type(obj: &Bound<'_, PyAny>) -> String {
 /// sync), drop the GIL across `.await`, then extract bytes (GIL held, sync).
 /// Returns Ok(Some(bytes)) for a chunk, Ok(None) on StopAsyncIteration (clean
 /// end), Err for any other Python exception.
-async fn next_chunk(locals: &TaskLocals, gen: &Py<PyAny>) -> PyResult<Option<Vec<u8>>> {
+async fn next_chunk(locals: &TaskLocals, gen: &Py<PyAny>) -> PyResult<Option<Bytes>> {
     // Scope 1 (GIL, sync — no .await): bridge the coroutine.
     let fut = crate::gil::with_gil(|py| -> PyResult<_> {
         let coro = gen.bind(py).call_method0("__anext__")?;
@@ -168,7 +172,7 @@ impl ChunkSink {
     fn try_push(&self, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
         let bytes = chunk_to_bytes(obj.py(), obj)?;
         match &self.tx {
-            Some(tx) => Ok(tx.try_send(Ok(Frame::data(Bytes::from(bytes)))).is_ok()),
+            Some(tx) => Ok(tx.try_send(Ok(Frame::data(bytes))).is_ok()),
             None => Ok(false),
         }
     }
@@ -339,7 +343,7 @@ pub fn _drive_stream(
                     )
                 })
             })?;
-            let mut out: Vec<Vec<u8>> = Vec::new();
+            let mut out: Vec<Bytes> = Vec::new();
             while let Some(b) = next_chunk(&locals, &gen).await? {
                 out.push(b);
             }

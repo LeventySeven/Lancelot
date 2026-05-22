@@ -40,7 +40,7 @@ pub async fn call_async(
     locals: TaskLocals,
     handler: Py<PyAny>,
     parts: ReqParts,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<Bytes> {
     // Scope 1: build the coroutine and bridge it to a Rust future. The bridge
     // (`call_soon_threadsafe`) is synchronous — no `.await` in this GIL scope.
     // R2: the REAL method/path/query/headers are moved into the Request here
@@ -107,7 +107,7 @@ pub fn build_result(
 }
 
 /// Drop the GIL across the awaitable, then serialize the result (Scope 3).
-pub async fn await_and_serialize(fut: ResultFuture) -> PyResult<Vec<u8>> {
+pub async fn await_and_serialize(fut: ResultFuture) -> PyResult<Bytes> {
     let result: Py<PyAny> = fut.await?;
     crate::gil::with_gil(|py| to_json_bytes(py, result.bind(py)))
 }
@@ -153,7 +153,7 @@ pub fn _drive(
                 };
                 set.spawn(call_async(locals.clone(), h, parts));
             }
-            let mut out: Vec<Vec<u8>> = Vec::with_capacity(set.len());
+            let mut out: Vec<Bytes> = Vec::with_capacity(set.len());
             while let Some(joined) = set.join_next().await {
                 // A panicked dispatch task maps to a PyErr (audit #6) instead
                 // of `.expect()` aborting the whole JoinSet.
@@ -175,7 +175,7 @@ pub fn _drive(
     // `guard` closes the loop in Drop on every exit path — including the `run?`
     // early-return below (audit #4 / m12-lifecycle).
     let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop, driver);
-    let (results, wall): (Vec<Vec<u8>>, f64) = run?;
+    let (results, wall): (Vec<Bytes>, f64) = run?;
 
     // Scope 3 (GIL): hand the serialized bytes back to Python.
     let py_results = results
