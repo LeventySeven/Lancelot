@@ -42,6 +42,22 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 /// memory. Permit is held for the connection's lifetime, released on close.
 const MAX_CONNECTIONS: usize = 1024;
 
+/// Slow-loris header-read deadline (R6). How long a client may take to send the
+/// complete request head before the connection is dropped. Default 15 s
+/// (Granian/nginx-class); tunable via `LANCELOT_HEADER_TIMEOUT_MS` (clamped
+/// [100 ms, 600 s]) — a real operator knob AND what lets the slow-loris test
+/// run in ~1 s instead of 15.
+fn header_timeout_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("LANCELOT_HEADER_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|n| n.clamp(100, 600_000))
+            .unwrap_or(15_000)
+    })
+}
+
 pub struct App {
     pub router: Router,
     pub handlers: Vec<Py<PyAny>>, // slot -> handler
@@ -231,7 +247,7 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
                     let mut builder = hyper::server::conn::http1::Builder::new();
                     builder
                         .timer(TokioTimer::new())
-                        .header_read_timeout(std::time::Duration::from_secs(15));
+                        .header_read_timeout(std::time::Duration::from_millis(header_timeout_ms()));
                     let _ = builder.serve_connection(io, svc).await;
                 });
             }
