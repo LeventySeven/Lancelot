@@ -560,9 +560,10 @@ class App:
         import asyncio
 
         deadline = (timeout if timeout is not None else self._drain_timeout)
-        end = asyncio.get_event_loop().time() + max(deadline, 0.0)
+        _loop = asyncio.get_running_loop()  # async ctx → always present (no deprecation)
+        end = _loop.time() + max(deadline, 0.0)
         while self._active_requests > 0:
-            remaining = end - asyncio.get_event_loop().time()
+            remaining = end - _loop.time()
             if remaining <= 0:
                 return False
             await asyncio.sleep(min(0.05, remaining))
@@ -578,9 +579,9 @@ class App:
         import signal
 
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()  # not get_event_loop (deprecated 3.12+)
         except RuntimeError:
-            return False
+            return False  # no running loop → caller wires its own handler
         try:
             loop.add_signal_handler(signal.SIGTERM, self.initiate_shutdown)
             loop.add_signal_handler(signal.SIGINT, self.initiate_shutdown)

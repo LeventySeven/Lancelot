@@ -132,66 +132,46 @@ async def _http(app, scope, receive, send):
         await send({"type": "http.response.body", "body": _ov})
         return
 
-    # Tier-B.B3: request-id ContextVar. The ID is taken from the incoming
-    # `X-Request-ID` / `X-Correlation-ID` if present; otherwise a fresh
-    # UUID4 is minted INTERNALLY (visible to user code via
-    # `lancelot.context.request_id.get()`) but NOT echoed back in the
-    # response — that would break FastAPI byte-parity. We only echo when
-    # the client supplied a correlation id (the standard trace handoff).
-    from lancelot.context import request_id as _rid_var, new_request_id
+    # Tier-B.B3 request-id + W3C trace context, captured in ONE header scan
+    # (was two full scans — efficiency). request-id: from X-Request-ID /
+    # X-Correlation-ID if present (echoed back ONLY then — FastAPI byte-parity),
+    # else a fresh internal UUID4. traceparent: a valid W3C header exposes its
+    # trace-id via context.trace_id and is forwarded by TransportPool onto
+    # outbound LLM calls (the AI request joins the same distributed trace).
+    from lancelot.context import (request_id as _rid_var, new_request_id,
+                                  trace_id as _tid_var, trace_parent as _tp_var,
+                                  parse_traceparent)
 
     _rid = None
     _rid_from_client = False
+    _tp_raw = None
     for _hk, _hv in scope.get("headers", []):
-        if _hk in (b"x-request-id", b"x-correlation-id"):
-            try:
-                _rid_raw = _hv.decode("ascii", "ignore")
-            except Exception:  # noqa: BLE001
-                _rid_raw = ""
-            # SECURITY: A malicious client could send `X-Request-ID:
-            # foo\r\nX-Evil: y` to smuggle a response header (we echo
-            # this value back). Strip CR/LF and bound the length so a
-            # tiny client can't cost us a huge response header.
-            _rid = (_rid_raw.replace("\r", "").replace("\n", "")
-                    .replace("\x00", ""))[:128]
-            if _rid:
+        if _rid is None and _hk in (b"x-request-id", b"x-correlation-id"):
+            # SECURITY: we echo this back — strip CR/LF/NUL (response-header
+            # smuggling) and bound the length so a tiny client can't cost a
+            # huge header.
+            _cleaned = (_hv.decode("ascii", "ignore").replace("\r", "")
+                        .replace("\n", "").replace("\x00", ""))[:128]
+            if _cleaned:
+                _rid = _cleaned
                 _rid_from_client = True
-                break
-            _rid = None
+        elif _tp_raw is None and _hk == b"traceparent":
+            _tp_raw = _hv.decode("ascii", "ignore")
     if not _rid:
         _rid = new_request_id()
-    _rid_token = _rid_var.set(_rid)
+    _tid = parse_traceparent(_tp_raw) if _tp_raw else None
 
-    # W3C trace context (cloud observability): if the client sent a valid
-    # `traceparent`, expose its trace-id (for the user's logs/metrics to join
-    # the distributed trace) and stash the normalized header so
-    # `lancelot.llm.TransportPool` forwards it on outbound LLM calls — the AI
-    # request joins the SAME trace. Lightweight propagation, no OTel dep.
-    from lancelot.context import (trace_id as _tid_var,
-                                  trace_parent as _tp_var, parse_traceparent)
-    _tid_token = _tp_token = None
-    for _hk, _hv in scope.get("headers", []):
-        if _hk == b"traceparent":
-            _tp_raw = _hv.decode("ascii", "ignore")
-            _tid = parse_traceparent(_tp_raw)
-            if _tid:  # only set on a VALID header — the regex guarantees clean hex
-                _tid_token = _tid_var.set(_tid)
-                _tp_token = _tp_var.set(_tp_raw.strip().lower())
-            break
-
-    # Tier-B.B1 + B4 + B2: in-flight counter is incremented exactly once
-    # here and decremented in `finally` no matter what path the response
-    # takes (200 / 5xx / cancellation). Also start the duration clock.
+    # Tier-B.B1+B4+B2: in-flight counter + RED in-flight gauge + duration clock.
     import time as _time
+    from lancelot.metrics import in_flight_delta
 
-    app._active_requests += 1
     _t0 = _time.perf_counter()
     _final_status_holder = [500]  # mutable so we can set it from below
+    _rid_token = _tid_token = _tp_token = None
 
     async def send_with_rid(msg):
-        # Echo `x-request-id` ONLY when the client sent one (so we keep
-        # FastAPI byte-parity for the common no-correlation case).
-        # Also remember the final status for the RED-metric histogram.
+        # Echo `x-request-id` ONLY when the client sent one (FastAPI byte-parity
+        # for the common no-correlation case). Also capture the final status.
         if msg.get("type") == "http.response.start":
             _final_status_holder[0] = msg.get("status", 500)
             if _rid_from_client:
@@ -202,13 +182,21 @@ async def _http(app, scope, receive, send):
                     msg = {**msg, "headers": hdrs}
         await send(msg)
 
+    # Set the ContextVars + bump the counters INSIDE the try so the `finally`
+    # ALWAYS unwinds them — no leak window if anything between entry and
+    # dispatch raises (audit HIGH-1). These mutations are the only ones; the
+    # 503 cap check above already read `_active_requests` pre-increment.
     try:
+        app._active_requests += 1
+        in_flight_delta(1)
+        _rid_token = _rid_var.set(_rid)
+        if _tid:
+            _tid_token = _tid_var.set(_tid)
+            _tp_token = _tp_var.set(_tp_raw.strip().lower())
         await _http_dispatch(app, scope, receive, send_with_rid)
     finally:
         app._active_requests -= 1
-        # Best-effort: never let telemetry/contextvar bookkeeping kill a
-        # request. The try blocks here are tight — only the exact call
-        # that could raise sits inside each.
+        in_flight_delta(-1)
         try:
             from lancelot.metrics import record_request
 
@@ -217,11 +205,8 @@ async def _http(app, scope, receive, send):
         except Exception:  # noqa: BLE001
             pass
         try:
-            _rid_var.reset(_rid_token)
-        except Exception:  # noqa: BLE001
-            pass
-        # Reset trace-context vars (only set when a valid traceparent arrived).
-        try:
+            if _rid_token is not None:
+                _rid_var.reset(_rid_token)
             if _tid_token is not None:
                 _tid_var.reset(_tid_token)
             if _tp_token is not None:
@@ -583,13 +568,17 @@ async def _http_dispatch(app, scope, receive, send):
                 # when a send failed — i.e. AFTER the upstream had already
                 # completed (the user paid for tokens nobody was watching).
                 async def _watch_disconnect():
+                    # Catch BaseException (incl. CancelledError AND any server-
+                    # adapter receive() error): stop watching CLEANLY, never
+                    # leave an unretrieved task exception (audit MED-1). The task
+                    # then completes normally so the `finally` cancel is a no-op.
                     try:
                         while True:
                             m = await receive()
                             if m.get("type") == "http.disconnect":
                                 lreq._cancel_event.set()
                                 return
-                    except _asyncio.CancelledError:
+                    except BaseException:  # noqa: BLE001
                         return
 
                 _disc_watch = _asyncio.ensure_future(_watch_disconnect())

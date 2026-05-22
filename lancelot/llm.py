@@ -32,6 +32,13 @@ class TransportPool:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
+        # Streaming LLM responses legitimately outlive the unary `timeout` — a
+        # steady token feed must NOT be severed by a total/read deadline (a 30s
+        # unary read timeout kills any stream with a >30s generation). Keep
+        # connect/write/pool bounded but DISABLE the read deadline for streams;
+        # runaway streams are bounded instead by client-disconnect cancellation
+        # (C2). Stolen from Bifrost's separate streaming-client timeout policy.
+        self._stream_timeout = httpx.Timeout(timeout, read=None)
 
     async def aclose(self):
         await self._client.aclose()
@@ -145,7 +152,9 @@ class TransportPool:
         verbs may retry once before opening the stream. Returns an httpx
         Response context (use `async with pool.stream(...) as r:`)."""
         method = method.upper()
-        return self._client.stream(method, url, **self._inject_traceparent(kw))
+        kw = self._inject_traceparent(kw)
+        kw.setdefault("timeout", self._stream_timeout)  # no read deadline; caller can override
+        return self._client.stream(method, url, **kw)
 
     @staticmethod
     def _inject_traceparent(kw):
