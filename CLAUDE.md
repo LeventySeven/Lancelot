@@ -68,7 +68,7 @@ Public surface added this milestone:
 ## M3 — Rust hot-path swaps (COMPLETE)
 
 All 7 R-swaps from `docs/plans/2026-05-20-...:R-swaps` are landed. Each gated by criterion bench + `clippy -D warnings` + unsafe-checker skill audit + a verification agent (the plan's per-swap discipline):
-- **R1** const-tier routing — shipped (Python-side router).
+- **R1** const-tier routing — shipped as **O(1) matchit routing** (Python router + Rust `matchit`). NOTE (recheck honesty fix): this is constant-TIME routing, NOT Robyn's prebaked-bytes ConstRouter (serve a fixed response from Rust with zero GIL/Request alloc/handler call). That prebaked tier is a documented STUB in `src/router.rs` ("returns None; the real pre-baked CachedResponse tier lands post-M0") — it never landed. Building it (Robyn's `AtomicBool`-gated zero-GIL const path) is the highest-leverage way to flip our one conceded loss (tiny one-shot responses) into a win + make `/livez`/`/readyz` free — see "Recheck future options" below.
 - **R2** lazy request proxy — `m3-r2`. The M0 dispatch HARDCODED `Request("POST","/echo")`; now threads real method/path/query/headers (lazy, OnceLock-cached getters). `src/ffi/request.rs`, `src/dispatch.rs` (`ReqParts`).
 - **R3** streaming pump — `m3-r3`. `src/stream.rs`: async-gen → bounded-mpsc → hyper `StreamBody`; GIL dropped across each `__anext__` await; backpressure + cancellation + shutdown-aware. `_drive_stream` in-process test helper.
 - **R4** single-pass `validate_json` — via pydantic-core (`Request.json` uses `from_json`).
@@ -105,6 +105,16 @@ If a future change makes any of these legitimately fixable (e.g. a real BaseHTTP
 Run it: `./benchmarks/run_load.sh` (4-variant, 2 shapes) + `./benchmarks/characterize.sh` (crossover + streaming sweeps); raw dumps in `benchmarks/results/`.
 
 **`@app.batch` (C5 marquee) — validated + a CRITICAL bug fixed (`./benchmarks/run_batch.sh`).** Against a rate-limited upstream (cap 8, 50ms/call, c=200): batched 2,165 rps vs solo 179 (~12×), coalescing ratio 15.98 (≈ max_batch) — ~16× fewer upstream calls. The effectiveness bench EXPOSED that the timer-window flush cancelled its OWN task (`_flush` → `self.timer_task.cancel()` while running inside it), poisoning any **awaiting** batch handler (the real use case) with CancelledError → 500. Existing tests used non-awaiting handlers and missed it. Fixed in `lancelot/batch.py` (skip cancel when `timer is asyncio.current_task()`); regression test `test_c5_awaiting_handler_on_timer_flush_succeeds`.
+
+## Recheck future options (2026-05-22 — rust-skill audit + FastAPI/Robyn/Blazeio alignment)
+
+Two verification agents (Rust soundness+perf via rust skills; framework alignment) ran. **Rust core verdict: SOUND** — no UB/GIL-across-await/Send-Sync/panic-across-FFI/leak/unbounded-DoS; only the 3 low-risk perf items below, all DONE this session (tag `m4-recheck-perf`): F3 defer per-request alloc past routing (404 flood 158k vs matched 44k), F4 memoize pydantic_core to/from_json (via `PyOnceLock` — std `OnceLock` deadlocked on the GIL-releasing first import), F1 bound `shutdown_asyncgens`. Streaming/SSE confirmed at-or-ahead of FastAPI 0.136.1; `@app.batch` is a genuine Lancelot-only primitive; http1-only + no-orjson + AI-logic-boundary all confirmed deliberate.
+
+**Two NEW-surface options surfaced (NOT built — need a decision; both move the byte path):**
+1. **Rust prebaked-bytes const tier** (steal Robyn's `AtomicBool`-gated ConstRouter). The ONLY thing that flips our conceded loss (tiny one-shot responses) into a win, and makes `/livez`/`/readyz` free (zero GIL/alloc/handler-call). The `src/router.rs` stub already anticipates it. Was "explicitly NOT in M4"; revisit as a measured spike IF the small-response regime is a real adoption blocker.
+2. **Response compression (gzip + br)** on the large-payload path (Blazeio ships streaming encoders, threshold ~10 KB, gated on `Accept-Encoding`). Amplifies the one serialization regime we WIN; never touches the small-response path. br needs a dep (gzip is stdlib) — weigh against the pydantic-only-runtime rule (compression would be a Rust-side dep, not a Python runtime dep — OK).
+
+Everything else from the teardowns is "harden/validate what exists" (the correct bias given M4 found 4 broken features) or already Tier-D.
 
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
 

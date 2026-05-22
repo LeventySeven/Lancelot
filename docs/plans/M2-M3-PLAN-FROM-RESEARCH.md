@@ -60,7 +60,7 @@ These are tempting; teardowns flagged them as not-worth-it for our positioning.
 
 These came up as "consider stealing" in the agents' reports but Lancelot already has equivalent or better:
 
-- Const-tier routing (R1, Python-side; we are ALREADY where Robyn's ConstRouter is)
+- Const-tier routing (R1) — shipped as O(1) matchit routing. CORRECTION (2026-05-22 recheck): this is NOT "where Robyn's ConstRouter is" — Robyn's ConstRouter serves PREBAKED BYTES from Rust with zero GIL/alloc/handler-call; we have constant-TIME routing only. The prebaked tier is a stub in `src/router.rs`, never built. See CLAUDE.md "Recheck future options".
 - `catch_unwind` FFI panic isolation (R7) — Robyn doesn't have this
 - `header_read_timeout(15s)` + TokioTimer (R6) — slow-loris defense
 - Pydantic v2 `TypeAdapter.dump_json` response path (no custom JSON)
