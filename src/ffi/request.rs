@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use std::sync::OnceLock;
 
@@ -122,18 +123,34 @@ impl Request {
             return Ok(v.clone_ref(py));
         }
         // Single-pass via pydantic_core if present (Rust core, no second
-        // decode); fall back to stdlib json.
-        let parsed = if let Ok(pc) = py.import("pydantic_core") {
-            pc.call_method1("from_json", (PyBytes::new(py, &self.body),))?
-                .unbind()
+        // decode); fall back to stdlib json. The bound `from_json` callable is
+        // resolved ONCE (perf F4) instead of `import` + lookup per request.
+        let body = PyBytes::new(py, &self.body);
+        let parsed = if let Some(f) = from_json_fn(py) {
+            f.bind(py).call1((body,))?.unbind()
         } else {
-            py.import("json")?
-                .call_method1("loads", (PyBytes::new(py, &self.body),))?
-                .unbind()
+            py.import("json")?.call_method1("loads", (body,))?.unbind()
         };
         let _ = self.json_cache.set(parsed.clone_ref(py));
         Ok(parsed)
     }
+}
+
+/// The bound `pydantic_core.from_json` callable, resolved once (perf F4 —
+/// mirror of `serialize::to_json_fn`). `None` = pydantic_core absent → stdlib.
+/// MUST be `PyOnceLock` not `std::OnceLock`: the init `import` releases the GIL,
+/// and a std lock held across that deadlocks concurrent GIL-holders (see
+/// serialize::to_json_fn for the full rationale).
+fn from_json_fn(py: Python<'_>) -> Option<Py<PyAny>> {
+    static F: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
+    F.get_or_init(py, || {
+        py.import("pydantic_core")
+            .and_then(|pc| pc.getattr("from_json"))
+            .map(|f| f.unbind())
+            .ok()
+    })
+    .as_ref()
+    .map(|f| f.clone_ref(py))
 }
 
 /// Test-only constructor (gated; the real Request is built by service.rs from

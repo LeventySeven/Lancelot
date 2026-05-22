@@ -115,9 +115,30 @@ fn json_ok(body: Vec<u8>) -> HResp<RespBody> {
 }
 
 async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
+    // Route on BORROWED method/path FIRST — a 404/405 then allocates NOTHING
+    // (perf F3: the eager owned-String + per-header Vec build is deferred past
+    // the route decision, restoring the lazy-Request "pay nothing if unmatched"
+    // property; scanning / probe traffic no longer pays the allocation tax).
+    let slot = match app.router.route(req.method().as_str(), req.uri().path()) {
+        Some(s) => s,
+        // 405 if the path exists under another method; 404 otherwise
+        // (HTTP semantics / FastAPI parity — domain-web).
+        None if app.router.matches_any_method(req.uri().path()) => {
+            return plain(StatusCode::METHOD_NOT_ALLOWED, b"method not allowed")
+        }
+        None => return plain(StatusCode::NOT_FOUND, b"not found"),
+    };
+    // Audit #5: bounds-checked slot lookup (router/handlers desync would
+    // otherwise panic OUTSIDE catch_unwind). Should be unreachable given the
+    // 1:1 build in lib.rs, but enforce rather than assume.
+    let handler = match app.handlers.get(slot) {
+        Some(h) => crate::gil::with_gil(|py| h.clone_ref(py)),
+        None => return plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
+    };
+    // Matched: NOW materialize the owned request parts (R2 — the REAL method /
+    // path / query / headers, owned so `ReqParts` is `Send` across the `.await`).
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
-    // R2: capture the REAL query string + headers (was dropped in M0).
     let query_string = req.uri().query().unwrap_or("").to_string();
     let headers: Vec<(String, String)> = req
         .headers()
@@ -130,22 +151,6 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
             (k.as_str().to_ascii_lowercase(), val)
         })
         .collect();
-    let slot = match app.router.route(&method, &path) {
-        Some(s) => s,
-        // 405 if the path exists under another method; 404 otherwise
-        // (HTTP semantics / FastAPI parity — domain-web).
-        None if app.router.matches_any_method(&path) => {
-            return plain(StatusCode::METHOD_NOT_ALLOWED, b"method not allowed")
-        }
-        None => return plain(StatusCode::NOT_FOUND, b"not found"),
-    };
-    // Audit #5: bounds-checked slot lookup (router/handlers desync would
-    // otherwise panic OUTSIDE catch_unwind). Should be unreachable given the
-    // 1:1 build in lib.rs, but enforce rather than assume.
-    let handler = match app.handlers.get(slot) {
-        Some(h) => crate::gil::with_gil(|py| h.clone_ref(py)),
-        None => return plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
-    };
     // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
     // allocation per connection (remote memory-DoS). A truncated/aborted
     // body is a 400, NOT a silent empty-body 200.
@@ -338,8 +343,14 @@ fn graceful_loop_teardown(py: Python<'_>, event_loop: &Bound<'_, PyAny>) {
             })();
         }
     }
-    // loop.run_until_complete(loop.shutdown_asyncgens())
+    // loop.run_until_complete(asyncio.wait_for(loop.shutdown_asyncgens(), 2.0))
+    // Bounded (audit F1): a pathological async-gen `aclose` that blocks forever
+    // must not wedge process shutdown — SIGTERM always exits within the bound.
     if let Ok(coro) = event_loop.call_method0("shutdown_asyncgens") {
-        let _ = event_loop.call_method1("run_until_complete", (coro,));
+        let _ = (|| -> PyResult<()> {
+            let bounded = asyncio.call_method1("wait_for", (coro, 2.0_f64))?;
+            event_loop.call_method1("run_until_complete", (bounded,))?;
+            Ok(())
+        })();
     }
 }
