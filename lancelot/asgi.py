@@ -526,6 +526,25 @@ async def _http_dispatch(app, scope, receive, send):
                 import asyncio as _asyncio
 
                 lreq._cancel_event = _asyncio.Event()
+
+                # C2 (validated under load — M4): poll receive() for
+                # http.disconnect WHILE the handler runs, so an in-flight
+                # TransportPool call bound to this request is cancelled the
+                # moment the client leaves. Without this, nothing watched the
+                # disconnect during the handler await, so it was only noticed
+                # when a send failed — i.e. AFTER the upstream had already
+                # completed (the user paid for tokens nobody was watching).
+                async def _watch_disconnect():
+                    try:
+                        while True:
+                            m = await receive()
+                            if m.get("type") == "http.disconnect":
+                                lreq._cancel_event.set()
+                                return
+                    except _asyncio.CancelledError:
+                        return
+
+                _disc_watch = _asyncio.ensure_future(_watch_disconnect())
                 gen = route.handler(**kwargs)
                 await send({"type": "http.response.start", "status": 200,
                             "headers": [
@@ -589,6 +608,8 @@ async def _http_dispatch(app, scope, receive, send):
                         _next_task.cancel()
                     raise
                 finally:
+                    if not _disc_watch.done():
+                        _disc_watch.cancel()
                     if _next_task is not None and not _next_task.done():
                         _next_task.cancel()
                     await _flush()
