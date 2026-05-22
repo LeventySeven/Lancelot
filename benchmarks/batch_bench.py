@@ -31,6 +31,7 @@ _UP_MS = int(os.environ.get("LC_UPSTREAM_MS", "50"))
 _UP_CAP = int(os.environ.get("LC_UPSTREAM_CAP", "8"))
 _WINDOW = int(os.environ.get("LC_BATCH_WINDOW_MS", "50"))
 _MAXB = int(os.environ.get("LC_MAX_BATCH", "16"))
+_MAX_KEYS = int(os.environ.get("LC_MAX_KEYS", "1024"))
 
 _stats = {"batch_calls": 0, "batch_items": 0, "max_batch_seen": 0, "solo_calls": 0}
 
@@ -56,7 +57,7 @@ def build():
             await asyncio.sleep(_UP_MS / 1000.0)
 
     @app.batch("/batch", batch_window_ms=_WINDOW, max_batch=_MAXB,
-               key=lambda it: it.k)
+               max_keys=_MAX_KEYS, key=lambda it: it.k)
     async def batched(items: list[Item]) -> list[dict]:
         _stats["batch_calls"] += 1
         _stats["batch_items"] += len(items)
