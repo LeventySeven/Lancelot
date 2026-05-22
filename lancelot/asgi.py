@@ -120,12 +120,16 @@ async def _http(app, scope, receive, send):
     if app._max_concurrent_requests is not None \
             and app._active_requests >= app._max_concurrent_requests \
             and path not in ("/livez", "/readyz"):
+        # FIX: the body was `b'...overloaded"}'[:28]` but that string is 30
+        # bytes — the slice cut the closing `"}`, emitting INVALID JSON
+        # (`{"detail":"server overloaded`) with content-length 28. Use the full
+        # body + its real length.
+        _ov = b'{"detail":"server overloaded"}'
         await send({"type": "http.response.start", "status": 503,
                     "headers": [(b"retry-after", b"1"),
-                                (b"content-length", b"28"),
+                                (b"content-length", str(len(_ov)).encode()),
                                 (b"content-type", b"application/json")]})
-        await send({"type": "http.response.body",
-                    "body": b'{"detail":"server overloaded"}'[:28]})
+        await send({"type": "http.response.body", "body": _ov})
         return
 
     # Tier-B.B3: request-id ContextVar. The ID is taken from the incoming
