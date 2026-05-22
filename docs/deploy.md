@@ -76,6 +76,17 @@ generators' `finally`/`aclose` run — it does NOT hard-kill (validated:
 `tests/test_m4_resilience_load.py::test_v1_4_*`). Send a second SIGTERM / SIGKILL
 to force-exit.
 
+## Observability / distributed tracing
+
+`lancelot.App` reads an incoming W3C `traceparent` and exposes its trace-id via
+`lancelot.context.trace_id.get()` — include it in your log lines / metric labels
+to correlate this service into the caller's distributed trace. `TransportPool`
+forwards the `traceparent` onto outbound LLM calls automatically, so the upstream
+joins the same trace. This is lightweight, no-dep context propagation; for full
+span export, add OpenTelemetry (`opentelemetry-instrumentation-asgi`) yourself —
+the two compose (we don't reimplement spans). RED metrics auto-emit when
+`opentelemetry-api` is installed (see `lancelot/metrics.py`).
+
 ## Health checks
 
 `lancelot.App` auto-registers `/livez` (process alive) and `/readyz` (lifespan

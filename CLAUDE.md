@@ -16,7 +16,7 @@ We own the **byte path** (transport / serialization / streaming / resilience) fo
 - **Large-payload serialization** — pydantic-core `to_json` beats Python `json.dumps`: **~2.3× at 69 KB** (crossover ~1–4 KB).
 - **Streaming for AI** — re-architected R3 pump (parity-to-1.3× vs Starlette), bounded backpressure, graceful drain, client-disconnect → upstream cancellation (C2). The marquee.
 - **`@app.batch`** — prefix-aware request coalescing: **~12× throughput / ~16× fewer upstream calls** vs a rate-limited LLM backend. No analogue in FastAPI/Robyn/Blazeio.
-- **Cloud resilience** — body cap, connection cap, slow-loris, per-route timeout, graceful drain, RED metrics, request-id, /livez+/readyz — all validated under adversarial load.
+- **Cloud resilience + observability** — body cap, connection cap, slow-loris, per-route timeout, graceful drain, RED metrics, request-id, **W3C `traceparent` propagation** (`context.trace_id` + `TransportPool` forwards it to the LLM call → joins the distributed trace, no OTel dep), /livez+/readyz — all validated under adversarial load.
 - **FastAPI byte-parity** — 974/978 = 99.6% conformance.
 
 **Honest perf envelope (do not oversell).** uvicorn+uvloop still *beats* our Rust server on tiny *handler* one-shot responses (per-request FFI/asyncio-bridge overhead) — which is why the **const tier** exists for the fixed-response case. Never claim a blanket "faster server"; lead with the wins above.
