@@ -166,6 +166,7 @@ async def _http(app, scope, receive, send):
     from lancelot.metrics import in_flight_delta
 
     _t0 = _time.perf_counter()
+    scope["_lancelot_t0"] = _t0  # request start → streaming TTFT (time-to-first-chunk)
     _final_status_holder = [500]  # mutable so we can set it from below
     _rid_token = _tid_token = _tp_token = None
 
@@ -596,14 +597,32 @@ async def _http_dispatch(app, scope, receive, send):
                 # ignore comments (RFC 8895 / WHATWG EventSource §9).
                 # A6: stream_interval — batch N events per SSE frame for
                 # high-rate token streams. Default 1 (unbuffered).
+                import time as _time  # for TTFT (time-to-first-chunk)
+
                 _ka = getattr(route, "sse_keepalive", 15.0)
                 _interval = max(1, int(getattr(route, "stream_interval", 1)))
                 _buf = bytearray()
                 _buf_count = 0
+                _ttft_done = False
 
                 async def _flush():
-                    nonlocal _buf, _buf_count
+                    nonlocal _buf, _buf_count, _ttft_done
                     if _buf:
+                        if not _ttft_done:
+                            # TTFT: record time-to-first-chunk once (the AI-
+                            # streaming UX metric — research core/ is unanimous
+                            # it matters more than total duration). Measured from
+                            # request entry; keepalive pings don't count (they
+                            # send a separate b":\n\n", never through _flush).
+                            _ttft_done = True
+                            try:
+                                from lancelot.metrics import record_stream_ttft
+                                _st = scope.get("_lancelot_t0")
+                                if _st is not None:
+                                    record_stream_ttft(
+                                        path, method, _time.perf_counter() - _st)
+                            except Exception:  # noqa: BLE001
+                                pass
                         await send({"type": "http.response.body",
                                     "body": bytes(_buf), "more_body": True})
                         _buf = bytearray()

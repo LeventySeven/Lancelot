@@ -16,7 +16,7 @@ We own the **byte path** (transport / serialization / streaming / resilience) fo
 - **Large-payload serialization** — pydantic-core `to_json` beats Python `json.dumps`: **~2.3× at 69 KB** (crossover ~1–4 KB).
 - **Streaming for AI** — re-architected R3 pump (parity-to-1.3× vs Starlette), bounded backpressure, graceful drain, client-disconnect → upstream cancellation (C2). The marquee.
 - **`@app.batch`** — prefix-aware request coalescing: **~12× throughput / ~16× fewer upstream calls** vs a rate-limited LLM backend. No analogue in FastAPI/Robyn/Blazeio.
-- **Cloud resilience + observability** — body cap, connection cap, slow-loris, per-route timeout, graceful drain, RED metrics, request-id, **W3C `traceparent` propagation** (`context.trace_id` + `TransportPool` forwards it to the LLM call → joins the distributed trace, no OTel dep), /livez+/readyz — all validated under adversarial load.
+- **Cloud resilience + observability** — body cap, connection cap, slow-loris, per-route timeout, graceful drain, RED metrics, **streaming TTFT** (time-to-first-chunk — the AI-streaming UX metric, `lancelot.http.stream.ttft`), request-id, **W3C `traceparent` propagation** (`context.trace_id` + `TransportPool` forwards it to the LLM call → joins the distributed trace, no OTel dep), /livez+/readyz — all validated under adversarial load.
 - **FastAPI byte-parity** — 974/978 = 99.6% conformance.
 
 **Honest perf envelope (do not oversell).** uvicorn+uvloop still *beats* our Rust server on tiny *handler* one-shot responses (per-request FFI/asyncio-bridge overhead) — which is why the **const tier** exists for the fixed-response case. Never claim a blanket "faster server"; lead with the wins above.
@@ -127,6 +127,13 @@ Two verification agents (Rust soundness+perf via rust skills; framework alignmen
 2. ❌ **Response compression — DON'T BUILD (already covered).** Investigated 2026-05-22: `lancelot.App.add_middleware(GZipMiddleware)` (Starlette's, FastAPI-identical) works out of the box (verified — response comes back `content-encoding: gzip`). And the deploy model puts a TLS-terminating proxy in front, which compresses too. So app-layer gzip is available where it matters (the Python seam) and redundant on the Rust `_native` server (the proxy's job). Building our own gzip would be reimplementing Starlette middleware + the proxy = useless logic (now Tier-D). The loopback benchmark also can't show a compression win (it's a real-network/bandwidth win, not throughput). NOT worth a Rust dep + hot-path branch.
 
 Everything else from the teardowns is "harden/validate what exists" (the correct bias given M4 found 4 broken features) or already Tier-D.
+
+## Core-transcript recheck (2026-05-22 — `researchfms/core/` second pass)
+
+A careful re-read of `core/` (esp. the 7 TRANSCRIPTS_*.md) — the prior "all AI-logic, skip" was directionally right but missed real signal:
+- **BUILT: streaming TTFT metric.** The transcripts are unanimous that **TTFT (time-to-first-token) + P99, NOT total throughput, are THE user-facing-AI metrics** ("above 200-300ms users perceive lag"; DEEPLEARNINGAI:9240/3467/10377). Our RED metrics emitted total duration only — wrong number for a token stream. Added `record_stream_ttft` → `lancelot.http.stream.ttft` (recorded on the first streamed chunk; keepalive pings excluded). P99 already falls out of the duration histogram via OTel.
+- **Positioning sharpeners (framing, not new code) — the field validates existing features:** `Response.set_session_affinity` IS "KV-cache-aware routing for the agent backend" (DEEPLEARNINGAI:3487 — "the LB must be cache-aware… not available out-of-the-box"); `lancelot.canonical.dumps_canonical` IS "prompt-cache-stability serialization" (DEEPLEARNINGAI:781 — byte-stable prefix → >80% cache hit, 5-10× token + TTFT win). Describe them that way.
+- **Confirmed SKIPs:** durable/checkpointed execution (orchestration = user-side + Tier-D), wire-compatible model gateway / model routing (AI-logic + Tier-D), AG-UI event schema (AI-UI protocol; our SSE/WS transports already serve it), SSE `Last-Event-ID` REPLAY (stateful resume = user-side; `stream.py` already declined it), mid-stream abort (already-have — a user aborts by returning from their async-gen).
 
 ## Tier-D — explicit DO-NOT-DO list (no-bullshit anchor)
 

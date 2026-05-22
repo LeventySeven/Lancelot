@@ -42,6 +42,17 @@ def _maybe_bind():
                 "lancelot.http.requests.in_flight",
                 description="In-flight HTTP requests right now.",
             ),
+            # TTFT — time-to-first-token: request start → first STREAMED chunk
+            # on the wire. The research transcripts (core/) are unanimous that
+            # TTFT (not total duration) is THE user-facing-AI streaming metric
+            # ("above 200-300ms users perceive lag"). The total-duration
+            # histogram above is the wrong number for a token stream; this is
+            # the right one. Recorded once per streaming response.
+            "stream_ttft": meter.create_histogram(
+                "lancelot.http.stream.ttft",
+                unit="s",
+                description="Streaming time-to-first-chunk (TTFT) in seconds.",
+            ),
         }
     except Exception:  # noqa: BLE001 — defensive; partial OTel installs
         _state = None
@@ -62,6 +73,19 @@ def record_request(route_path: str, method: str, status: int,
         inst["req_counter"].add(1, attributes=attrs)
         inst["duration_hist"].record(duration_s, attributes=attrs)
     except Exception:  # noqa: BLE001 — never let telemetry kill a request
+        pass
+
+
+def record_stream_ttft(route_path: str, method: str, ttft_s: float) -> None:
+    """Record time-to-first-chunk for a streaming response (the AI-streaming
+    UX metric). Cheap None-check when OTel isn't installed."""
+    inst = _maybe_bind()
+    if inst is None:
+        return
+    try:
+        inst["stream_ttft"].record(
+            ttft_s, attributes={"http.route": route_path, "http.method": method})
+    except Exception:  # noqa: BLE001
         pass
 
 

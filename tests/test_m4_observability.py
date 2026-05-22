@@ -31,18 +31,30 @@ def _counter_points(reader, name):
     return pts
 
 
-def test_v3_1_red_metrics_exact_under_concurrent_load():
-    from opentelemetry import metrics as om
-    from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+_READER = None
 
-    reader = InMemoryMetricReader()
-    try:
-        om.set_meter_provider(MeterProvider(metric_readers=[reader]))
-    except Exception:  # noqa: BLE001 — provider already set this process
-        pass
-    from lancelot import metrics as lmetrics
-    lmetrics.reset_for_tests()  # rebind lancelot's cached meter to our provider
+
+def _install_reader():
+    """One process-wide InMemoryMetricReader + MeterProvider (set_meter_provider
+    is once-per-process), memoized so every metric test reads the same reader."""
+    global _READER
+    if _READER is None:
+        from opentelemetry import metrics as om
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+        _READER = InMemoryMetricReader()
+        try:
+            om.set_meter_provider(MeterProvider(metric_readers=[_READER]))
+        except Exception:  # noqa: BLE001 — provider already set this process
+            pass
+        from lancelot import metrics as lmetrics
+        lmetrics.reset_for_tests()  # rebind lancelot's cached meter to our provider
+    return _READER
+
+
+def test_v3_1_red_metrics_exact_under_concurrent_load():
+    reader = _install_reader()
 
     app = lancelot.App()
 
@@ -111,3 +123,31 @@ def test_v3_2_request_id_isolation_under_concurrency(path, handler_kind):
     # Every request observed ITS OWN id — zero cross-request bleed.
     assert got == [f"req-{i}" for i in range(N)], \
         f"request-id bleed: {[(i, g) for i, g in enumerate(got) if g != f'req-{i}'][:5]}"
+
+
+def test_v3_4_stream_ttft_metric_recorded():
+    """TTFT (time-to-first-chunk) is recorded for streaming responses — the
+    AI-streaming UX metric the research transcripts (core/) say matters most.
+    Distinct from the total-duration histogram (which is the wrong number for a
+    token stream)."""
+    from lancelot.stream import Event
+    from lancelot.testclient import TestClient
+
+    reader = _install_reader()
+    app = lancelot.App()
+
+    @app.stream("/s")
+    async def s():
+        yield Event("delta", {"i": 0})
+        yield Event("delta", {"i": 1})
+
+    with TestClient(app) as c:
+        with c.stream("GET", "/s") as r:
+            assert r.status_code == 200
+            b"".join(r.iter_bytes())
+
+    pts = _counter_points(reader, "lancelot.http.stream.ttft")
+    assert pts, "no stream TTFT data point recorded"
+    assert sum(p.count for p in pts) >= 1
+    assert any(p.attributes.get("http.route") == "/s" for p in pts)
+    assert all(p.sum >= 0 for p in pts)  # TTFT is a non-negative duration
