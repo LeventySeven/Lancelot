@@ -44,6 +44,20 @@ The Rust server speaks **cleartext HTTP/1.1 only** (deliberate — see CLAUDE.md
 Terminate TLS at a reverse proxy / load balancer in front of it (the standard
 cloud shape). h2/h2c is not served.
 
+## Compression
+
+Don't reach for a custom encoder. For `lancelot.App` (under uvicorn), add
+Starlette's gzip middleware — identical to FastAPI:
+
+```python
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+```
+
+For the Rust `_native` server, let the TLS-terminating proxy in front compress
+(nginx `gzip on;`, Cloudflare, etc.) — that's the standard cloud shape and
+avoids spending app CPU on what the edge does better.
+
 ## Operator knobs (env)
 
 | Var | Default | Meaning |
