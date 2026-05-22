@@ -82,6 +82,7 @@ class TransportPool:
         so the user stops paying for LLM tokens the client is no longer
         watching."""
         method = method.upper()
+        kw = self._inject_traceparent(kw)
         idempotent = method in _IDEMPOTENT
         attempt = 0
         while True:
@@ -144,4 +145,20 @@ class TransportPool:
         verbs may retry once before opening the stream. Returns an httpx
         Response context (use `async with pool.stream(...) as r:`)."""
         method = method.upper()
-        return self._client.stream(method, url, **kw)
+        return self._client.stream(method, url, **self._inject_traceparent(kw))
+
+    @staticmethod
+    def _inject_traceparent(kw):
+        """Forward the active request's W3C `traceparent` onto the outbound call
+        so the upstream LLM/gateway joins the SAME distributed trace (Tier-B
+        cloud observability). No-op when there's no trace context (the common
+        case) or the caller set `traceparent` explicitly (their value wins).
+        Lightweight context propagation — full span export is the user's OTel."""
+        from lancelot.context import trace_parent
+
+        tp = trace_parent.get()
+        if not tp:
+            return kw
+        headers = dict(kw.get("headers") or {})
+        headers.setdefault("traceparent", tp)
+        return {**kw, "headers": headers}

@@ -158,6 +158,23 @@ async def _http(app, scope, receive, send):
         _rid = new_request_id()
     _rid_token = _rid_var.set(_rid)
 
+    # W3C trace context (cloud observability): if the client sent a valid
+    # `traceparent`, expose its trace-id (for the user's logs/metrics to join
+    # the distributed trace) and stash the normalized header so
+    # `lancelot.llm.TransportPool` forwards it on outbound LLM calls — the AI
+    # request joins the SAME trace. Lightweight propagation, no OTel dep.
+    from lancelot.context import (trace_id as _tid_var,
+                                  trace_parent as _tp_var, parse_traceparent)
+    _tid_token = _tp_token = None
+    for _hk, _hv in scope.get("headers", []):
+        if _hk == b"traceparent":
+            _tp_raw = _hv.decode("ascii", "ignore")
+            _tid = parse_traceparent(_tp_raw)
+            if _tid:  # only set on a VALID header — the regex guarantees clean hex
+                _tid_token = _tid_var.set(_tid)
+                _tp_token = _tp_var.set(_tp_raw.strip().lower())
+            break
+
     # Tier-B.B1 + B4 + B2: in-flight counter is incremented exactly once
     # here and decremented in `finally` no matter what path the response
     # takes (200 / 5xx / cancellation). Also start the duration clock.
@@ -197,6 +214,14 @@ async def _http(app, scope, receive, send):
             pass
         try:
             _rid_var.reset(_rid_token)
+        except Exception:  # noqa: BLE001
+            pass
+        # Reset trace-context vars (only set when a valid traceparent arrived).
+        try:
+            if _tid_token is not None:
+                _tid_var.reset(_tid_token)
+            if _tp_token is not None:
+                _tp_var.reset(_tp_token)
         except Exception:  # noqa: BLE001
             pass
 
