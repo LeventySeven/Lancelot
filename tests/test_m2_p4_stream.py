@@ -7,6 +7,34 @@ synthesis — zero product citations for Last-Event-Id replay)."""
 import asyncio
 
 
+def test_stream_accepts_raw_bytes_and_str_not_only_event():
+    """REGRESSION: `@app.stream` must accept `bytes`/`str` yields (raw SSE the
+    way AI handlers naturally write it — `yield f"data: {token}\\n\\n"`), not
+    only `Event`. The loop called `event.render()` unconditionally, so a
+    bytes/str yield raised AFTER the 200 was sent → a SILENT EMPTY body. Now:
+    bytes pass through, str → utf-8, Event → SSE-framed."""
+    import lancelot
+    from lancelot.stream import Event
+    from lancelot.testclient import TestClient
+
+    app = lancelot.App()
+
+    @app.stream("/raw")
+    async def raw():
+        yield b"data: a\n\n"            # bytes — passthrough
+        yield "data: b\n\n"            # str — utf-8
+        yield Event("delta", {"x": 1})  # Event — SSE-framed via render()
+
+    with TestClient(app) as client:
+        r = client.get("/raw")
+        assert r.status_code == 200
+        body = r.content
+        assert body, "regression: @app.stream emitted a SILENT EMPTY body"
+        assert b"data: a\n\n" in body
+        assert b"data: b\n\n" in body
+        assert b"event: delta" in body and b'"x":1' in body
+
+
 def test_stream_typed_events_render_to_sse():
     """A handler yielding `Event` instances → SSE wire frames
     `data: <json>\\n\\n`. The framework owns the framing."""

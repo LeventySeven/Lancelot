@@ -201,6 +201,25 @@ async def _http(app, scope, receive, send):
             pass
 
 
+def _stream_chunk_bytes(ev):
+    """Coerce one `@app.stream` yield to wire bytes. Accepts `bytes`/`str`
+    (raw passthrough — like Starlette's StreamingResponse, the shape AI
+    handlers naturally yield: `yield f"data: {token}\n\n"`) AND
+    `lancelot.stream.Event` (SSE-framed via `.render()`); anything else is a
+    JSON line. FIX: the loop previously called `event.render()` unconditionally,
+    so a `bytes`/`str` yield raised after the 200 was sent → SILENT EMPTY body."""
+    if isinstance(ev, (bytes, bytearray)):
+        return bytes(ev)
+    if isinstance(ev, str):
+        return ev.encode("utf-8")
+    render = getattr(ev, "render", None)
+    if callable(render):
+        out = render()
+        return out if isinstance(out, (bytes, bytearray)) else str(out).encode("utf-8")
+    import json as _json
+    return (_json.dumps(ev, separators=(",", ":"), default=str) + "\n").encode("utf-8")
+
+
 async def _http_dispatch(app, scope, receive, send):
     """The original `_http` body, factored out so the wrapper above can
     own the per-request lifecycle (counter, request-id, RED metrics)
@@ -598,7 +617,7 @@ async def _http_dispatch(app, scope, receive, send):
                             _next_task = None
                             break
                         _next_task = None  # consumed; will rebuild
-                        _buf += event.render()
+                        _buf += _stream_chunk_bytes(event)
                         _buf_count += 1
                         if _buf_count >= _interval:
                             await _flush()
