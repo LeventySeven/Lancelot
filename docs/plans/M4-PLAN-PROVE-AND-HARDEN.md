@@ -1,5 +1,13 @@
 # Lancelot M4 Plan — Prove & Harden
 
+**STATUS: ✅ COMPLETE (2026-05-22).** All three tiers validated under real load.
+Outcome: FOUR shipped features were found broken/incomplete under load (R3
+streaming pump, `@app.batch` self-cancel, graceful drain, C2 cancellation) — every
+one green on in-process unit tests — and fixed. Resilience caps (slow-loris,
+body, connection, per-route timeout), AI primitives (batch edges, KV-cache
+determinism), observability (RED metrics, request-id isolation) all hold;
+multiprocess `SO_REUSEPORT` is Linux-only (documented). Tags `m4-v1-*` → `m4-v3-complete`.
+
 **Date:** 2026-05-22
 **Anchor rule (user-restated):** *no bullshit, no useless logic.* Every item below either validates a claim we already make OR fixes a gap that validation exposed. Nothing speculative; no new surface unless a measured gap demands it.
 
@@ -54,7 +62,10 @@ The repositioned pitch (locked in CLAUDE.md): **transport/serialization/streamin
 | V2.2 | C2 TransportPool cancellation: client disconnect → in-flight upstream LLM call is actually cancelled (stops the $$). Measure that it propagates under load, not just in a unit test. | "Stops $ on unwatched tokens" is a money claim; must be real. | Disconnect mid-call; assert upstream future cancelled + pool slot freed. |
 | V2.3 | C1 KV-cache helpers: `dumps_canonical` determinism across types/orderings (property test) + session-affinity header stability; quantify the serialization cost vs plain. | Cache-hit help is a cost claim; verify determinism + overhead. | Property test + a cost micro-measurement (honest, caveated). |
 
-### Tier-V3 — Observability & deployment (make the operator story true)
+### Tier-V3 — Observability & deployment (make the operator story true) — ✅ COMPLETE (tag `m4-v3-complete`)
+
+> Status (2026-05-22): `tests/test_m4_observability.py` + `test_m4_deploy.py`. V3.1 (RED metrics — counter/histogram exact under 200 concurrent reqs incl. errors, via real OTel InMemoryMetricReader) held; V3.2 (request-id ContextVar isolation across 200 concurrent reqs, async + sync-pool) held. V3.3 (multiprocess SO_REUSEPORT co-bind + serve) held, and surfaced a PLATFORM FINDING: `SO_REUSEPORT` load-balancing is **Linux-only** — macOS/BSD binds N sockets but delivers to ONE, so the benchmark's macOS multiprocess number is a no-distribution FLOOR (≈ single-process), not the Linux ceiling. Corrected `benchmarks/README.md` + `CLAUDE.md`; added `docs/deploy.md` (recipe + caveat + knob table). No code bug.
+
 
 | # | Item | Why | Done = |
 |---|------|-----|--------|
