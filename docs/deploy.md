@@ -66,3 +66,19 @@ to force-exit.
 
 `lancelot.App` auto-registers `/livez` (process alive) and `/readyz` (lifespan
 started + in-flight under threshold) for Kubernetes probes.
+
+On the Rust `_native` server, serve fixed-response endpoints (health probes,
+static config, cached payloads) via the **const-bytes tier** — prebaked bytes
+returned straight from Rust with zero GIL / Request alloc / handler call
+(~183k req/s per-core vs ~66k for uvicorn+uvloop on the same payload):
+
+```python
+lancelot._native.run(
+    routes,                       # your handler routes
+    host="127.0.0.1", port=8000,
+    const_routes=[                # (method, path, body, content_type, status)
+        ("GET", "/livez",  b'{"status":"ok"}', "application/json", 200),
+        ("GET", "/readyz", b'{"status":"ok"}', "application/json", 200),
+    ],
+)
+```

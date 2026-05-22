@@ -86,10 +86,48 @@ fn header_timeout_ms() -> u64 {
     })
 }
 
+/// A prebaked response (Robyn-style ConstRouter / const-bytes tier): a route
+/// whose reply is FIXED bytes, served straight from Rust with ZERO GIL, ZERO
+/// `Request` allocation, ZERO handler call. The status + content-type are
+/// validated at registration so `response()` cannot panic on the hot path.
+/// Use for health probes (`/livez`/`/readyz`) and static/cached responses —
+/// the small-response regime where the FFI+asyncio-bridge overhead otherwise
+/// loses to uvicorn+uvloop.
+pub struct Prebaked {
+    status: StatusCode,
+    content_type: hyper::header::HeaderValue,
+    body: Bytes,
+}
+
+impl Prebaked {
+    pub fn new(status: u16, content_type: &str, body: Vec<u8>) -> Result<Self, String> {
+        Ok(Self {
+            status: StatusCode::from_u16(status).map_err(|e| e.to_string())?,
+            content_type: hyper::header::HeaderValue::from_str(content_type)
+                .map_err(|e| format!("bad const content-type: {e}"))?,
+            body: Bytes::from(body),
+        })
+    }
+
+    /// Build the response — `body.clone()` is a cheap refcount bump (Bytes).
+    /// `.unwrap()` is infallible: status + content_type were validated in `new`.
+    fn response(&self) -> HResp<RespBody> {
+        HResp::builder()
+            .status(self.status)
+            .header(hyper::header::CONTENT_TYPE, self.content_type.clone())
+            .body(Full::new(self.body.clone()).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+}
+
 pub struct App {
     pub router: Router,
     pub handlers: Vec<Py<PyAny>>, // slot -> handler
-    pub locals: TaskLocals,       // the server's asyncio loop + context
+    // slot -> Some(prebaked) for const routes, None for handler routes. Parallel
+    // to `handlers`. A const slot is served from Rust without ever entering
+    // Python (the const-bytes fast path in `handle`).
+    pub const_bodies: Vec<Option<Prebaked>>,
+    pub locals: TaskLocals, // the server's asyncio loop + context
     // Notified on graceful shutdown (SIGTERM) so in-flight R3 stream pumps
     // stop pulling before the event loop closes (audit #2).
     pub shutdown: std::sync::Arc<tokio::sync::Notify>,
@@ -128,6 +166,14 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         }
         None => return plain(StatusCode::NOT_FOUND, b"not found"),
     };
+    // Const-bytes fast path (Robyn ConstRouter): if this slot has a prebaked
+    // response, serve it straight from Rust — ZERO GIL, ZERO Request alloc,
+    // ZERO handler call. A Vec index + match, so it's ~free when no route is
+    // const (all entries None). This is the path that beats uvicorn+uvloop on
+    // tiny responses (health probes, static/cached endpoints).
+    if let Some(Some(pre)) = app.const_bodies.get(slot) {
+        return pre.response();
+    }
     // Audit #5: bounds-checked slot lookup (router/handlers desync would
     // otherwise panic OUTSIDE catch_unwind). Should be unreachable given the
     // 1:1 build in lib.rs, but enforce rather than assume.

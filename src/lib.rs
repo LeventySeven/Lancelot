@@ -20,33 +20,56 @@ fn _ping() -> &'static str {
     "lancelot-m0"
 }
 
-/// `routes`: list of (method, path, handler). Builds the router + a
-/// long-lived asyncio loop/TaskLocals and serves until SIGTERM.
+/// `routes`: list of (method, path, handler). `const_routes` (optional, trailing
+/// keyword for back-compat): list of (method, path, body, content_type, status)
+/// served as prebaked bytes straight from Rust — zero GIL/Request/handler (the
+/// const-bytes tier; ideal for health probes + static responses). Builds the
+/// router + a long-lived asyncio loop/TaskLocals and serves until SIGTERM.
 #[pyfunction]
-#[pyo3(signature = (routes, host="127.0.0.1", port=8000))]
+#[pyo3(signature = (routes, host="127.0.0.1", port=8000, const_routes=None))]
+// The const_routes tuple shape (method, path, body, content_type, status) is a
+// thin FFI DTO from Python — a named struct would just add ceremony at the seam.
+#[allow(clippy::type_complexity)]
 fn run(
     py: Python<'_>,
     routes: Vec<(String, String, Py<PyAny>)>,
     host: &str,
     port: u16,
+    const_routes: Option<Vec<(String, String, Vec<u8>, String, u16)>>,
 ) -> PyResult<()> {
     let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
     let locals = pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)?;
+    let const_routes = const_routes.unwrap_or_default();
     let mut router = crate::router::Router::new();
-    let mut handlers = Vec::with_capacity(routes.len());
-    for (i, (method, path, h)) in routes.into_iter().enumerate() {
+    let mut handlers = Vec::with_capacity(routes.len() + const_routes.len());
+    let mut const_bodies: Vec<Option<crate::service::Prebaked>> = Vec::new();
+    let mut slot = 0usize;
+    for (method, path, h) in routes {
         // Propagate a duplicate/malformed-route error as a clean Python
         // ValueError at startup instead of panicking across the FFI seam.
         router
-            .add(&method, &path, i)
+            .add(&method, &path, slot)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         handlers.push(h);
+        const_bodies.push(None);
+        slot += 1;
+    }
+    for (method, path, body, content_type, status) in const_routes {
+        let pre = crate::service::Prebaked::new(status, &content_type, body)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        router
+            .add(&method, &path, slot)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        handlers.push(py.None()); // placeholder; never called
+        const_bodies.push(Some(pre));
+        slot += 1;
     }
     crate::service::serve(
         py,
         crate::service::App {
             router,
             handlers,
+            const_bodies,
             locals,
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         },
