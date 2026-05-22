@@ -30,7 +30,10 @@ The repositioned pitch (locked in CLAUDE.md): **transport/serialization/streamin
 
 ## M4 items — validate-then-harden (no new features unless a gap forces it)
 
-### Tier-V1 — Resilience under adversarial load (the cloud-native pitch must be real)
+### Tier-V1 — Resilience under adversarial load (the cloud-native pitch must be real) — ✅ COMPLETE (tag `m4-v1-complete`)
+
+> Status (2026-05-22): all 5 validated against the real server in a subprocess (`tests/test_m4_resilience_load.py`). V1.1/V1.2/V1.3/V1.5 held as claimed; **V1.4 graceful drain was BROKEN** (in-flight requests 500'd on SIGTERM — Robyn-style hard-kill, the B1 anti-goal; the 3rd headline feature to fail under load) and was FIXED (`serve()` now drains via `acquire_many_owned` bounded by `LANCELOT_DRAIN_SECS`). New knobs: `LANCELOT_HEADER_TIMEOUT_MS`, `LANCELOT_MAX_CONNECTIONS`, `LANCELOT_DRAIN_SECS`.
+
 
 | # | Item | Why | Done = |
 |---|------|-----|--------|
