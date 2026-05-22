@@ -47,10 +47,47 @@ def _free_port():
     return p
 
 
-def _spawn(env_extra=None):
+# Python ASGI seam (lancelot.App under uvicorn) — the deployable path — with a
+# per-route timeout + a yield-dep whose teardown we count, to prove the timeout
+# fires AND cleans up under concurrency (V1.5).
+_TIMEOUT_SERVER = r"""
+import asyncio
+import sys
+import uvicorn
+import lancelot
+from lancelot.params import Depends
+
+app = lancelot.App()
+_td = {"n": 0}
+
+def db():
+    try:
+        yield "session"
+    finally:
+        _td["n"] += 1
+
+@app.get("/slow", timeout=0.2)
+async def slow(s: str = Depends(db)):
+    await asyncio.sleep(5.0)  # far exceeds the 0.2 s route timeout
+    return {"never": True}
+
+@app.get("/teardowns")
+async def teardowns():
+    return {"n": _td["n"]}
+
+@app.get("/ping")
+async def ping():
+    return {"ok": True}
+
+uvicorn.run(app.asgi(), host="127.0.0.1", port=int(sys.argv[1]),
+            log_level="warning", access_log=False, loop="uvloop", http="httptools")
+"""
+
+
+def _spawn(env_extra=None, src=_SERVER):
     port = _free_port()
     env = {**os.environ, **(env_extra or {})}
-    proc = subprocess.Popen([sys.executable, "-c", _SERVER, str(port)],
+    proc = subprocess.Popen([sys.executable, "-c", src, str(port)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -163,6 +200,36 @@ def test_v1_4_graceful_drain_lets_inflight_request_finish_on_sigterm():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def test_v1_5_per_route_timeout_under_concurrency_504s_and_runs_teardown():
+    # Per-route timeout (B5) under concurrent load: every slow request must 504
+    # near the deadline (not hang to the 5 s sleep), every yield-dep teardown
+    # must run despite the cancellation, and the server stays healthy.
+    proc, port = _spawn(src=_TIMEOUT_SERVER)
+    try:
+        base = f"http://127.0.0.1:{port}"
+        assert httpx.get(f"{base}/ping").status_code == 200
+        N = 20
+
+        def hit(_):
+            return httpx.get(f"{base}/slow", timeout=10).status_code
+
+        t0 = time.time()
+        with cf.ThreadPoolExecutor(max_workers=N) as ex:
+            codes = list(ex.map(hit, range(N)))
+        elapsed = time.time() - t0
+
+        # All time out (504), concurrently — bounded well under the 5 s sleep.
+        assert all(c == 504 for c in codes), codes
+        assert elapsed < 3.0, f"timeouts did not fire concurrently ({elapsed:.1f}s)"
+        # Every yield-dep `finally` ran despite the timeout cancellation.
+        td = httpx.get(f"{base}/teardowns").json()["n"]
+        assert td == N, f"yield-dep teardown leaked under timeout: {td}/{N}"
+        # Server healthy afterward.
+        assert httpx.get(f"{base}/ping").status_code == 200
+    finally:
+        _stop(proc)
 
 
 def _rss_kb(pid):
