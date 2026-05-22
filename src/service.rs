@@ -40,7 +40,35 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 /// BEFORE accept gives kernel-backlog backpressure (the OS buffers, then
 /// refuses SYNs) rather than buffering accepted-but-unserved connections in
 /// memory. Permit is held for the connection's lifetime, released on close.
-const MAX_CONNECTIONS: usize = 1024;
+/// Default 1024; tunable via `LANCELOT_MAX_CONNECTIONS` (clamped [1, 1<<20]) —
+/// a real operator knob (match it to the container's FD limit) AND what lets
+/// the connection-cap test run with a small cap.
+fn max_connections() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LANCELOT_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 1 << 20))
+            .unwrap_or(1024)
+    })
+}
+
+/// Graceful-drain deadline (B1): on SIGTERM we stop accepting, then wait up to
+/// this long for in-flight connections to finish before closing — drain, not
+/// Robyn-style hard-kill. Default 10 s; tunable via `LANCELOT_DRAIN_SECS`
+/// (clamped [0, 300]; 0 = no drain, exit immediately).
+fn drain_timeout() -> std::time::Duration {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let secs = *S.get_or_init(|| {
+        std::env::var("LANCELOT_DRAIN_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|n| n.min(300))
+            .unwrap_or(10)
+    });
+    std::time::Duration::from_secs(secs)
+}
 
 /// Slow-loris header-read deadline (R6). How long a client may take to send the
 /// complete request head before the connection is dropped. Default 15 s
@@ -180,19 +208,28 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
     // Bounded concurrent connections (domain-web). Acquire a permit BEFORE
     // accepting → backpressure lands in the kernel listen backlog, not in an
     // unbounded pile of spawned tasks.
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let max_conns = max_connections();
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(max_conns));
 
     let server = async move {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|e| PyOSError::new_err(e.to_string()))?;
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|e| PyOSError::new_err(e.to_string()))?;
-        // Graceful-shutdown helper: drain in-flight R3 stream pumps before the
-        // event loop closes (audit #2), then signal the loop to stop.
+        // Graceful-shutdown helper (B1 — drain, NOT Robyn-style hard-kill).
+        // First wake in-flight R3 stream pumps so they stop pulling (audit #2),
+        // then DRAIN: acquire ALL connection permits — satisfiable only once
+        // every in-flight connection has released its permit (i.e. finished) —
+        // bounded by `drain_timeout()`. We're still inside `run_until_complete`,
+        // so the asyncio loop keeps pumping and in-flight handlers actually
+        // progress to completion instead of being cancelled at close (the V1.4
+        // bug: in-flight requests 500'd on SIGTERM). A stuck handler can't block
+        // shutdown past the deadline.
         macro_rules! graceful_break {
             () => {{
                 app.shutdown.notify_waiters();
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let drain = conn_limit.clone().acquire_many_owned(max_conns as u32);
+                let _ = tokio::time::timeout(drain_timeout(), drain).await;
                 break;
             }};
         }

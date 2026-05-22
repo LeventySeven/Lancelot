@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -21,13 +22,19 @@ import pytest
 httpx = pytest.importorskip("httpx")
 
 _SERVER = r"""
+import asyncio
 import sys
 import lancelot._native as _native
 
 async def echo(req):
     return {"ok": True, "n": len(req.body)}
 
-_native.run([("GET", "/echo", echo), ("POST", "/echo", echo)],
+async def slow(req):
+    await asyncio.sleep(0.3)  # an in-flight handler with real work
+    return {"ok": True, "slow": True}
+
+_native.run([("GET", "/echo", echo), ("POST", "/echo", echo),
+             ("GET", "/slow", slow)],
             host="127.0.0.1", port=int(sys.argv[1]))
 """
 
@@ -94,6 +101,68 @@ def test_v1_1_slowloris_dribbled_head_dropped_and_healthy_traffic_survives():
         assert httpx.get(f"{base}/echo").status_code == 200
     finally:
         _stop(proc)
+
+
+def test_v1_3_connection_cap_throttles_flood_without_dropping_or_crashing():
+    # Small cap so a flood >> cap is reachable under the OS FD limit.
+    proc, port = _spawn({"LANCELOT_MAX_CONNECTIONS": "8"})
+    try:
+        base = f"http://127.0.0.1:{port}"
+        N = 64  # >> cap
+
+        def hit(_):
+            # No keep-alive → each request is its own connection (exercises the
+            # per-connection permit cap, not request multiplexing).
+            with httpx.Client(limits=httpx.Limits(max_keepalive_connections=0),
+                              timeout=30) as c:
+                return c.get(f"{base}/slow").status_code
+
+        t0 = time.time()
+        with cf.ThreadPoolExecutor(max_workers=N) as ex:
+            codes = list(ex.map(hit, range(N)))
+        elapsed = time.time() - t0
+
+        # Backpressure, not drops: every request is eventually served (200),
+        # the server never crashes, and the cap THROTTLES (64 conns / cap 8 ×
+        # 0.3 s ≈ 2.4 s of serialization — provably > the ~0.3 s an uncapped
+        # server would take, confirming the cap actually gates concurrency).
+        assert all(c == 200 for c in codes), codes
+        assert proc.poll() is None, "server crashed under connection flood"
+        assert elapsed > 1.0, f"cap did not throttle (elapsed {elapsed:.2f}s)"
+        assert httpx.get(f"{base}/echo").status_code == 200
+    finally:
+        _stop(proc)
+
+
+def test_v1_4_graceful_drain_lets_inflight_request_finish_on_sigterm():
+    # B1 claim: SIGTERM drains in-flight work (Robyn hard-kills; we must not).
+    proc, port = _spawn()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        assert httpx.get(f"{base}/echo").status_code == 200
+
+        result = {}
+
+        def inflight():
+            try:
+                r = httpx.get(f"{base}/slow", timeout=10)
+                result["status"] = r.status_code
+            except Exception as e:  # noqa: BLE001
+                result["error"] = repr(e)
+
+        th = threading.Thread(target=inflight)
+        th.start()
+        time.sleep(0.1)  # ensure the /slow handler is in-flight (0.3 s sleep)
+        proc.send_signal(signal.SIGTERM)  # drain, don't hard-kill
+        th.join(timeout=10)
+
+        # The in-flight request must COMPLETE (200), not be cancelled/dropped.
+        assert result.get("status") == 200, f"in-flight request not drained: {result}"
+        proc.wait(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 def _rss_kb(pid):
