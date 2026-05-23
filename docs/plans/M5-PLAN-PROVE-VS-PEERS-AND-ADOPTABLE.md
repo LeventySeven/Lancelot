@@ -1,6 +1,6 @@
 # Lancelot M5 Plan — Prove vs Peers & Adoptable from FastAPI
 
-**STATUS: 📋 PLAN (not started; predecessor M4 ✅ complete @ tag `m4-sweep-validated`).**
+**STATUS: 🚧 CODE COMPLETE, AWAITING DEPLOYED-VALIDATION RUNS (2026-05-23).** All harness code + deploy scaffolding + docs landed across commits 777fa99..2060e3d (11 commits). The remaining work is wall-clock-bound: provision a Linux VPS for Phase C scaling, deploy to Render for Phase B, run the 6 h Phase-B + 24 h Phase-C soaks, capture the raw oha dumps, pick + run the K=3 drop-in OSS apps for T2.b. None of those are coding work; they're operations that must run against real infrastructure. See "Code-complete inventory" below.
 
 **Date:** 2026-05-23
 **Anchor rule (user-restated):** *no bullshit, no useless logic.* Every item below either produces evidence a FastAPI user can quote OR fixes a measured gap that evidence exposed. Nothing speculative; no new surface unless a measured gap demands it.
@@ -46,6 +46,36 @@ Three sub-claims (compat, perf, endurance) — each backed by reproducible evide
 | **Drop-in compat on real OSS apps** | **Missing** | — | **T2.b produces it (K=3 apps documented)** |
 | **Operator paper trail** | **Missing** | scattered notes only | **T2.c + T2.d produce it (cookbook + dashboards + runbook + failure-modes)** |
 | **Peer source-level recheck** | **Stale** | teardowns predate M4 reckoning | **T3 produces fresh comparative + low-risk adoptions** |
+
+## Code-complete inventory (as of 2026-05-23)
+
+| Item | Status | Commit | Artifact |
+|---|---|---|---|
+| T1.1 peer factories (Robyn 0.84.0, Blazeio 4.1.0) | ✅ | `777fa99` | `benchmarks/servers.py` (`run_robyn`, `run_blazeio` + `_VARIANTS`) |
+| T1.2 4-way sustained-load harness | ✅ | `d9cc388` | `benchmarks/m5/{lib.sh,run_load_4way.sh}` |
+| T1.3 mixed adversarial+benign cohort | ✅ | `6f5ce93` | `benchmarks/m5/{slow_loris.py,run_mixed.sh}` |
+| T1.4 streaming TTFT distributions | ✅ | `277b5e3` | `benchmarks/m5/{ttft_collector.py,run_ttft.sh}` |
+| T1.5 `@app.batch` peer comparison | ✅ | `74e0a4e` | `benchmarks/m5/{batch_peer_bench.py,run_batch_4way.sh}` |
+| T1.6 multiprocess `SO_REUSEPORT` scaling | ✅ | `660145f` | `benchmarks/m5/run_scaling.sh` (Linux-only LB caveat documented) |
+| T1.7 deployed exit-gate workload + Render + VPS | ✅ | `4f418c2` + `2060e3d` | `benchmarks/m5/exit_gate/{mock_upstream.py, app_{lancelot,fastapi,robyn,blazeio}.py, Dockerfile, .dockerignore, requirements.txt, render.yaml, nginx.conf, deploy_vps.sh, README.md}` |
+| T2.a endurance/soak driver with leak guards | ✅ | `34b81ce` | `benchmarks/m5/soak.py` |
+| T2.c.1 migration cookbook (FastAPI → Lancelot) | ✅ | `d6a5c1a` | `docs/migration/from-fastapi.md` |
+| T2.c.2 Grafana RED dashboard | ✅ | `d6a5c1a` | `docs/operator/dashboards/lancelot-red.json` |
+| T2.c.3 operator runbook | ✅ | `d6a5c1a` | `docs/operator/runbook.md` |
+| T2.d.1 failure-modes synthesis | ✅ | `d6a5c1a` | `docs/operator/failure-modes.md` |
+| T3.1-3.3 + T3.5 peer source recheck | ✅ | `eef0b11` | `docs/peer-source-recheck/M5-peers.md` |
+
+### Remaining (operations, not coding)
+
+| Item | Why it's not in the code-complete list | What still needs to happen |
+|---|---|---|
+| T2.b drop-in compat on K=3 real OSS FastAPI apps | Needs the user to pick + provide / clone the apps | Pick 3 apps (suggestions in plan T2.b.1); `pip install lancelot` + import-swap + run their tests; document each in `docs/migration/drop-in-results.md` |
+| Phase B Render deploy | Needs a Render account + `render.yaml` apply | Connect repo in Render dashboard → New Blueprint → point at `benchmarks/m5/exit_gate/render.yaml`; smoke + 6h soak |
+| Phase C VPS deploy | Needs a Linux VPS pair | Run `deploy_vps.sh` on the box; bench from a second VPS in same region; 1h smoke + 24h soak |
+| T1 raw bench dumps published | Need actual runs against the deployed targets | `DURATION=30m benchmarks/m5/run_load_4way.sh` etc., then commit results under `benchmarks/results/M5/` |
+| T3.4 low-risk adoptions | T3 recheck found **zero** low-risk adoptions to land in M5 (see `M5-peers.md`) | Nothing to do; deferred to M6 with documented rationale |
+
+These are user-driven operational steps; the harness, the apps, the docs, and the deploy scaffolding are all ready. The M5 exit tag is gated on: lab body raw dumps + Phase B 6h soak + Phase C 24h soak + T2.b K=3 results landing in repo.
 
 ## Estimation note (read this before sizing anything)
 
