@@ -259,7 +259,7 @@ def _p_app(F):
     the 422 response + HTTPValidationError/ValidationError schemas."""
     from pydantic import BaseModel
 
-    is_fa = hasattr(F, "FastAPI")
+    is_fa = F.__name__ == "fastapi"  # M5: lancelot.FastAPI is now an alias for App
     app = F.FastAPI() if is_fa else F.App()
     Dep = (F.Depends if is_fa else __import__(
         "lancelot.params", fromlist=["Depends"]).Depends)

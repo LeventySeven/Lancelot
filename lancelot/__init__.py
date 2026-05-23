@@ -4,10 +4,50 @@ from lancelot.concurrency import gather
 from lancelot.requests import Request
 from lancelot.routing import APIRouter
 
-__all__ = ["App", "Lancelot", "APIRouter", "Request", "TestClient",
-           "BackgroundTasks", "background", "WebSocket",
-           "WebSocketDisconnect", "StaticFiles", "gather", "run", "_ping"]
+# FastAPI users write `from fastapi import FastAPI`; alias so the swap
+# `from lancelot import FastAPI` works without any further rewriting.
+FastAPI = App
+
+__all__ = [
+    # Core surface.
+    "App", "FastAPI", "Lancelot", "APIRouter", "Request",
+    "TestClient", "gather", "run", "_ping",
+    # FastAPI-compat names (re-exported lazily — see __getattr__ below).
+    "Depends", "Security",
+    "Body", "Query", "Path", "Header", "Cookie", "Form", "File",
+    "UploadFile",
+    "HTTPException", "RequestValidationError",
+    "WebSocketException", "WebSocketDisconnect", "WebSocket",
+    "Response", "BackgroundTasks", "background",
+    "StaticFiles",
+]
 __version__ = "0.0.0"
+
+
+# FastAPI-compat lazy re-exports. Mapping `name → (module, attr_name)`.
+# Kept lazy so plain `import lancelot` doesn't pull starlette/python-multipart/
+# httpx (the pydantic-only runtime guard, M0 DoD #1).
+_FASTAPI_COMPAT = {
+    # DI surface (lancelot.params owns the param-fn dataclasses; same shape as
+    # fastapi.params).
+    "Depends":         ("lancelot.params", "Depends"),
+    "Security":        ("lancelot.params", "Security"),
+    "Body":            ("lancelot.params", "Body"),
+    "Query":           ("lancelot.params", "Query"),
+    "Path":            ("lancelot.params", "Path"),
+    "Header":          ("lancelot.params", "Header"),
+    "Cookie":          ("lancelot.params", "Cookie"),
+    "Form":            ("lancelot.params", "Form"),
+    "File":            ("lancelot.params", "File"),
+    # Exceptions.
+    "HTTPException":           ("lancelot.exceptions", "HTTPException"),
+    "RequestValidationError":  ("lancelot.exceptions", "RequestValidationError"),
+    "WebSocketException":      ("lancelot.exceptions", "WebSocketRequestValidationError"),
+    # Responses.
+    "Response":         ("lancelot.responses", "Response"),
+    # File upload helper.
+    "UploadFile":       ("lancelot.uploads", "UploadFile"),
+}
 
 
 def __getattr__(name):
@@ -49,4 +89,23 @@ def __getattr__(name):
         import importlib
 
         return importlib.import_module("lancelot.context")
+    # FastAPI-compat lazy re-exports (M5 drop-in adoption).
+    if name in _FASTAPI_COMPAT:
+        mod_name, attr_name = _FASTAPI_COMPAT[name]
+        import importlib
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError as e:
+            raise AttributeError(
+                f"lancelot.{name} is provided by an optional dependency "
+                f"that isn't installed ({mod_name}: {e}). Install the "
+                f"FastAPI-equivalent extras and retry."
+            ) from e
+        if not hasattr(mod, attr_name):
+            raise AttributeError(
+                f"lancelot.{name}: {mod_name}.{attr_name} is not exposed by "
+                f"this Lancelot version. Check the migration cookbook for "
+                f"the supported surface."
+            )
+        return getattr(mod, attr_name)
     raise AttributeError(f"module 'lancelot' has no attribute {name!r}")

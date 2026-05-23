@@ -190,7 +190,26 @@ class Route:
                         return True
                 return False
 
-            if _contains_response(_ret_hint):
+            # FastAPI behavior: if the WHOLE return annotation is a Response
+            # subclass, auto-treat as response_model=None (no schema/validation).
+            # If the return annotation is Union[Response, X] (ambiguous), THAT
+            # is the only case we raise — same as FastAPI's actual error path.
+            _ret_origin = typing.get_origin(_ret_hint)
+            import types as _ts2
+            _is_pure_response = (
+                isinstance(_ret_hint, type)
+                and _contains_response(_ret_hint)
+            )
+            _is_union_with_response = (
+                (_ret_origin is typing.Union or _ret_origin is _ts2.UnionType)
+                and _contains_response(_ret_hint)
+            )
+
+            if _is_pure_response:
+                # M5 drop-in: match FastAPI's auto-coerce behavior; no error.
+                if getattr(self, "response_model", None) is None:
+                    self.response_model = None  # explicit no-schema marker
+            elif _is_union_with_response:
                 from lancelot.exceptions import FastAPIError
 
                 raise FastAPIError(

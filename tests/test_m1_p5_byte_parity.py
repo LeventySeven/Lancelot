@@ -92,7 +92,7 @@ def test_sync_dependency_offloaded_and_bytes_match_fastapi():
     from lancelot.params import Depends as LDepends
 
     def build(F):
-        is_fa = hasattr(F, "FastAPI")
+        is_fa = F.__name__ == "fastapi"  # M5: lancelot.FastAPI is now an alias for App
         app = F.FastAPI() if is_fa else F.App()
         Dep = F.Depends if is_fa else LDepends
 
@@ -170,7 +170,7 @@ def test_background_tasks_run_after_response_like_fastapi():
     from lancelot.testclient import TestClient as LC
 
     def build(F, sink):
-        is_fa = hasattr(F, "FastAPI")
+        is_fa = F.__name__ == "fastapi"  # M5: lancelot.FastAPI is now an alias for App
         app = F.FastAPI() if is_fa else F.App()
         BT = (fastapi.BackgroundTasks if is_fa
               else __import__("lancelot", fromlist=["BackgroundTasks"]
