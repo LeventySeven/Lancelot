@@ -25,6 +25,12 @@ echo "==> M5 exit-gate VPS deploy ($(uname -sm))"
 echo "    git=${LANCELOT_GIT_URL}#${LANCELOT_GIT_REF}"
 echo "    dir=${PROJECT_DIR}  domain=${LANCELOT_DOMAIN:-<plain http>}"
 
+# Guard: PROJECT_DIR must not contain spaces — the generated systemd
+# ExecStart= line uses unquoted paths.
+case "$PROJECT_DIR" in
+  *\ *) echo "ERROR: PROJECT_DIR='$PROJECT_DIR' contains spaces; pick a path without spaces (default /opt/lancelot-m5 is safe)." >&2; exit 1;;
+esac
+
 # --- 1. System packages ---
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
@@ -99,6 +105,9 @@ User=${APP_USER}
 WorkingDirectory=${PROJECT_DIR}
 Environment="LC_UPSTREAM_URL=http://127.0.0.1:8901" "LC_EMBED_SIZE=4096" "LC_BATCH_WINDOW_MS=50" "LC_BATCH_MAX=16" ${port_env}
 ExecStart=${cmd}
+# NB: paths in cmd above must not contain spaces — PROJECT_DIR defaults to
+# /opt/lancelot-m5 (safe). If you override PROJECT_DIR to a path with
+# spaces, wrap cmd in quotes here or pre-escape.
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
