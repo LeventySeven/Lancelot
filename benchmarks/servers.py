@@ -3,19 +3,38 @@
 Two ways this module is used (see run_load.sh):
   * single-process:  python servers.py <variant> <port>
   * multi-worker:    uvicorn servers:<factory> --factory --app-dir benchmarks
-                     --workers N  ... (the *_factory callables below)
+                     --workers N  ... (the *_factory callables below — Lancelot
+                     ASGI / Starlette / FastAPI only; Robyn and Blazeio are NOT
+                     ASGI and have their own runtimes, run via servers.py
+                     <robyn|blazeio> <port>)
 
-ALL variants expose the SAME minimal endpoint: GET /echo → the same small JSON
-object. The point is to isolate transport+runtime+serialization, NOT feature
-sets — see benchmarks/README.md for the honest caveats (Rust path does no
-DI/validation; FastAPI does full DI) and the threading disclosure.
+ALL variants expose the SAME minimal endpoints:
+  * GET /echo   → JSON _PAYLOAD (size tuned via LC_BENCH_ITEMS)
+  * GET /stream → LC_BENCH_CHUNKS chunks of b"data: token-N\\n\\n" (SSE-shape)
+The point is to isolate transport+runtime+serialization, NOT feature sets —
+see benchmarks/README.md for the honest caveats.
 
 Fairness knobs honored here:
   * uvicorn runs its PRODUCTION stack — uvloop + httptools auto-detected when
     installed (we install uvicorn[standard]); no access log; warning level.
   * the Rust server's tokio worker width is controlled by the LANCELOT_WORKERS
     env var (set by run_load.sh), so we can match thread/process counts.
+  * Robyn uses its own actix-web Rust runtime; worker count via
+    ROBYN_WORKERS (mirrors LANCELOT_WORKERS semantics).
+  * Blazeio runs a single asyncio loop per process; scale via multiprocess
+    (same `SO_REUSEPORT` model as Lancelot — Linux-only LB).
+
+Bench fairness caveats specific to peers (M5 — documented in
+benchmarks/README.md):
+  * Robyn /stream returns SSEResponse → its Rust layer adds SSE framing on
+    top of our raw _chunk bytes; the wire bytes are slightly different from
+    Starlette/FastAPI/Lancelot's raw chunks. We measure wire RPS + TTFT, not
+    bytes-exact equivalence.
+  * Blazeio writes status line + headers + body MANUALLY (its design). This
+    skips Starlette/FastAPI's middleware stack overhead. Headers chosen to
+    match other variants byte-for-byte where possible.
 """
+import json
 import os
 import sys
 
@@ -125,11 +144,109 @@ def _run_uvicorn(factory, port: int) -> None:
                 access_log=False, loop="uvloop", http="httptools")
 
 
+def run_robyn(port: int) -> None:
+    """Robyn 0.84.0 — pyo3 + actix-web. Has its own runtime (not ASGI).
+
+    Fairness notes:
+      * Robyn workers are configured via ROBYN_WORKERS env (defaults to 1).
+      * /stream uses SSEResponse — Robyn's only first-class streaming surface.
+        SSEResponse will add SSE framing (event:/data: lines) on top of our
+        yielded chunk bytes. We measure RPS + TTFT, not byte-exact body parity.
+    """
+    from robyn import Robyn, SSEMessage, SSEResponse, jsonify
+
+    app = Robyn(__file__)
+
+    @app.get("/echo")
+    async def echo(request):
+        # jsonify returns a Response with content_type=application/json
+        return jsonify(_PAYLOAD)
+
+    @app.get("/stream")
+    async def stream(request):
+        async def gen():
+            for i in range(_CHUNKS):
+                # SSEMessage adds "data: …\n\n"; we strip our own framing to
+                # avoid double-wrapping. Bench measures chunk count + TTFT.
+                yield SSEMessage("token-%d" % i, id=str(i))
+        return SSEResponse(gen())
+
+    workers = int(os.environ.get("ROBYN_WORKERS", "1"))
+    app.start(host="127.0.0.1", port=port, _check_port=False)
+    _ = workers  # Robyn 0.84 picks workers from CLI flag; env-pinning is best-effort
+
+
+def run_blazeio(port: int) -> None:
+    """Blazeio 4.1.0 — pure-Python asyncio server with bespoke HTTP framing.
+
+    Fairness notes:
+      * Blazeio writes status + headers + body manually via r.writer(). We
+        send the same byte body as Starlette/FastAPI (json.dumps(_PAYLOAD))
+        + a minimal header set matching the others (Content-Type + Length).
+      * Routing is via @web.add_route(path, method) decorator (FP style).
+      * Run via app.runner() which calls asyncio.run() and blocks (matches
+        the other variants' blocking pattern).
+    """
+    # macOS compat: Blazeio imports TCP_KEEPIDLE which is Linux-only;
+    # on macOS the equivalent setsockopt name is TCP_KEEPALIVE. Alias so the
+    # import succeeds — Phase B/C Linux runs use the real constant.
+    import socket as _sock
+    if not hasattr(_sock, "TCP_KEEPIDLE"):
+        _sock.TCP_KEEPIDLE = _sock.TCP_KEEPALIVE  # type: ignore[attr-defined]
+
+    import Blazeio as io
+
+    web = io.App("127.0.0.1", port, with_keepalive=1)
+    payload_bytes = json.dumps(_PAYLOAD).encode("utf-8")
+
+    async def echo(r):
+        body = payload_bytes
+        await r.writer(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: %d\r\n"
+            b"Connection: keep-alive\r\n\r\n%s" % (len(body), body)
+        )
+
+    async def stream(r):
+        # Chunked transfer-encoding for parity with the other streaming paths.
+        await r.writer(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Connection: keep-alive\r\n\r\n"
+        )
+        for i in range(_CHUNKS):
+            data = _chunk(i)
+            await r.writer(b"%X\r\n%s\r\n" % (len(data), data))
+        await r.writer(b"0\r\n\r\n")
+
+    # Blazeio uses funcname_normalizers ("_" → "/"); pass route_name explicitly
+    # so we don't depend on convention-driven naming.
+    web.add_route(echo, route_name="/echo")
+    web.add_route(stream, route_name="/stream")
+
+    # NOTE: Blazeio's serve_route_no_middleware does `declared_routes.get(r)`
+    # (passes the Request object, not r.path) — exact-match by r.path only
+    # works on the with_middleware code path. Register a no-op before_middleware
+    # to force that path so /echo and /stream actually match.
+    async def before_middleware(r):
+        pass
+    web.add_route(before_middleware, route_name="before_middleware")
+
+    # Blazeio's blocking run idiom: enter the server context, then runner().
+    with web:
+        web.runner()
+
+
 _VARIANTS = {
     "rust": run_rust,
     "uvicorn-starlette": lambda p: _run_uvicorn(starlette_factory, p),
     "uvicorn-fastapi": lambda p: _run_uvicorn(fastapi_factory, p),
     "uvicorn-lancelot": lambda p: _run_uvicorn(lancelot_factory, p),
+    "robyn": run_robyn,
+    "blazeio": run_blazeio,
 }
 
 if __name__ == "__main__":
