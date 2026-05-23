@@ -1,0 +1,13 @@
+{
+  "n_total": 30,
+  "n_closed_by_server": 30,
+  "n_errored": 0,
+  "n_responded": 0,
+  "p50_close_s": 5.035086042014882,
+  "p95_close_s": 5.040089084010106,
+  "max_close_s": 5.040560417022789,
+  "duration_s": 5,
+  "dribble_ms": 200,
+  "connections": 30,
+  "target": "127.0.0.1:18951"
+}

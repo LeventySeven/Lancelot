@@ -1,0 +1,2 @@
+slow-loris driver done: total=30 closed-by-server=30 errored=0 responded=0 p50_close=5.04s p95_close=5.04s max_close=5.04s
+json written to /Users/seventyleven/Desktop/Lancelot/benchmarks/results/M5/mixed/rust.slowloris.json
