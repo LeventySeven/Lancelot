@@ -200,22 +200,29 @@ def run_blazeio(port: int) -> None:
     payload_bytes = json.dumps(_PAYLOAD).encode("utf-8")
 
     async def echo(r):
-        body = payload_bytes
-        await r.writer(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/json\r\n"
-            b"Content-Length: %d\r\n"
-            b"Connection: keep-alive\r\n\r\n%s" % (len(body), body)
+        # Use Blazeio's prepare() so its internal keepalive state machine sees
+        # the response correctly. Manual r.writer() with HTTP/1.1 head bypasses
+        # that state machine and breaks at c≥4 (0% success on oha c=50).
+        await r.prepare(
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload_bytes)),
+            },
+            status=200,
         )
+        await r.writer(payload_bytes)
 
     async def stream(r):
-        # Chunked transfer-encoding for parity with the other streaming paths.
-        await r.writer(
-            b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: text/event-stream\r\n"
-            b"Transfer-Encoding: chunked\r\n"
-            b"Cache-Control: no-cache\r\n"
-            b"Connection: keep-alive\r\n\r\n"
+        # Chunked transfer-encoding for parity with the other streaming paths;
+        # encode_resp=False so Blazeio doesn't double-frame the chunks.
+        await r.prepare(
+            headers={
+                "Content-Type": "text/event-stream",
+                "Transfer-Encoding": "chunked",
+                "Cache-Control": "no-cache",
+            },
+            status=200,
+            encode_resp=False,
         )
         for i in range(_CHUNKS):
             data = _chunk(i)
