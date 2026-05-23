@@ -1,0 +1,25 @@
+# Docker build context restricter for the exit-gate image.
+# Keep the build context lean — only what we actually need.
+
+# Build artifacts.
+target/
+**/target/
+*.so
+*.pyd
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local benches' raw results.
+benchmarks/results/
+
+# Conformance harness (huge; not needed for deploy).
+conformance/
+
+# IDE / OS junk.
+.DS_Store
+.idea/
+.vscode/
+*.swp

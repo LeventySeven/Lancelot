@@ -1,0 +1,105 @@
+# M5 exit-gate Render Blueprint — Phase B (adoption-signal deploy).
+#
+# One Docker image, four Web Services (one per framework) + one private
+# Mock-Upstream service. All services share the image; FRAMEWORK env
+# selects which app starts.
+#
+# To deploy: connect this repo in the Render dashboard → New Blueprint
+# → point at benchmarks/m5/exit_gate/render.yaml.
+
+services:
+  # ---- Shared mock LLM/vector backend (private; not exposed to internet) ----
+  - type: pserv  # private service — internal-only, talked to by the apps
+    name: m5-mock-upstream
+    runtime: image
+    rootDir: .
+    dockerfilePath: ./benchmarks/m5/exit_gate/Dockerfile
+    dockerCommand: python /app/mock_upstream.py 8901
+    plan: starter
+    envVars:
+      - key: MOCK_TTFT_MS
+        value: "10"
+      - key: MOCK_TOK_PER_S
+        value: "50"
+      - key: MOCK_TOKENS
+        value: "200"
+      - key: MOCK_LOOKUP_CAP
+        value: "8"
+      - key: MOCK_LOOKUP_MS
+        value: "50"
+
+  # ---- Lancelot — the framework under test ----
+  - type: web
+    name: m5-lancelot
+    runtime: image
+    rootDir: .
+    dockerfilePath: ./benchmarks/m5/exit_gate/Dockerfile
+    plan: starter
+    envVars:
+      - key: FRAMEWORK
+        value: lancelot
+      - key: PORT
+        value: "8910"
+      - key: LC_UPSTREAM_URL
+        value: http://m5-mock-upstream:8901
+      - key: LC_EMBED_SIZE
+        value: "4096"
+      - key: LC_BATCH_WINDOW_MS
+        value: "50"
+      - key: LC_BATCH_MAX
+        value: "16"
+    healthCheckPath: /healthz
+
+  # ---- FastAPI (peer baseline) ----
+  - type: web
+    name: m5-fastapi
+    runtime: image
+    rootDir: .
+    dockerfilePath: ./benchmarks/m5/exit_gate/Dockerfile
+    plan: starter
+    envVars:
+      - key: FRAMEWORK
+        value: fastapi
+      - key: PORT
+        value: "8911"
+      - key: LC_UPSTREAM_URL
+        value: http://m5-mock-upstream:8901
+      - key: LC_EMBED_SIZE
+        value: "4096"
+    healthCheckPath: /healthz
+
+  # ---- Robyn ----
+  - type: web
+    name: m5-robyn
+    runtime: image
+    rootDir: .
+    dockerfilePath: ./benchmarks/m5/exit_gate/Dockerfile
+    plan: starter
+    envVars:
+      - key: FRAMEWORK
+        value: robyn
+      - key: PORT
+        value: "8912"
+      - key: LC_UPSTREAM_URL
+        value: http://m5-mock-upstream:8901
+      - key: LC_EMBED_SIZE
+        value: "4096"
+    healthCheckPath: /healthz
+
+  # ---- Blazeio ----
+  - type: web
+    name: m5-blazeio
+    runtime: image
+    rootDir: .
+    dockerfilePath: ./benchmarks/m5/exit_gate/Dockerfile
+    plan: starter
+    envVars:
+      - key: FRAMEWORK
+        value: blazeio
+      - key: PORT
+        value: "8913"
+      - key: LC_UPSTREAM_URL
+        value: http://m5-mock-upstream:8901
+      - key: LC_EMBED_SIZE
+        value: "4096"
+    healthCheckPath: /healthz
