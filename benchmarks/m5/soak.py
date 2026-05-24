@@ -122,8 +122,14 @@ async def worker(client_session, base_url: str, route: str, body: bytes | None,
         next_send_at += interval
 
 
-def emit_window(writer, w: WindowStats, baseline_p99_ms: float | None) -> bool:
-    """Write one window row + apply guards. Returns False if a guard fired."""
+def emit_window(writer, w: WindowStats, baseline_p99_ms: float | None,
+                rss_history: list[tuple[float, float]] | None = None,
+                fd_history: list[tuple[float, int]] | None = None) -> bool:
+    """Write one window row + apply guards. Returns False if a guard fired.
+
+    rss_history / fd_history: optional rolling windows of (t_monotonic, value)
+    tuples used by G3 (RSS slope) + G4 (FD/task monotonic). Caller maintains
+    these so the function stays a pure emit+check."""
     succ = w.succ_rate()
     p50 = w.p(0.50)
     p95 = w.p(0.95)
@@ -153,7 +159,61 @@ def emit_window(writer, w: WindowStats, baseline_p99_ms: float | None) -> bool:
               f"[{int(w.t_start)}–{int(w.t_end)}]", flush=True)
         return False
 
+    # G3 (M6 T2.1): RSS slope > 5%/hour over the trailing 4-hour window.
+    # Only fires when we have enough history (≥2 h of samples) to compute a
+    # meaningful slope. Slope is computed via linear regression on
+    # (t_monotonic_seconds, rss_kb) pairs in the window.
+    if rss_history is not None and len(rss_history) >= 8:  # ≥8 samples = ≥2h at 30s/window? no, 8×30s=4 min — see threshold below
+        # Trim to the trailing 4-hour window.
+        t_now = rss_history[-1][0]
+        rss_4h = [(t, v) for (t, v) in rss_history if t_now - t <= 4 * 3600]
+        if len(rss_4h) >= max(8, int(2 * 3600 / 30)):  # need ≥2h of 30s windows
+            ts = [t for (t, _) in rss_4h]
+            vs = [v for (_, v) in rss_4h]
+            slope_per_sec = _linreg_slope(ts, vs)  # kb per second
+            mean_rss = sum(vs) / len(vs)
+            if mean_rss > 0:
+                slope_pct_per_hour = (slope_per_sec * 3600 / mean_rss) * 100
+                if slope_pct_per_hour > 5.0:
+                    print(f"GUARD G3 FAILED: RSS slope={slope_pct_per_hour:.2f}%/h "
+                          f"> 5.0%/h over {len(rss_4h)} samples in window "
+                          f"[{int(w.t_start)}–{int(w.t_end)}]", flush=True)
+                    return False
+
+    # G4 (M6 T2.1): FD count monotonically non-decreasing over the trailing
+    # 1-hour window. "Monotonic non-decreasing" = no sample drops below an
+    # earlier sample. We tolerate plateaus (consistent flat = fine); we fail
+    # only if EVERY sample in the window is >= the previous AND the last
+    # sample is meaningfully larger than the first (no return-to-baseline).
+    if fd_history is not None and len(fd_history) >= 12:  # ≥12 = 6 min minimum
+        t_now = fd_history[-1][0]
+        fd_1h = [(t, v) for (t, v) in fd_history if t_now - t <= 3600]
+        if len(fd_1h) >= max(12, int(0.5 * 3600 / 30)):  # need ≥30 min of samples
+            vs = [v for (_, v) in fd_1h]
+            # Monotonic non-decreasing test.
+            is_monotonic = all(vs[i] >= vs[i - 1] for i in range(1, len(vs)))
+            grew_meaningfully = vs[-1] >= vs[0] + max(10, int(vs[0] * 0.20))
+            if is_monotonic and grew_meaningfully:
+                print(f"GUARD G4 FAILED: FD count monotonic non-decreasing over "
+                      f"{len(fd_1h)} samples; first={vs[0]} last={vs[-1]} "
+                      f"in window [{int(w.t_start)}–{int(w.t_end)}]", flush=True)
+                return False
+
     return True
+
+
+def _linreg_slope(xs: list[float], ys: list[float]) -> float:
+    """Simple least-squares slope (no numpy dep). Returns dy/dx."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+    den = sum((xs[i] - mean_x) ** 2 for i in range(n))
+    if den == 0:
+        return 0.0
+    return num / den
 
 
 async def main_async(args) -> int:
@@ -193,6 +253,9 @@ async def main_async(args) -> int:
             t_unix_start = time.time()
             baseline_p99_ms: float | None = None
             baseline_windows_collected: list[float] = []
+            # G3 + G4 (M6 T2.1) rolling histories: (t_monotonic, value)
+            rss_history: list[tuple[float, float]] = []
+            fd_history: list[tuple[float, int]] = []
 
             while not stop_evt.is_set() and (time.monotonic() - t_start) < duration_s:
                 window = WindowStats(t_start=time.time(), t_end=0.0)
@@ -227,6 +290,12 @@ async def main_async(args) -> int:
                     window.rss_kb = rss
                     window.fd_count = fdc
                     window.task_count = tasks_n
+                    # G3/G4 rolling history — only meaningful when we have
+                    # real samples (remote-host path); local soak skips.
+                    if rss > 0:
+                        rss_history.append((time.monotonic(), rss))
+                    if fdc > 0:
+                        fd_history.append((time.monotonic(), fdc))
 
                 # Bake the baseline p99 over the first 10 minutes (= 600s).
                 if baseline_p99_ms is None:
@@ -240,7 +309,9 @@ async def main_async(args) -> int:
                                   f"(over {len(baseline_windows_collected)} windows)",
                                   flush=True)
 
-                ok = emit_window(writer, window, baseline_p99_ms)
+                ok = emit_window(writer, window, baseline_p99_ms,
+                                 rss_history if args.remote_host else None,
+                                 fd_history if args.remote_host else None)
                 fh.flush()
 
                 if not ok:
