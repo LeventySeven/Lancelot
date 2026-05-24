@@ -40,9 +40,71 @@ $HOME/.cargo/bin/cargo clippy --release --all-targets -- -D warnings
 
 If any of these go red, the chunk does not ship. The conformance floor is `passes=974` (= 99.6% of 978).
 
-## Current milestone state (as of m3-batch-validated)
+## Current milestone state (as of M7 distributed-plumbing+MCP+Rust-patterns)
+
+**M7 (2026-05-23/24) — distributed plumbing + MCP + 14 Rust-project patterns.** 15-of-17 active items shipped inline; only T3.1 (multi-region deploy recipes) + T2.6 (multi-region session-affinity verification) deferred — they need wall-clock deploy infra. Three transcripts/teardowns are the source of every item: YC RA `TRANSCRIPTS_YC_ROOT_ACCESS.md` (T1/T2/T3), `docs/peer-source-recheck/M7-RUST-PATTERNS.md` (T4, 14 patterns from 8 Rust-project teardowns). Headline: outbound LLM transport primitives (`spawn_child`, `fanout`, `lancelot.upstream_metrics`), distributed observability (`queue_wait_ms` + per-tenant cap, `/fleet/status`, region/worker tags), multi-region plumbing (`lancelot.secrets` w/ SIGHUP rotation, mTLS on TransportPool, region-aware route registration), Rust hot-path discipline (`intern!`, file:line on errors, audit comments for cooperation + scratch-pool). 347 tests passing, conformance 978/987 = 99.1% (≥974 floor). Tag: `m7-shipped-inline`.
 
 **This session (2026-05-21/22) — honest validation + M4 scoping.** Benchmarked the claimed wins under real load (oha). Found the Rust server's true envelope (wins large-payload serialization + streaming; loses tiny one-shot to uvicorn+uvloop; anti-scales w/ threads → multiprocess) AND found+fixed TWO headline features that shipped BROKEN for their real use case: the R3 streaming pump (16-26× regression → re-architected to parity-to-1.3×) and `@app.batch` (timer-flush self-cancel → 500 on awaiting handlers → fixed, validated ~12×/~16×). Tags: `m3-bench-honest`, `m3-bench-characterize`, `m3-stream-rearch`, `m3-stream-shutdown`, `m3-batch-validated`. **M2-M3 are complete; the next milestone is M4 "Prove & Harden" — see `docs/plans/M4-PLAN-PROVE-AND-HARDEN.md`** (thesis: shipped + green unit tests ≠ works under load; validate-then-harden the rest before any new surface).
+
+## M7 surface shipped (2026-05-24)
+
+**`lancelot.llm.TransportPool` extensions:**
+- `pool.spawn_child(parent_request, session_affinity=...)` — sub-agent primitive that snapshots parent's traceparent + request_id + agent_id + affinity, survives ContextVar reset (T1.1).
+- `pool.fanout(coros, first_n=, deadline=, cancel_laggards=True, concurrency=)` — Chroma parallel-probe pattern; partial failure shape; results in completion order (T1.2).
+- `pool.request()` auto-injects `x-request-id` + `x-agent-id` + `traceparent` (T1.1 inline).
+- `pool.reload_mtls()` for SIGHUP cert rotation (T3.4).
+- `TransportPool(mtls_cert=, mtls_key=, mtls_ca=)` mTLS toggle (T3.4).
+
+**`lancelot.upstream_metrics`** (T1.3 + T2.2):
+- Provider/model detection (OpenAI / Anthropic / Google / Groq / DeepSeek / Mistral / Together / Fireworks).
+- Token extraction across 3 provider shapes (OpenAI `prompt_tokens`, Anthropic `input_tokens`, Google `promptTokenCount`).
+- `set_rate_table()` + `LANCELOT_LLM_RATES` env JSON; Lancelot does NOT ship rates.
+- Structured error taxonomy: `ok` / `quota` / `timeout` / `permanent` / `transient` / `upstream_5xx`.
+- 6 new OTel histograms/counters under `lancelot.upstream.*`.
+- Cost accumulates into the parent's `cost_usd` ContextVar (Sim.ai end-to-end → X-Lancelot-Cost-USD trailer covers sub-LLM-calls automatically).
+
+**`lancelot.mcp.mount(app, path='/mcp', max_response_bytes=4096)`** (T1.4 + T1.5):
+- Top-level convenience that mirrors `app.mcp()`. Auto-discoverable by code-gen agents.
+- T1.5 minimal-return discipline: WARN log when tool returns > 4 KB (Dex Horthy pattern). Configurable / disable with 0.
+- Doc: `docs/operator/mcp-guidelines.md` (handle-and-fetch pattern, when big returns are right, schema-strict input as corollary).
+- Bonus fix: `App.call_tool(name, /, **kwargs)` positional-only `name` so tools with `name=...` argument don't collide.
+
+**`lancelot.context` ContextVars added:** `cost_usd`, `tokens_in`, `tokens_out`, `agent_id`, `tenant_id`, `queue_wait_ms` — all with sane sentinel defaults; read by ASGI seam in `finally` and passed to `record_request`.
+
+**`lancelot.metrics`** (T2.1 + T2.4 + T2.5 + T4.8):
+- `lancelot.http.cost.usd` histogram (T2.1).
+- `_bounded_tenant()` + `LANCELOT_TENANT_LABEL_MAX` (T2.4) — over-cap → `_overflow_` bucket.
+- `http.status_code` attr now on every metric (T2.5) — adverse-path slicing.
+- `lancelot.http.queue_wait_ms` histogram (T4.8).
+- `X-Lancelot-Cost-USD` response header (6-decimal) when cost_usd > 0.
+
+**`lancelot.tenant.TenantConcurrencyLimiter`** (T4.8) — opt-in ASGI middleware. Per-tenant `asyncio.Semaphore`; tenant from header (default `X-Tenant-Id`); anon shares `_anon_` bucket; env `LANCELOT_TENANT_CONCURRENCY` or explicit kwarg; cap=0 disables.
+
+**`lancelot.fleet`** (T2.3):
+- `region()`, `worker_id()`, `started_at()`, `fleet_info(app)`, `install_otel_resource_attrs()`.
+- Env: `LANCELOT_REGION` (default `default`), `LANCELOT_WORKER_ID` (default PID).
+- `/fleet/status` GET endpoint auto-registered: {region, worker_id, status, in_flight, uptime_s, lancelot_version}. status flips to "draining" on initiate_shutdown().
+
+**`@app.get('/x', region='eu-west-1')`** (T3.5) — region-pinned routes; non-matching workers silently drop the route. Zero hot-path cost; failover is the LB's job.
+
+**`lancelot.secrets`** (T3.2):
+- Backends: `EnvBackend` (default), `FileBackend`, `VaultBackend`, `InfisicalBackend`, `AwsSecretsManagerBackend`. All non-env backends lazy-import their SDK (cardinal rule).
+- `lancelot.secrets.get(name)` / `configure(backend)` / `rotate()` / `install_sighup_handler()` / `set_audit_hook(fn)`.
+- Audit hook is fail-safe (a raising hook is logged but does not propagate).
+
+**`lancelot.memory_pool.MemoryPool(total_bytes)`** (T4.6) — DataFusion TrackConsumersPool pattern:
+- `pool.reserve(name, n_bytes)` returns RAII `MemoryReservation` (sync `with` OR async `async with`).
+- `ResourcesExhausted(top_consumer=, top_consumer_bytes=, requested_bytes=, available_bytes=)` — error names the top consumer in human bytes ("Top consumer: 'embed:acme' holding 380.0MB").
+
+**Rust hot-path wins:**
+- `intern!` on `__anext__` / `__aiter__` / `media_type` / `pydantic_core` / `to_json` / `orjson.dumps` / `asyncio` / `new_event_loop` (T4.13).
+- Sized header Vec from HeaderMap.len() to avoid mid-collect realloc (T4.14 micro-improvement).
+- File:line on Rust↔Python boundary errors (T4.12 — lightweight, no snafu dep).
+- T4.1 cfg(test) buffer=1 (forces backpressure code path under every unit test) + T4.2 select_biased! (SIGTERM priority compile-time-guaranteed) + T4.9 set_retry_hint (Turbopuffer pattern) + T4.10 Levenshtein 404 + T4.11 SIGINT poll — all shipped earlier in this session.
+
+**M7 deferred (need wall-clock deploy infra):**
+- T3.1 multi-region deploy recipes (Render multi-region + AWS multi-AZ + Fly.io) — needs ~9-12h wall clock to provision + 1h soak each.
+- T2.6 multi-region session-affinity verification — gates on T3.1.
 
 **M4-V1 (resilience under adversarial load) IN PROGRESS** (`tests/test_m4_resilience_load.py`, real server + subprocess): V1.1 slow-loris ✓, V1.2 body-cap flood ✓, V1.3 connection-cap throttle ✓ — all held. **V1.4 graceful drain was BROKEN** (the THIRD headline feature to fail under load, after streaming + batch): on SIGTERM the Rust server cut in-flight requests at the 100ms window + cancelled them → 500, NOT drained (Robyn-style hard-kill — the exact B1 anti-goal). Fixed in `serve()`: `graceful_break` now `acquire_many_owned(max_conns)` (drains until every in-flight connection releases its permit, bounded by `drain_timeout()`) while still inside `run_until_complete` so handlers finish. New operator knobs: `LANCELOT_HEADER_TIMEOUT_MS` (slow-loris deadline, default 15000), `LANCELOT_MAX_CONNECTIONS` (default 1024), `LANCELOT_DRAIN_SECS` (graceful-drain deadline, default 10). Remaining: V1.5 per-route timeout under concurrency, then Tier-V2/V3.
 
