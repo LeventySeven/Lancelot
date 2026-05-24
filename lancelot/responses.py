@@ -67,6 +67,24 @@ class Response:
         clean = str(key).replace("\r", "").replace("\n", "")
         self.headers["x-session-affinity"] = clean
 
+    def set_retry_hint(self, should_retry: bool) -> None:
+        """M7 T4.9 (Turbopuffer pattern): tell the client whether THIS
+        specific response is retry-safe. Server-controlled retry overrides
+        the client SDK's status-code defaults. Use cases:
+          - status=500 BUT should_retry=False ("permanent server error,
+            don't pound us with retries on this") — back-pressure to the
+            caller during a real outage instead of thundering-herd retries.
+          - status=409 (conflict) WITH should_retry=True ("transient
+            lock-conflict, retry after backoff").
+          - status=429 (rate-limit) WITH should_retry=True paired with the
+            standard Retry-After header.
+
+        Emits `X-Should-Retry: true` or `X-Should-Retry: false`. Clients
+        that don't read it fall back to the SDK's status-code defaults.
+        Pairs with @app.batch: surface upstream-LLM backpressure cleanly
+        to callers without thundering-herd retries on a real outage."""
+        self.headers["x-should-retry"] = "true" if should_retry else "false"
+
 
 class HTMLResponse(Response):
     media_type = "text/html; charset=utf-8"

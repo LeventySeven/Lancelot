@@ -221,14 +221,26 @@ impl ChunkSink {
 /// cost of up to `depth × chunk_size` buffered per in-flight stream. Tunable via
 /// `LANCELOT_STREAM_BUFFER` (clamped [1, 4096]); default 256 — tuned so small
 /// (token-stream) chunks rarely block while keeping memory bounded.
+///
+/// M7 T4.1 (Zed ZED.md:6157-6165 pattern): under `cfg(test)` the default is
+/// FORCED to 1, so every unit test exercises the backpressure await-capacity
+/// code path. The M4 reckoning found 4 features broken under load that were
+/// all green on tests; buffer=1 makes the backpressure branch unavoidable.
+/// The user-facing `LANCELOT_STREAM_BUFFER` override still works in tests
+/// (e.g. an explicit ≥2 stress test) — but the DEFAULT under tests is 1.
 fn stream_buffer() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
+        // Default differs between prod and test (M7 T4.1).
+        #[cfg(test)]
+        const DEFAULT: usize = 1;
+        #[cfg(not(test))]
+        const DEFAULT: usize = 256;
         std::env::var("LANCELOT_STREAM_BUFFER")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(256)
+            .unwrap_or(DEFAULT)
             .min(4096)
     })
 }
