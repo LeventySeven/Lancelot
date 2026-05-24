@@ -4,15 +4,38 @@ build-backend = "maturin"
 
 [project]
 name = "lancelot"
-version = "0.0.0"
+version = "0.1.0"
+description = "FastAPI-compatible Python AI/cloud/web backend framework (Rust core via pyo3 + hyper + tokio)"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.7"]
+readme = "README.md"
+license = { text = "Apache-2.0" }
+keywords = ["fastapi", "asgi", "ai", "llm", "streaming", "backend", "framework", "rust", "pyo3"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 
 # Runtime dep stays pydantic-ONLY (cardinal rule). These extras are opt-in and
 # never pulled by `import lancelot`. `bench` = the load-comparison baselines
 # (benchmarks/); the `oha` load tool is a separate Rust binary (cargo install oha).
+# `orjson` = optional faster JSON serializer (M6 T1.2 auto-detect); `mcp` =
+# soft dep for the docs server in tools/mcp_docs_server.py.
 [project.optional-dependencies]
 bench = ["uvicorn[standard]>=0.30"]
+orjson = ["orjson>=3.10"]
+mcp = ["mcp[cli]>=1.0"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

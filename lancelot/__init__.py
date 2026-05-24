@@ -21,7 +21,7 @@ __all__ = [
     "Response", "BackgroundTasks", "background",
     "StaticFiles",
 ]
-__version__ = "0.0.0"
+__version__ = "0.1.0"
 
 
 # FastAPI-compat lazy re-exports. Mapping `name → (module, attr_name)`.
