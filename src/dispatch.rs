@@ -130,9 +130,12 @@ pub fn _drive(
     let body = Bytes::copy_from_slice(body);
     // RAII: the loop is closed on EVERY exit path by the guard's Drop
     // (m12-lifecycle) — no hand-rolled close-on-each-path.
+    // M7 T4.13: intern hot-path attr names. `new_event_loop` is called
+    // ONCE per dispatch (cold-ish) but the asyncio symbol IS used per-
+    // request via the dispatch task; cheap to intern at the call site.
     let guard = crate::gil::EventLoop::new(
-        py.import("asyncio")?
-            .call_method0("new_event_loop")?
+        py.import(pyo3::intern!(py, "asyncio"))?
+            .call_method0(pyo3::intern!(py, "new_event_loop"))?
             .unbind(),
     );
     let event_loop = guard.bind(py);

@@ -144,8 +144,9 @@ impl Request {
 fn from_json_fn(py: Python<'_>) -> Option<Py<PyAny>> {
     static F: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
     F.get_or_init(py, || {
-        py.import("pydantic_core")
-            .and_then(|pc| pc.getattr("from_json"))
+        // M7 T4.13: intern! the module name + attr name.
+        py.import(pyo3::intern!(py, "pydantic_core"))
+            .and_then(|pc| pc.getattr(pyo3::intern!(py, "from_json")))
             .map(|f| f.unbind())
             .ok()
     })

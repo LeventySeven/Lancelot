@@ -79,11 +79,15 @@ fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// NOT `__anext__`/`__aiter__`, so it correctly returns None and falls through
 /// to the regular await path (audit #6 — distinction verified).
 pub fn as_async_iter(obj: &Bound<'_, PyAny>) -> Option<Py<PyAny>> {
-    if obj.hasattr("__anext__").unwrap_or(false) {
+    // M7 T4.13 (LAKESAIL.md:854 intern! pattern): cache the PyString for
+    // hot attribute names so the lookup is pointer-equality, not a fresh
+    // string alloc + hash + comparison each time.
+    let py = obj.py();
+    if obj.hasattr(pyo3::intern!(py, "__anext__")).unwrap_or(false) {
         return Some(obj.clone().unbind());
     }
-    if obj.hasattr("__aiter__").unwrap_or(false) {
-        if let Ok(it) = obj.call_method0("__aiter__") {
+    if obj.hasattr(pyo3::intern!(py, "__aiter__")).unwrap_or(false) {
+        if let Ok(it) = obj.call_method0(pyo3::intern!(py, "__aiter__")) {
             return Some(it.unbind());
         }
     }
@@ -102,7 +106,8 @@ pub fn as_async_iter(obj: &Bound<'_, PyAny>) -> Option<Py<PyAny>> {
 /// if the cleaned value is empty/invalid.
 pub fn stream_media_type(obj: &Bound<'_, PyAny>) -> String {
     const DEFAULT: &str = "application/jsonl";
-    if let Ok(mt) = obj.getattr("media_type") {
+    // M7 T4.13: intern the hot-path attr name.
+    if let Ok(mt) = obj.getattr(pyo3::intern!(obj.py(), "media_type")) {
         if let Ok(s) = mt.extract::<String>() {
             let cleaned: String = s
                 .chars()
@@ -122,8 +127,11 @@ pub fn stream_media_type(obj: &Bound<'_, PyAny>) -> String {
 /// end), Err for any other Python exception.
 async fn next_chunk(locals: &TaskLocals, gen: &Py<PyAny>) -> PyResult<Option<Bytes>> {
     // Scope 1 (GIL, sync — no .await): bridge the coroutine.
+    // M7 T4.13: __anext__ is called once per chunk — the hottest of all
+    // attr lookups in the streaming path. intern! makes it a pointer
+    // equality compare instead of a fresh string + hash per chunk.
     let fut = crate::gil::with_gil(|py| -> PyResult<_> {
-        let coro = gen.bind(py).call_method0("__anext__")?;
+        let coro = gen.bind(py).call_method0(pyo3::intern!(py, "__anext__"))?;
         pyo3_async_runtimes::into_future_with_locals(locals, coro)
     })?;
     // GIL DROPPED across the await — other tasks/requests progress.

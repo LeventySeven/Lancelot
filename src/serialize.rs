@@ -19,8 +19,9 @@ use pyo3::types::PyBytes;
 fn to_json_fn(py: Python<'_>) -> Option<Py<PyAny>> {
     static F: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
     F.get_or_init(py, || {
-        py.import("pydantic_core")
-            .and_then(|pc| pc.getattr("to_json"))
+        // M7 T4.13: intern the hot-path module + attr names.
+        py.import(pyo3::intern!(py, "pydantic_core"))
+            .and_then(|pc| pc.getattr(pyo3::intern!(py, "to_json")))
             .map(|f| f.unbind())
             .ok()
     })
@@ -37,8 +38,9 @@ fn to_json_fn(py: Python<'_>) -> Option<Py<PyAny>> {
 fn orjson_dumps_fn(py: Python<'_>) -> Option<Py<PyAny>> {
     static F: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
     F.get_or_init(py, || {
-        py.import("orjson")
-            .and_then(|oj| oj.getattr("dumps"))
+        // M7 T4.13: intern the hot-path module + attr names.
+        py.import(pyo3::intern!(py, "orjson"))
+            .and_then(|oj| oj.getattr(pyo3::intern!(py, "dumps")))
             .map(|f| f.unbind())
             .ok()
     })
