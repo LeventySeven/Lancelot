@@ -163,8 +163,11 @@ pub fn _drive(
                 match joined {
                     Ok(r) => out.push(r?),
                     Err(e) => {
+                        // M7 T4.12: error includes Rust file:line so the
+                        // Python traceback names both Python + Rust frames.
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "dispatch task failed: {e}"
+                            "dispatch task failed at {}:{}: {e}",
+                            file!(), line!()
                         )))
                     }
                 }

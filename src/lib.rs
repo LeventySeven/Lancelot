@@ -45,21 +45,36 @@ fn run(
     let mut const_bodies: Vec<Option<crate::service::Prebaked>> = Vec::new();
     let mut slot = 0usize;
     for (method, path, h) in routes {
-        // Propagate a duplicate/malformed-route error as a clean Python
-        // ValueError at startup instead of panicking across the FFI seam.
-        router
-            .add(&method, &path, slot)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        // M7 T4.12: registration errors include the Rust source location
+        // so the operator's traceback names the file:line in addition to
+        // the Python frame. Replaces the prior `PyValueError::new_err(e)`
+        // (just the message). Done at the call site here rather than
+        // a snafu macro — 9 ad-hoc sites total, all in this file/service.rs.
+        router.add(&method, &path, slot).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "route registration failed at {}:{}: {} (method={}, path={})",
+                file!(), line!(), e, method, path
+            ))
+        })?;
         handlers.push(h);
         const_bodies.push(None);
         slot += 1;
     }
     for (method, path, body, content_type, status) in const_routes {
         let pre = crate::service::Prebaked::new(status, &content_type, body)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        router
-            .add(&method, &path, slot)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "const-route prebake failed at {}:{}: {} \
+                     (method={}, path={}, content-type={}, status={})",
+                    file!(), line!(), e, method, path, content_type, status
+                ))
+            })?;
+        router.add(&method, &path, slot).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "const-route registration failed at {}:{}: {} (method={}, path={})",
+                file!(), line!(), e, method, path
+            ))
+        })?;
         handlers.push(py.None()); // placeholder; never called
         const_bodies.push(Some(pre));
         slot += 1;
