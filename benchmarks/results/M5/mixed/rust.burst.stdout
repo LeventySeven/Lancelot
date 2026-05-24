@@ -1,0 +1,10 @@
+burst client start: host=127.0.0.1:18951 path=/echo burst_c=100 burst_period_s=10.0 burst_duration_s=3.0 total_duration_s=30.0
+burst #1 starting @ t=0.0s (c=100, dur=3.0s)
+burst #1 done: n_ok=7916 n_err=0 p50=33.61ms p99=96.27ms
+burst #2 starting @ t=10.0s (c=100, dur=3.0s)
+burst #2 done: n_ok=7325 n_err=0 p50=36.00ms p99=137.99ms
+burst #3 starting @ t=20.0s (c=100, dur=3.0s)
+burst #3 done: n_ok=7248 n_err=0 p50=36.29ms p99=117.73ms
+
+burst total: bursts=3 n_ok=22489 n_err=0 avg=38.05ms p50=35.26 p99=116.64
+json written: /Users/seventyleven/Desktop/Lancelot/benchmarks/results/M5/mixed/rust.burst.json

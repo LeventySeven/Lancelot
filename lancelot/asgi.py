@@ -220,22 +220,26 @@ async def _http(app, scope, receive, send):
         in_flight_delta(-1)
         try:
             from lancelot.metrics import record_request
-            # M7 T2.1 + T2.4: pass tenant + cost into the metric record.
-            # Both default to "-"/0.0 if the handler didn't set them; no
-            # cardinality / cost-metric inflation in the common case.
+            # M7 T2.1 + T2.4 + T4.8: pass tenant + cost + queue_wait_ms
+            # into the metric record. All default to "-"/0.0 if the
+            # handler/middleware didn't set them; no cardinality / cost /
+            # queue-wait pollution in the common case.
             try:
                 from lancelot.context import (
                     cost_usd as _cost_var,
                     tenant_id as _tenant_var,
+                    queue_wait_ms as _qw_var,
                 )
                 _cost = _cost_var.get()
                 _tenant = _tenant_var.get()
+                _qw = _qw_var.get()
             except Exception:  # noqa: BLE001
-                _cost, _tenant = 0.0, "-"
+                _cost, _tenant, _qw = 0.0, "-", 0.0
 
             record_request(path, method, _final_status_holder[0],
                            _time.perf_counter() - _t0,
-                           tenant=_tenant, cost_usd=_cost)
+                           tenant=_tenant, cost_usd=_cost,
+                           queue_wait_ms=_qw)
         except Exception:  # noqa: BLE001
             pass
         try:

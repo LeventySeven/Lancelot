@@ -93,6 +93,17 @@ tenant_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "lancelot.tenant_id", default="-"
 )
 
+# M7 T4.8 (Turbopuffer pattern): time the request waited BEFORE the
+# handler started running (semaphore acquire, queue depth, etc.). Default
+# 0.0 → baseline is "always near zero"; anything > 0 means SOMETHING is
+# throttling the request. Set by middleware (e.g. TenantConcurrencyLimiter)
+# after its own semaphore acquire; read by ASGI seam to emit the
+# `lancelot.http.queue_wait_ms` histogram. The missing 3rd number after
+# RED + TTFT for multi-tenant AI backends — surfaces head-of-line blocking.
+queue_wait_ms: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "lancelot.queue_wait_ms", default=0.0
+)
+
 
 def parse_traceparent(value):
     """Validate a W3C `traceparent` header value → its 32-hex trace-id, or

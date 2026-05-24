@@ -62,6 +62,17 @@ def _maybe_bind():
                 unit="USD",
                 description="Per-request accumulated cost (USD) — handler-set.",
             ),
+            # M7 T4.8 (Turbopuffer pattern): time the request spent WAITING
+            # before the handler started (queue_wait = total_in_handler −
+            # pure_handler_compute). The missing third number after RED +
+            # TTFT for multi-tenant AI backends — surfaces head-of-line
+            # blocking + tenant-concurrency-cap saturation. Recorded once
+            # per request from the asgi seam.
+            "queue_wait_hist": meter.create_histogram(
+                "lancelot.http.queue_wait_ms",
+                unit="ms",
+                description="Time request waited before handler ran (ms).",
+            ),
         }
     except Exception:  # noqa: BLE001 — defensive; partial OTel installs
         _state = None
@@ -102,7 +113,8 @@ def _bounded_tenant(tenant: str) -> str:
 
 def record_request(route_path: str, method: str, status: int,
                    duration_s: float, tenant: str = "-",
-                   cost_usd: float = 0.0) -> None:
+                   cost_usd: float = 0.0,
+                   queue_wait_ms: float = 0.0) -> None:
     inst = _maybe_bind()
     if inst is None:
         return
@@ -128,6 +140,14 @@ def record_request(route_path: str, method: str, status: int,
             ch = inst.get("cost_hist")
             if ch is not None:
                 ch.record(cost_usd, attributes=attrs)
+        # M7 T4.8 (Turbopuffer pattern): queue-wait emit on every request
+        # (including the zero case — saturated semaphores ARE the signal;
+        # the histogram's "always-near-zero" baseline is what dashboards
+        # alert against). Cheap when OTel isn't installed (still gated by
+        # the early _maybe_bind None-return).
+        qw = inst.get("queue_wait_hist")
+        if qw is not None:
+            qw.record(queue_wait_ms, attributes=attrs)
     except Exception:  # noqa: BLE001 — never let telemetry kill a request
         pass
 
