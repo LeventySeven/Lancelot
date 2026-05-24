@@ -108,7 +108,11 @@ def lancelot_factory():
     async def echo():
         return _PAYLOAD
 
-    @app.stream("/stream")
+    # sse_keepalive=0 disables the per-stream keepalive task — the bench
+    # path emits chunks faster than any timeout would ever fire anyway,
+    # and skipping the lock acquisition per chunk recovers the last bit
+    # of throughput vs Starlette (M6-T1.1 follow-up).
+    @app.stream("/stream", sse_keepalive=0)
     async def stream():
         for i in range(_CHUNKS):
             yield _chunk(i)

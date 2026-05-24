@@ -605,72 +605,97 @@ async def _http_dispatch(app, scope, receive, send):
                 _buf_count = 0
                 _ttft_done = False
 
-                async def _flush():
+                # (M6-T1.1: original `_flush` removed; the
+                # `_flush_serialized` below replaces it and serializes
+                # sends through the keepalive lock — see fix note.)
+
+                _it = gen.__aiter__()
+                # M6-T1.1 (fixes M5 lab-body 10× regression on
+                # uvicorn-lancelot /stream): the previous loop wrapped
+                # every __anext__ in wait_for(shield(ensure_future(...))),
+                # so each chunk paid for 3 task allocations + a timeout
+                # handle just to enforce the SSE keepalive idle deadline.
+                # At c=50 × 256 chunks/req that's ~64k extra asyncio ops/s
+                # — the native rust R3 pump skips all of this (one
+                # _drain coroutine + sink.try_push per chunk).
+                #
+                # Fix: keepalive lives in a single background task that
+                # only fires when the main loop has been idle for _ka
+                # seconds. Sends are serialized through _send_locked
+                # (asyncio.Lock); the main loop is a clean async-for.
+                _last_send = _time.monotonic()
+                _send_lock = _asyncio.Lock() \
+                    if (_ka is not None and _ka > 0) else None
+
+                async def _send_serialized(msg):
+                    nonlocal _last_send
+                    if _send_lock is not None:
+                        async with _send_lock:
+                            await send(msg)
+                            _last_send = _time.monotonic()
+                    else:
+                        await send(msg)
+                        _last_send = _time.monotonic()
+
+                async def _flush_serialized():
                     nonlocal _buf, _buf_count, _ttft_done
                     if _buf:
                         if not _ttft_done:
-                            # TTFT: record time-to-first-chunk once (the AI-
-                            # streaming UX metric — research core/ is unanimous
-                            # it matters more than total duration). Measured from
-                            # request entry; keepalive pings don't count (they
-                            # send a separate b":\n\n", never through _flush).
                             _ttft_done = True
                             try:
                                 from lancelot.metrics import record_stream_ttft
                                 _st = scope.get("_lancelot_t0")
                                 if _st is not None:
                                     record_stream_ttft(
-                                        path, method, _time.perf_counter() - _st)
+                                        path, method,
+                                        _time.perf_counter() - _st)
                             except Exception:  # noqa: BLE001
                                 pass
-                        await send({"type": "http.response.body",
-                                    "body": bytes(_buf), "more_body": True})
+                        await _send_serialized({
+                            "type": "http.response.body",
+                            "body": bytes(_buf), "more_body": True})
                         _buf = bytearray()
                         _buf_count = 0
 
-                _it = gen.__aiter__()
-                # Long-lived __anext__ task; shielded from wait_for so a
-                # keepalive timeout does NOT cancel the in-flight handler
-                # awaitable. We rebuild the task only after an event is
-                # consumed (one-at-a-time, no concurrency).
-                _next_task = None
+                async def _keepalive_loop():
+                    # Wake up periodically; only emit a ping if idle has
+                    # exceeded _ka. Sleeping for half the window keeps
+                    # max-idle-before-ping at ≤1.5 × _ka in the worst case.
+                    try:
+                        while True:
+                            await _asyncio.sleep(_ka / 2.0)
+                            idle = _time.monotonic() - _last_send
+                            if idle >= _ka:
+                                # Flush any buffered chunks first so a
+                                # slow client doesn't lose data behind
+                                # the ping.
+                                await _flush_serialized()
+                                await _send_serialized({
+                                    "type": "http.response.body",
+                                    "body": b":\n\n", "more_body": True})
+                    except _asyncio.CancelledError:
+                        return
+
+                _kp_task = (_asyncio.ensure_future(_keepalive_loop())
+                            if _send_lock is not None else None)
                 try:
-                    while True:
-                        if _next_task is None or _next_task.done():
-                            if _next_task is None:
-                                _next_task = _asyncio.ensure_future(
-                                    _it.__anext__())
-                        try:
-                            event = await _asyncio.wait_for(
-                                _asyncio.shield(_next_task), timeout=_ka)
-                        except _asyncio.TimeoutError:
-                            # Flush any buffered events first so a slow
-                            # client doesn't lose chunks behind the ping.
-                            await _flush()
-                            await send({"type": "http.response.body",
-                                        "body": b":\n\n", "more_body": True})
-                            continue
-                        except StopAsyncIteration:
-                            _next_task = None
-                            break
-                        _next_task = None  # consumed; will rebuild
+                    async for event in _it:
                         _buf += _stream_chunk_bytes(event)
                         _buf_count += 1
                         if _buf_count >= _interval:
-                            await _flush()
+                            await _flush_serialized()
                 except _asyncio.CancelledError:
                     lreq._cancel_event.set()
-                    if _next_task is not None and not _next_task.done():
-                        _next_task.cancel()
                     raise
                 finally:
+                    if _kp_task is not None and not _kp_task.done():
+                        _kp_task.cancel()
                     if not _disc_watch.done():
                         _disc_watch.cancel()
-                    if _next_task is not None and not _next_task.done():
-                        _next_task.cancel()
-                    await _flush()
-                    await send({"type": "http.response.body",
-                                "body": b"", "more_body": False})
+                    await _flush_serialized()
+                    await _send_serialized({
+                        "type": "http.response.body",
+                        "body": b"", "more_body": False})
                 return
             # FastAPI: an async-generator handler (async def with yield)
             # returns the async-gen directly; calling it (no await) gives
