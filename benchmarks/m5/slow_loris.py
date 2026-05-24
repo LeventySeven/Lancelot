@@ -61,9 +61,13 @@ class Summary:
             self.closed_at_max_s = closes[-1]
 
 
-async def dribble_one(host: str, port: int, dribble_s: float, deadline_s: float) -> Outcome:
+async def dribble_one(host: str, port: int, dribble_s: float, deadline_s: float,
+                      jitter_s: float = 0.0) -> Outcome:
     """Connect, send GET, then dribble bytes one-by-one until the server
-    closes us OR the duration deadline elapses."""
+    closes us OR the duration deadline elapses. M6 T2.5: optional jitter_s
+    adds random uniform [-jitter_s, +jitter_s] noise to each dribble
+    interval — simulates flaky adversarial network conditions."""
+    import random as _rand
     o = Outcome()
     start = time.monotonic()
     try:
@@ -113,7 +117,13 @@ async def dribble_one(host: str, port: int, dribble_s: float, deadline_s: float)
             o.closed_at_s = time.monotonic() - start
             break
         try:
-            await asyncio.sleep(dribble_s)
+            # M6 T2.5: jitter the dribble interval if requested. Bounded
+            # below at 1ms to keep this useful (no zero-sleep busy loop).
+            if jitter_s > 0:
+                _jittered = max(0.001, dribble_s + _rand.uniform(-jitter_s, jitter_s))
+                await asyncio.sleep(_jittered)
+            else:
+                await asyncio.sleep(dribble_s)
         except asyncio.CancelledError:
             break
 
@@ -130,13 +140,15 @@ async def dribble_one(host: str, port: int, dribble_s: float, deadline_s: float)
 async def main_async(args: argparse.Namespace) -> int:
     deadline_s = args.duration_s
     dribble_s = args.dribble_ms / 1000.0
+    jitter_s = (args.jitter_ms or 0) / 1000.0
 
     sem = asyncio.Semaphore(args.connections)
     summary = Summary()
 
     async def run_one() -> None:
         async with sem:
-            o = await dribble_one(args.host, args.port, dribble_s, deadline_s)
+            o = await dribble_one(args.host, args.port, dribble_s,
+                                  deadline_s, jitter_s=jitter_s)
             summary.add(o)
 
     # Spawn args.connections tasks at once (the semaphore limits in-flight),
@@ -194,6 +206,9 @@ def parse_args() -> argparse.Namespace:
                    help="number of concurrent slow-loris conns to maintain")
     p.add_argument("--dribble-ms", type=int, default=200,
                    help="ms between each header byte (default 200)")
+    p.add_argument("--jitter-ms", type=int, default=0,
+                   help="M6 T2.5: optional random ±jitter on the dribble "
+                        "interval (default 0 = constant cadence)")
     p.add_argument("--duration-s", type=int, default=30,
                    help="total run duration in seconds")
     p.add_argument("--json-out", default=None, help="write summary JSON here")
