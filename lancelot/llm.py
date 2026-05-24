@@ -162,12 +162,229 @@ class TransportPool:
         so the upstream LLM/gateway joins the SAME distributed trace (Tier-B
         cloud observability). No-op when there's no trace context (the common
         case) or the caller set `traceparent` explicitly (their value wins).
-        Lightweight context propagation — full span export is the user's OTel."""
-        from lancelot.context import trace_parent
+        Lightweight context propagation — full span export is the user's OTel.
 
+        M7 T1.1 also injects `x-request-id` and `x-agent-id` (if set) so the
+        upstream LLM call inherits the parent request's identifiers; the
+        downstream service can join the same RED/trace dashboards via these
+        same headers. Backwards-compatible — only adds headers; never
+        overwrites a caller-set value (.setdefault)."""
+        from lancelot.context import trace_parent, request_id, agent_id
+
+        headers = dict(kw.get("headers") or {})
         tp = trace_parent.get()
-        if not tp:
+        if tp:
+            headers.setdefault("traceparent", tp)
+        try:
+            rid = request_id.get()
+            if rid and rid != "-":
+                headers.setdefault("x-request-id", rid)
+        except LookupError:
+            pass
+        try:
+            aid = agent_id.get()
+            if aid and aid != "-":
+                headers.setdefault("x-agent-id", aid)
+        except LookupError:
+            pass
+        if not headers:
+            return kw
+        return {**kw, "headers": headers}
+
+    # ----- M7 T1.2 parallel-probe fanout ----------------------------------
+    async def fanout(self, requests, *,
+                     first_n: int | None = None,
+                     deadline: float | None = None,
+                     cancel_laggards: bool = True,
+                     concurrency: int | None = None):
+        """M7 T1.2 (Chroma/Huber pattern): fire N outbound calls in
+        parallel; resolve as soon as the first `first_n` complete; cancel
+        the laggards. Bounded concurrency, deadline, and partial-failure
+        semantics built in.
+
+        Args:
+            requests: iterable of `(method, url, kwargs)` tuples OR
+                pre-built coroutines (anything awaitable). Pre-built
+                coros let callers reuse spawn_child handles.
+            first_n: resolve after this many successes. Default: all.
+            deadline: wall-clock cap in seconds. None = no cap.
+            cancel_laggards: cancel remaining tasks once `first_n`
+                successes land. True is the Chroma default.
+            concurrency: max in-flight at once. None = unbounded
+                (typical for fanout; the *upstream* rate-limits us).
+
+        Returns:
+            List of results in COMPLETION ORDER (not input order).
+            Successes are httpx.Response; failures (timeout, error,
+            cancellation) are the exception instances. Caller sees
+            the partial-failure shape just like asyncio.gather(
+            return_exceptions=True) — typical pattern is
+            `[r for r in results if not isinstance(r, Exception)]`.
+
+        Why completion order (not input order): the whole point of
+        fanout is "first-N wins" — input-order positions of cancelled
+        laggards aren't useful to the caller. asyncio.gather(*,
+        return_exceptions=True) returns input order but blocks on the
+        slowest; we deliberately don't do that here.
+
+        Example:
+            child = pool.spawn_child(req)
+            payloads = [{"prompt": p} for p in prompts]
+            coros = [child.request("POST", url, json=p) for p in payloads]
+            results = await pool.fanout(coros, first_n=3, deadline=2.0)
+            successes = [r for r in results if not isinstance(r, Exception)]
+        """
+        # Materialize input into a list of coros.
+        coros = []
+        for r in requests:
+            if isinstance(r, tuple):
+                m, u, kw = r if len(r) == 3 else (r[0], r[1], {})
+                coros.append(self.request(m, u, **kw))
+            else:
+                coros.append(r)
+        if not coros:
+            return []
+        target_n = first_n if first_n is not None else len(coros)
+        target_n = max(1, min(target_n, len(coros)))
+
+        sem = asyncio.Semaphore(concurrency) if concurrency else None
+
+        async def _run(coro):
+            if sem is None:
+                return await coro
+            async with sem:
+                return await coro
+
+        tasks = [asyncio.ensure_future(_run(c)) for c in coros]
+        results: list = []
+        successes = 0
+        pending = set(tasks)
+        try:
+            # Loop until we have `target_n` successes or all tasks done.
+            t0 = asyncio.get_event_loop().time() if deadline else None
+            while pending and successes < target_n:
+                timeout = None
+                if deadline is not None and t0 is not None:
+                    remaining = deadline - (asyncio.get_event_loop().time() - t0)
+                    if remaining <= 0:
+                        break
+                    timeout = remaining
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                    timeout=timeout)
+                if not done:
+                    # Timed out with no completions → deadline exceeded.
+                    break
+                for d in done:
+                    try:
+                        results.append(d.result())
+                        successes += 1
+                    except Exception as e:  # noqa: BLE001
+                        results.append(e)
+        finally:
+            if cancel_laggards:
+                for t in pending:
+                    t.cancel()
+                # Drain cancellations so they don't leak as warnings.
+                if pending:
+                    try:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+        return results
+
+    # ----- M7 T1.1 sub-agent / nestable pool ------------------------------
+    def spawn_child(self, parent_request=None, *,
+                    session_affinity: str | None = None):
+        """M7 T1.1 (Giga / Parahelp pattern): create a child handle that
+        propagates the *current* parent request's identifiers (traceparent,
+        request_id, agent_id, session_affinity) into every outbound call,
+        even if the parent ContextVars get reset before this child's call
+        completes.
+
+        Use this when a handler spawns asyncio.Tasks that may outlive the
+        parent's ContextVar scope (e.g. fire-and-forget audit emit; long
+        background LLM call). For the common in-line pattern
+        (`async def handler(req): r = await pool.post(...)`), no spawn_child
+        is needed — ContextVar copy-on-await semantics already propagate.
+
+        Args:
+            parent_request: optional Lancelot Request for cancellation
+                propagation. When the parent's `_cancel_event` fires
+                (client disconnected), the child's in-flight calls are
+                cancelled too — same C2 semantics as the unary path.
+            session_affinity: optional explicit KV-cache routing key,
+                forwarded as `x-lancelot-affinity` header so the
+                upstream LB pins this child to the same cache shard as
+                the parent. If None, the framework will not add one
+                (the parent middleware/router is responsible).
+
+        Returns:
+            A `_ChildHandle` that exposes `.request()` / `.stream()` with
+            the captured snapshot pinned in. Same shape as the parent
+            pool so call sites are interchangeable.
+
+        Example:
+            child = pool.spawn_child(req, session_affinity=user_id)
+            # Schedule N parallel sub-agent calls; each inherits parent's
+            # traceparent + request_id + agent_id + affinity.
+            results = await asyncio.gather(*[child.request("POST", url, json=p)
+                                             for p in payloads])
+        """
+        from lancelot.context import trace_parent, request_id, agent_id
+
+        snap = {}
+        tp = trace_parent.get()
+        if tp:
+            snap["traceparent"] = tp
+        try:
+            rid = request_id.get()
+            if rid and rid != "-":
+                snap["x-request-id"] = rid
+        except LookupError:
+            pass
+        try:
+            aid = agent_id.get()
+            if aid and aid != "-":
+                snap["x-agent-id"] = aid
+        except LookupError:
+            pass
+        if session_affinity:
+            snap["x-lancelot-affinity"] = session_affinity
+        return _ChildHandle(self, parent_request, snap)
+
+
+class _ChildHandle:
+    """M7 T1.1: child handle that pins the parent's identifier snapshot
+    onto every outbound call. Returned by `TransportPool.spawn_child(...)`.
+    Same shape as the pool (request / stream) so call sites are uniform.
+
+    The snapshot is captured at construction time, so even if the parent
+    ContextVars get reset (the request finishes before the child's call
+    completes), the child still carries the correct identifiers."""
+
+    __slots__ = ("_pool", "_parent_request", "_snap")
+
+    def __init__(self, pool, parent_request, snap):
+        self._pool = pool
+        self._parent_request = parent_request
+        self._snap = snap
+
+    def _merge_headers(self, kw):
+        if not self._snap:
             return kw
         headers = dict(kw.get("headers") or {})
-        headers.setdefault("traceparent", tp)
+        for k, v in self._snap.items():
+            headers.setdefault(k, v)
         return {**kw, "headers": headers}
+
+    async def request(self, method: str, url: str, *, request=None, **kw):
+        kw = self._merge_headers(kw)
+        # Forward parent cancellation if no explicit request= override.
+        if request is None:
+            request = self._parent_request
+        return await self._pool.request(method, url, request=request, **kw)
+
+    async def stream(self, method: str, url: str, **kw):
+        kw = self._merge_headers(kw)
+        return await self._pool.stream(method, url, **kw)
