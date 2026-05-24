@@ -269,13 +269,41 @@ def _wire_json(obj) -> bytes:
     Routes through the Rust pydantic-core seam (same as the 200 path) so
     the 422 bytes provably cannot drift from the success bytes. When the
     fast path or stdlib chokes on a UUID/datetime/BaseModel value, falls
-    back to a FastAPI-jsonable-encoder-shape `default=` function."""
+    back to a FastAPI-jsonable-encoder-shape `default=` function.
+
+    M6-T1.2: prefer orjson when installed (auto-detect, no env knob) — it's
+    ~2.2× faster than pydantic-core on dict-heavy payloads per the M5 lab
+    body (Robyn 8.1k vs us 5.0k @ 70KB; orjson 13.8k ops/s vs pyd-core
+    6.3k ops/s in isolation). Falls through to pydantic-core via _native
+    when orjson can't handle a type (BaseModel without OPT_SERIALIZE_PYDANTIC,
+    Decimal, etc.); orjson's runtime is a soft dep, not in pyproject.toml's
+    runtime deps (cardinal rule: pydantic-only)."""
+    # Fast path 1: orjson (when installed). Lazy + memoized via attribute
+    # caching on the function so we only pay the import once.
+    _od = _wire_json.__dict__.get("_orjson_dumps")
+    if _od is None:
+        try:
+            import orjson as _orjson
+            _od = _orjson.dumps
+        except ImportError:
+            _od = False  # sentinel: don't retry
+        _wire_json._orjson_dumps = _od
+    if _od is not False:
+        try:
+            return _od(obj)
+        except TypeError:
+            # orjson hit a type it can't serialize (BaseModel without
+            # OPT_SERIALIZE_PYDANTIC, etc.) — fall through to pydantic-core.
+            pass
+    # Fast path 2: pydantic-core via Rust _native (handles BaseModel,
+    # UUID, datetime, Decimal natively).
     try:
         from lancelot import _native
 
         return bytes(_native._to_json(obj))
     except Exception:  # noqa: BLE001
         pass
+    # Fallback: stdlib json with FastAPI-jsonable-encoder shape default fn.
     return _json.dumps(
         obj, ensure_ascii=False, allow_nan=False, separators=(",", ":"),
         default=_json_default,
