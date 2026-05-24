@@ -240,9 +240,14 @@ class App:
         self.router.add(Route("POST", path, _mcp_endpoint,
                               include_in_schema=False))
 
-    def call_tool(self, name: str, **kwargs):
+    def call_tool(self, name, /, **kwargs):
         """Invoke a registered tool by name. Inputs are Pydantic-validated
-        (same machinery as HTTP request validation)."""
+        (same machinery as HTTP request validation).
+
+        `name` is positional-only (PEP 570) so tools whose parameter
+        names include `name` don't collide with this method's signature
+        — required for MCP tools/call which passes `arguments` as
+        **kwargs (M7 T1.4: the greet(name='...') tool case)."""
         spec = self._tools[name]
         validated = spec._validator(**kwargs).model_dump()
         return spec.func(**validated)
