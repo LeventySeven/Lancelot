@@ -1,0 +1,47 @@
+Summary:
+  Success rate:	6.81%
+  Total:	3.0002 10 sec
+  Slowest:	2.7916 10 sec
+  Fastest:	0.0006 10 sec
+  Average:	0.0119 10 sec
+  Requests/sec:	4994.0388
+
+  Total data:	41.25 MiB
+  Size/request:	4.14 KiB
+  Size/sec:	1.37 MiB
+
+Response time histogram:
+  0.001 10 sec [1]     |
+  0.280 10 sec [10155] |■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■
+  0.559 10 sec [0]     |
+  0.838 10 sec [0]     |
+  1.117 10 sec [0]     |
+  1.396 10 sec [0]     |
+  1.675 10 sec [0]     |
+  1.954 10 sec [0]     |
+  2.233 10 sec [0]     |
+  2.513 10 sec [0]     |
+  2.792 10 sec [40]    |
+
+Response time distribution:
+  10.00% in 0.0007 10 sec
+  25.00% in 0.0007 10 sec
+  50.00% in 0.0008 10 sec
+  75.00% in 0.0008 10 sec
+  90.00% in 0.0009 10 sec
+  95.00% in 0.0009 10 sec
+  99.00% in 0.0029 10 sec
+  99.90% in 2.7915 10 sec
+  99.99% in 2.7916 10 sec
+
+
+Details (average, fastest, slowest):
+  DNS+dialup:	0.0008 10 sec, 0.0000 10 sec, 2.7908 10 sec
+  DNS-lookup:	0.0000 10 sec, 0.0000 10 sec, 0.0000 10 sec
+
+Status code distribution:
+  [200] 10196 responses
+
+Error distribution:
+  [139586] Can't assign requested address (os error 49)
+  [50] aborted due to deadline
