@@ -68,6 +68,12 @@ class Route:
     tags: list | None = None
     dependencies: list | None = None
     deprecated: bool | None = None
+    # M7 T3.5 (Veriff per-jurisdiction routing pattern): if set,
+    # register this route ONLY when the active worker's LANCELOT_REGION
+    # matches. None = register everywhere (the default — backwards-
+    # compatible). The check happens at Router.add() time (registration),
+    # not per-request, so there's zero hot-path overhead.
+    region: str | None = None
 
     def __post_init__(self):
         self.method = self.method.upper()
@@ -633,6 +639,16 @@ class Router:
         self.route_class = Route
 
     def add(self, route: Route):
+        # M7 T3.5 region gate: if this route is region-pinned and our
+        # worker is in a different region, don't register it at all.
+        # Zero hot-path cost — the runtime never sees the route.
+        if route.region is not None:
+            from lancelot.fleet import region as _current_region
+            if route.region != _current_region():
+                # Silently drop. The dual-region deploy registers BOTH
+                # region's routes from the same code; each worker only
+                # keeps its own region's set.
+                return
         self.routes.append(route)
         if route.is_ws:
             self._dyn.append(route)
