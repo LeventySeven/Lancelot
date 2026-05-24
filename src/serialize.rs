@@ -52,6 +52,18 @@ fn orjson_dumps_fn(py: Python<'_>) -> Option<Py<PyAny>> {
 /// on dict-heavy payloads when installed), fall through to pydantic_core.to_json
 /// when orjson can't serialize a value (TypeError; e.g. BaseModel without
 /// OPT_SERIALIZE_PYDANTIC, Decimal, etc.). Last resort: stdlib json.
+///
+/// M7 T4.7 audit (DataFusion `consume_budget` pattern): the BULK work in
+/// this function is the single `orjson.dumps()` / `pydantic_core.to_json()`
+/// C-extension call, which releases the GIL internally. There is NO
+/// Rust-side iteration loop over MB-size payloads — Lancelot delegates
+/// bulk serialization to those native libraries which manage their own
+/// cooperation. The single `Bytes::copy_from_slice` at the end is a C-level
+/// memcpy with no yield-point need (it executes in <5ms even for 10MB).
+/// Conclusion: no `tokio::task::coop::consume_budget` call needed here.
+/// If a future op introduces a Rust-side loop over MB-size data (e.g. a
+/// canonical-JSON re-encoder that walks the dict tree in Rust), THAT op
+/// should call `consume_budget` once per ~1k iterations.
 pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     // Fast path 1: orjson.dumps (when installed). On TypeError, fall through
     // to pydantic-core which handles the richer set of types natively.

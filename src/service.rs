@@ -210,17 +210,21 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let query_string = req.uri().query().unwrap_or("").to_string();
-    let headers: Vec<(String, String)> = req
-        .headers()
-        .iter()
-        .map(|(k, v)| {
-            // Starlette decodes header values as latin-1 (1 byte → 1 char),
-            // which is lossless for arbitrary bytes — unlike from_utf8_lossy
-            // which corrupts non-UTF-8 with replacement chars (audit #9).
-            let val: String = v.as_bytes().iter().map(|&b| b as char).collect();
-            (k.as_str().to_ascii_lowercase(), val)
-        })
-        .collect();
+    // M7 T4.14 audit (RIPGREP.md:247 + 494 scratch-pool pattern): we don't
+    // pool the headers vec because (a) per-request alloc cost is ~100ns and
+    // dwarfed by the GIL+handler call (~50µs+), (b) `bytes::BytesMut` /
+    // `String` already use jemalloc small-bins so pool gains are minimal.
+    // We DO pre-size the vec from the HeaderMap len() so collect() doesn't
+    // realloc mid-build — the only no-regret micro-win at this site.
+    let hm = req.headers();
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(hm.len());
+    for (k, v) in hm.iter() {
+        // Starlette decodes header values as latin-1 (1 byte → 1 char),
+        // which is lossless for arbitrary bytes — unlike from_utf8_lossy
+        // which corrupts non-UTF-8 with replacement chars (audit #9).
+        let val: String = v.as_bytes().iter().map(|&b| b as char).collect();
+        headers.push((k.as_str().to_ascii_lowercase(), val));
+    }
     // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
     // allocation per connection (remote memory-DoS). A truncated/aborted
     // body is a 400, NOT a silent empty-body 200.
@@ -316,6 +320,15 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
                 break;
             }};
         }
+        // M7 T4.2 audit (ZED.md:4826-4861 + 10994-11030 select_biased! pattern):
+        // both selects below already use `biased;` so SIGTERM/SIGINT are
+        // compile-time prioritized over the accept_loop — the Zed pattern is
+        // satisfied at this site. The `scopeguard::defer!` Drop-guard half of
+        // the pattern (auto-cancel oneshot senders on Drop) does NOT apply
+        // here because Lancelot's per-connection task doesn't hold any
+        // oneshots (`_permit` is the only resource and RAII handles it).
+        // If T1.1 spawn_child grows oneshot wiring later, add scopeguard at
+        // THAT site.
         loop {
             // Acquire a connection permit — but keep SIGTERM responsive even
             // when saturated (don't block shutdown waiting for a free slot).
