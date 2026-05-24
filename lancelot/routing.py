@@ -32,6 +32,11 @@ def _is_body_annotation(ann) -> bool:
 
 
 @dataclass
+# M6 T3.4 drop-in finding: FastAPI exposes the per-route record as
+# `fastapi.routing.APIRoute`; Lancelot calls the equivalent class `Route`.
+# Add the alias so `from lancelot.routing import APIRoute` works
+# verbatim for real OSS apps that subclass APIRoute for custom dispatch
+# (e.g. tiangolo's full-stack-fastapi-template).
 class Route:
     method: str
     path: str
@@ -487,6 +492,12 @@ class Route:
                                 status_code=route.status_code or 200)
 
         return _handler
+
+
+# M6 T3.4 drop-in compat: FastAPI's per-route record is `APIRoute` in
+# `fastapi.routing`. We use `Route`. Alias so subclassing works for apps
+# that customize dispatch via `APIRoute.get_route_handler()` override.
+APIRoute = Route
 
 
 class APIRouter:
