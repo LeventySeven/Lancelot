@@ -145,9 +145,20 @@ class App:
                 return r
             return JSONResponse(b'{"status":"ok"}')
 
+        # M7 T2.3 (Conductor pattern): /fleet/status surfaces this worker's
+        # region + worker_id + in-flight count + drain state — so an LB
+        # aggregator (HAProxy / nginx Lua / Conductor's "head of
+        # engineering" dashboard) can roll up N workers' state without
+        # speaking per-process OTel. Cheap; just reads in-memory state.
+        def _fleet_status():
+            from lancelot.fleet import fleet_info
+            info = fleet_info(self)
+            return JSONResponse(info)
+
         for path, fn in (("/openapi.json", _openapi_json), ("/docs", _docs),
                          ("/redoc", _redoc), ("/scalar", _scalar),
-                         ("/livez", _livez), ("/readyz", _readyz)):
+                         ("/livez", _livez), ("/readyz", _readyz),
+                         ("/fleet/status", _fleet_status)):
             self.router.add(Route("GET", path, fn, include_in_schema=False))
 
     # --- registration -----------------------------------------------------
