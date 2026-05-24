@@ -144,6 +144,16 @@ fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
         .unwrap()
 }
 
+/// M7 T4.10: owned-bytes plain response for dynamically-built bodies
+/// (e.g. the "did you mean?" 404 suggestion). Same shape as `plain`,
+/// just `Bytes::from(Vec)` instead of `from_static`.
+fn plain_owned(status: StatusCode, body: Vec<u8>) -> HResp<RespBody> {
+    HResp::builder()
+        .status(status)
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .unwrap()
+}
+
 fn json_ok(body: Bytes) -> HResp<RespBody> {
     HResp::builder()
         .status(StatusCode::OK)
@@ -166,7 +176,19 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         None if app.router.matches_any_method(req.uri().path()) => {
             return plain(StatusCode::METHOD_NOT_ALLOWED, b"method not allowed")
         }
-        None => return plain(StatusCode::NOT_FOUND, b"not found"),
+        // M7 T4.10: suggest the closest registered route on 404 (LanceDB
+        // "did you mean?" pattern). Pays nothing on the happy path; fires
+        // only when no route matches. Body is plain text; bounded length.
+        None => {
+            let path = req.uri().path();
+            let body = match app.router.closest_path(path) {
+                Some(suggestion) => {
+                    format!("not found. did you mean '{suggestion}'?").into_bytes()
+                }
+                None => b"not found".to_vec(),
+            };
+            return plain_owned(StatusCode::NOT_FOUND, body);
+        }
     };
     // Const-bytes fast path (Robyn ConstRouter): if this slot has a prebaked
     // response, serve it straight from Rust — ZERO GIL, ZERO Request alloc,
@@ -269,6 +291,14 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
             .map_err(|e| PyOSError::new_err(e.to_string()))?;
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .map_err(|e| PyOSError::new_err(e.to_string()))?;
+        // M7 T4.11: also catch SIGINT (Ctrl+C) so `python -c "lancelot.run(...)"`
+        // in a dev shell exits cleanly without leaving the asyncio loop pinned.
+        // The graceful_break! macro covers both signals identically — same drain
+        // path, same bounded timeout. (Without this, Ctrl+C ends up killing the
+        // Python process with an unclean asyncio teardown — LanceDB pattern,
+        // executor.rs:88-115 equivalent.)
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| PyOSError::new_err(e.to_string()))?;
         // Graceful-shutdown helper (B1 — drain, NOT Robyn-style hard-kill).
         // First wake in-flight R3 stream pumps so they stop pulling (audit #2),
         // then DRAIN: acquire ALL connection permits — satisfiable only once
@@ -292,15 +322,17 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
             let permit = tokio::select! {
                 biased;
                 _ = sigterm.recv() => graceful_break!(),
+                _ = sigint.recv() => graceful_break!(),
                 p = conn_limit.clone().acquire_owned() => match p {
                     Ok(p) => p,
                     Err(_) => break, // semaphore closed
                 },
             };
-            // Have a slot; accept — still abort promptly on SIGTERM.
+            // Have a slot; accept — still abort promptly on SIGTERM/SIGINT.
             let (stream, _) = tokio::select! {
                 biased;
                 _ = sigterm.recv() => { drop(permit); graceful_break!(); }
+                _ = sigint.recv() => { drop(permit); graceful_break!(); }
                 accepted = listener.accept() => match accepted {
                     Ok(v) => v,
                     Err(_) => continue, // permit drops here → slot freed
