@@ -87,14 +87,25 @@ class TransportPool:
         flips), the in-flight upstream HTTP call is awaited concurrently
         with the cancel-event and cancelled the moment the event fires —
         so the user stops paying for LLM tokens the client is no longer
-        watching."""
+        watching.
+
+        M7 T1.3 + T2.2: per-call upstream metrics emitted (LLM-aware
+        attrs: provider/model/class/tokens/cost). Also accumulates cost
+        into the request's `cost_usd` ContextVar — so the parent request
+        sees the sub-LLM-call's cost automatically (Sim.ai pattern)."""
         method = method.upper()
         kw = self._inject_traceparent(kw)
         idempotent = method in _IDEMPOTENT
         attempt = 0
+        import time as _time
         while True:
+            t0 = _time.perf_counter()
             resp = await self._await_cancellable(
                 self._client.request(method, url, **kw), request)
+            elapsed = _time.perf_counter() - t0
+            # M7 T1.3 + T2.2: emit per-call upstream metric + accumulate
+            # cost into parent's cost_usd ContextVar.
+            self._emit_upstream(url, resp, elapsed)
             # POST/PATCH/CONNECT etc. are NEVER retried — the cardinal
             # rule. Return as-is so the caller (handler) decides.
             if not idempotent:
@@ -114,6 +125,33 @@ class TransportPool:
                            + random.random() * self.backoff_base)
             await asyncio.sleep(wait)
             attempt += 1
+
+    @staticmethod
+    def _emit_upstream(url, resp, duration_s):
+        """M7 T1.3 + T2.2 metric emit. Best-effort: never raises into
+        the user's call path."""
+        try:
+            body = None
+            ct = resp.headers.get("content-type", "")
+            if "json" in ct:
+                try:
+                    body = resp.json()
+                except Exception:  # noqa: BLE001
+                    body = None
+            from lancelot.upstream_metrics import record_upstream
+            info = record_upstream(url, resp.status_code, duration_s,
+                                    body=body)
+            # T2.1 cost ContextVar: accumulate per-call cost into parent
+            # request so the X-Lancelot-Cost-USD trailer covers sub-LLM
+            # calls automatically.
+            if info.get("cost_usd", 0.0) > 0:
+                try:
+                    from lancelot.context import cost_usd as _cv
+                    _cv.set(_cv.get() + info["cost_usd"])
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _await_cancellable(self, coro, request):
         """Helper: await `coro`, but if `request` carries a cancel event
