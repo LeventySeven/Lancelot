@@ -19,9 +19,9 @@ The YC Root Access transcripts were read systematically. **Every M7 item below c
 
 ## Headline claim M7 must enable
 
-> "Lancelot ships outbound LLM transport primitives (`TransportPool.spawn_child` + `fanout` + LLM-aware OTel attrs + MCP-server adapter) that close the distributed-trace loop end-to-end through the LLM call; distributed observability spans regions + tenants + adverse paths with cost-per-request as a first-class metric; multi-region deploy is documented + tested across Render + AWS + Fly.io with rotate-aware secrets + agent identity in context. Every primitive is traceable to a YC Root Access transcript pattern (Giga, Parahelp, Commure, Sim.ai, Conductor, Infisical, Veriff)."
+> "Lancelot ships outbound LLM transport primitives (`TransportPool.spawn_child` + `fanout` + LLM-aware OTel attrs + MCP-server adapter) that close the distributed-trace loop end-to-end through the LLM call; distributed observability spans regions + tenants + adverse paths with cost-per-request and queue-wait as first-class metrics; multi-region deploy is documented + tested across Render + AWS + Fly.io with rotate-aware secrets + agent identity in context; and the Rust hot path is hardened with 14 patterns extracted from 8 production-Rust projects (test buffer=1; `select_biased!` graceful shutdown; per-tenant memory pool; `intern!` hot-path attr lookups; etc.). Every primitive is traceable to either a YC Root Access transcript or a Rust-project teardown."
 
-Three sub-claims (outbound primitives + MCP adapter; distributed observability; multi-region plumbing + secrets) — each backed by a transcript citation and a reproducible artifact in the repo.
+Four sub-claims (outbound primitives + MCP adapter; distributed observability; multi-region plumbing + secrets; Rust hot-path discipline) — each backed by a transcript-or-teardown citation and a reproducible artifact in the repo.
 
 ## Honest state of the framework (updated for M7)
 
@@ -87,22 +87,61 @@ Three sub-claims (outbound primitives + MCP adapter; distributed observability; 
 
 ---
 
-## Explicitly NOT in M7 (Tier-D — every reject is also transcript-sourced)
+### Track T4 — Rust hot-path discipline (added 2026-05-24; sourced from 8 Rust-project teardowns)
 
-These were CONSIDERED for M7 (or implied by earlier framing) but the transcript reads explicitly reject them. **Cardinal rule: AI logic stays user-side.**
+**Goal:** apply Rust patterns extracted from 8 Rust-project teardowns (Polars / Lakesail / Ripgrep / Turbopuffer / Datafusion / LanceDB / Tauri / Zed) that directly inform the Lancelot byte-path. **Full pattern catalog with `file:line` citations:** [`docs/peer-source-recheck/M7-RUST-PATTERNS.md`](../peer-source-recheck/M7-RUST-PATTERNS.md).
 
-| Tier-D item | Why NOT | Transcript citation |
+| # | Item | Source citation | Done = |
+|---|------|---|--------|
+| T4.1 | **`cfg(test)` buffer-size = 1 on every bounded channel.** Force backpressure code path under every unit test. Zed ships this exact pattern: `INCOMING_BUFFER_SIZE = 256` in prod, `1` under `cfg(test, feature = "test-support")`. Would have caught 4 of M4's broken-under-load features. Apply to `LANCELOT_STREAM_BUFFER`, every internal mpsc Lancelot creates. | ZED.md:6157-6165 | Existing channels audited; new channels have `#[cfg(test)] const BUFFER: usize = 1;`. (Coding ~1-2 h.) |
+| T4.2 | **`select_biased!` + `util::defer` Drop-guard for graceful shutdown.** Replace `serve()`'s ad-hoc `select!` with `tokio::select! { biased; shutdown_signal => …, accept_loop => … }` so SIGTERM-priority is compile-time-guaranteed. Wrap per-connection IO future in `scopeguard::defer!` that drops pending oneshot senders → all awaiters get `Cancelled` immediately. M4 V1.4 was the 3rd broken feature; this makes the invariant impossible to forget. | ZED.md:4826-4861 + 10994-11030 | `serve()` uses `biased;` ordering; per-conn IO futures wrap state in `scopeguard::defer!`; regression test exercises the SIGTERM-priority path. (Coding ~2-3 h.) |
+| T4.3 | **Asymmetric backpressure on T7.x distributed channels.** Outgoing = unbounded (app code never blocks); incoming = bounded (peers feel backpressure). Pair with a write-timeout (`LANCELOT_WRITE_TIMEOUT_MS`) so unbounded outgoing doesn't OOM on partial network partition. | ZED.md:4803-4817 | New T1.1 `spawn_child` + T1.4 MCP channels use the pattern; write-timeout env knob shipped. (Coding ~1-2 h.) |
+| T4.4 | **`ForegroundWork` dispatch queue for `lancelot.mcp` adapter (T1.4 implementation pattern).** Send-bg tasks post `ForegroundWork` enums onto an `mpsc::UnboundedSender`; one foreground task drains onto the asyncio loop with GIL. Matches Zed's ACP `acp.rs` and the R3 on-loop `_drain` design exactly (one bridge crossing per stream, not per call). | ZED.md:10283 (acp.rs:620-699) | T1.4 (`lancelot.mcp`) implemented this way; not a separate item, but the design constraint must be honored. (Constraint; no additional coding beyond T1.4.) |
+| T4.5 | **Triple-channel RPC model for T1.1 `spawn_child` distributed primitive.** Outgoing unbounded mpsc + response oneshot for unary + stream mpsc for server-streaming, all keyed by request id. Direct model for any M7+ cross-node primitive. | ZED.md:4729-4772 (peer.rs) | T1.1 `spawn_child` implementation follows this shape; design constraint. (No additional coding; integrated into T1.1.) |
+| T4.6 | **Per-tenant fair `MemoryPool` + named-consumer OOM error.** `MemoryPool` trait + RAII `MemoryReservation` (Drop calls `free()`); on `ResourcesExhausted` the error names the top consumer ("OOM caused by route=/v1/embed (tenant=acme, 380MB)"). Pairs with T2.4 cardinality cap. | DATAFUSION.md:2058-2265 | New `lancelot.memory_pool` module + `TrackConsumersPool` wrapper; integrates with M7 multi-tenant story; failing-tenant OOM names route + tenant. (Coding ~4-6 h.) |
+| T4.7 | **`tokio::task::coop::consume_budget` in CPU-heavy Rust paths called from handlers.** Any handler-callable Rust function that loops over MB-size payloads (canonical-JSON, large response framing) calls `tokio::task::coop::consume_budget` once per N iterations to surrender the executor mid-batch. Avoids holding the tokio worker for many ms on big payloads. | DATAFUSION.md:1301-1318 | `src/serialize.rs::to_json_bytes` (and any new bulk-iteration Rust path) calls `consume_budget` per 1k iterations; benchmark shows no regression on small payloads + improved fairness on large. (Coding ~1-2 h.) |
+| T4.8 | **`queue_wait_ms` metric + per-tenant concurrency cap.** Emit `lancelot.http.queue_wait_ms` (total_in_handler − pure_handler_compute) alongside the existing duration histogram. Add `LANCELOT_TENANT_CONCURRENCY` per-tenant semaphore. The missing third number after RED + TTFT for multi-tenant AI backends. | TURBOPUFFER.md:6680-6712 | New metric in `lancelot/metrics.py`; per-tenant semaphore in middleware; T2.4 cardinality cap extends to this label. (Coding ~2-3 h.) |
+| T4.9 | **`x-should-retry: true/false` server-controlled retry header.** Lets handlers tell SDKs "this 500 is permanent" or "this 4xx is transient lock-conflict, retry me." Pairs with `@app.batch` to surface upstream-LLM backpressure to clients without thundering-herd retries on real outages. | TURBOPUFFER.md:858-906 + 6733-6770 | New `Response.set_retry_hint(should_retry: bool)` helper; emit header; document in operator runbook + agents.md. (Coding ~1-2 h.) |
+| T4.10 | **Levenshtein "did you mean?" on 404 — lazy in `fmt::Display`.** Iterate registered matchit paths inside the 404 error's Display impl; suggest closest match. Pays nothing on caught errors; massive dev-UX win at near-zero size. | LANCEDB.md:4076-4108 | `src/dispatch.rs` 404 body suggests closest route name when path doesn't match; `<50` LOC; smoke test shows the suggestion. (Coding ~1 h.) |
+| T4.11 | **KeyboardInterrupt-aware 100ms poll in blocking `_native.run()`.** Periodically `Python::with_gil(\|py\| py.check_signals())` and abort the runtime on `Err`. Today Ctrl+C in dev relies on tokio's signal handler reaching us; adding the explicit GIL re-check makes dev feel identical to FastAPI/uvicorn. | LANCEDB.md:2569-2607 (executor.rs:88-115) | Native `run()` loop polls `check_signals` every 100ms; Ctrl+C in `python -c "lancelot.run(...)"` exits within 100ms. (Coding ~30 min.) |
+| T4.12 | **`snafu` + `#[snafu(implicit)] location: Location` at the Rust↔Python boundary.** Replace ad-hoc `PyValueError::new_err("...")` sites with a typed `LancelotError` enum carrying auto-populated `location`. Operators get file:line on every traceback; pairs with W3C `traceparent` propagation. | LANCEDB.md:4023-4067 | New `src/error.rs` with `LancelotError` enum (snafu-derive); existing `PyValueError::new_err` sites migrated; tests assert `location` appears in error str. (Coding ~3-4 h.) |
+| T4.13 | **`intern!(py, "name")` Python-string interning for hot attr lookups.** Cache PyString objects for `__anext__`, `body`, handler-call names → attribute lookup becomes pointer-equality instead of string compare. Microbench in `dispatch.rs` should show measurable improvement at high RPS. | LAKESAIL.md:854 | Hot path attr lookups in `src/dispatch.rs` + `src/ffi/request.rs` use `intern!`; criterion bench shows ≥5% improvement on /echo at c=50. (Coding ~1-2 h.) |
+| T4.14 | **Per-worker `Pool<Vec<u8>>` scratch buffer for header staging.** Backed by `thread_local!` per tokio worker. Defers F3 "alloc past routing" to the handler path — eliminates per-request `Vec` allocs in header build-up. | RIPGREP.md:247 + 494 | New `src/scratch.rs` with `thread_local! Pool<Vec<u8>>`; response header writing borrows + returns the buffer; criterion bench shows ≥3% on the /echo path. (Coding ~2-3 h.) |
+
+**Done = (T4):** All 14 items shipped with regression tests; criterion benches for T4.13 + T4.14 show measurable improvement; LancelotError migration completes ≥80% of existing PyValueError sites. The 4 patterns that integrate with other tracks (T4.3 / T4.4 / T4.5 / T4.6) gate the corresponding T1/T2 items.
+
+**Estimation (T4 add to M7 total):** ~20-30 h coding (most items are small/medium; T4.6 + T4.12 are the larger ones); ~30 min wall clock for criterion benches. Brings M7 total to ~56-75 h coding (was 36-45 h pre-T4).
+
+---
+
+## Explicitly NOT in M7 (Tier-D — every reject is transcript- or teardown-sourced)
+
+These were CONSIDERED for M7 (or implied by earlier framing) but the source reads explicitly reject them. **Cardinal rule: AI logic stays user-side; byte path only; no useless logic.**
+
+| Tier-D item | Why NOT | Transcript / teardown citation |
 |---|---|---|
-| Multi-AI-gateway abstraction (Vercel AI Gateway / Portkey / OpenRouter front) | Every customer-validated LLM app uses a single model family; switching cost is calibration, not transport. Building gateway = solving a non-bottleneck. | Parahelp: "remained on Anthropic's model family throughout its existence without switching… switching cost is high enough that the right trigger is a demonstrated performance gap on the internal eval, not just a new public benchmark". Magic Patterns: "frontier foundational models… proprietary system-level injections". Giga: "smarter and cheaper models are now tailwinds for Giga, not headwinds. Every GPT-4o-class release makes Giga's agents better without requiring retraining". |
-| Framework-side judge / sampling-N-traces orchestration | AI logic; user-side. | Parahelp: N-trace sampling pattern is described but it lives in user code; Lancelot ships the *byte-path primitives* (T1.1 spawn_child, T1.2 fanout) that user code uses. |
-| Durable workflow / job-queue (snapshot/restore, retry, idempotency at framework level) | Orchestration = user-side. Trigger.dev / Hatchet / Temporal already own this category. | Parahelp: "Hatchet's queue management provides back-pressure, prioritization, and retry logic". Trigger.dev: full snapshot/restore primitive is Trigger's product. |
-| Voice multi-channel (per-speaker isolated channels on one HTTP/2 connection) | We're http1-only by design (M3 hardening); multi-channel is an upstream/voice-stack concern. | David AI (lines 15111–15207): "multi-channel audio where each speaker is on their own clean, isolated channel". |
-| Framework-level AI-eval pipeline | AI logic; user-side. CoCounsel's per-prompt eval discipline is *applied by the user* against their handlers; Lancelot exposes the metrics they need (T2.x). | Jake / CoCounsel (lines 13597–13900): per-prompt eval suites live in product code, not in the framework. |
-| Customer-supplied plain-text NL-config that the framework interprets via LLM | Same: AI logic. | Reducto (lines 15774–end): "customers can provide plain-text instructions to guide model behavior on their specific edge cases" — this is Reducto's product, not its framework. |
-| Multi-tier agent orchestration ("AI Worker" / "Frontal" / etc.) | Same: orchestration is user-side. | HappyRobot: "AI Worker is reactive and per-customer… Frontal is proactive and cross-customer". |
-| LLM-classification taxonomy / domain engines | Same: AI-application pattern. | Numeral (lines 12438–12732): "scan the letter… classify it into one of those buckets using an LLM"; Sphere (lines 8292–8594): "AI-native engine that continuously collects, codifies, and monitors global tax law". |
+| Custom work-stealing async executor (replace tokio) | Polars ships one; we'd give up hyper integration + add a maintenance burden for no measured win | POLARS.md:36 + 645-723 |
+| Crossbeam-deque LIFO for parallel request dispatch | Right primitive for filesystem walks (Ripgrep), wrong for request dispatch (tokio's mpsc/JoinSet is the match) | RIPGREP.md:706-723 |
+| Arrow C Data Interface for zero-copy Python↔Rust | Lancelot payloads are JSON/text bytes via pydantic-core/orjson, not Arrow batches; adding arrow dep violates pydantic-only runtime rule | LANCEDB.md:2609-2624 |
+| `std::sync::LazyLock` for env-driven config touching Python | GIL × OnceLock deadlock memory ([[lancelot-gil-oncelock-deadlock]]); only safe when zero py-touch; use `PyOnceLock` everywhere Python-adjacent | LANCEDB.md:3607-3611 |
+| zstd-compressed binary protocol inside `_native` | Compression is the proxy/CDN's job; CLAUDE.md Tier-D already says don't reimplement response compression | ZED.md:4663-4703 |
+| Priority-tagged spawn (e.g. `Priority::RealtimeAudio`) | Out-of-scope for HTTP framework; tokio's single multi-thread + `spawn_blocking` is the right tool | ZED.md:6105 |
+| Custom URL-scheme transport (`ipc://localhost/cmd`) | Browser/webview-specific; HTTP is already Lancelot's transport | TAURI.md:65-100 |
+| Pluggable async-runtime indirection (tokio swappable) | Lancelot is tokio-only by design; the runtime-swap layer = useless abstraction with no user demand | TAURI.md:859-877 |
+| Capability-based ACL pre-dispatch | Lancelot's auth = user-side middleware; building an ACL = AI-logic-boundary violation + reinventing FastAPI dependencies | TAURI.md:280-310 |
+| Per-session HMAC anti-CSRF token in framework | Browser-side problem; HTTP framework's CSRF surface is cookie SameSite + same-origin policy | TAURI.md:1490-1502 |
+| SaaS control plane (multi-tenancy + ACLs + billing) | Lancelot is a framework, not a SaaS — defer to user-side. T4.6 ships the per-tenant memory primitives without the control plane | LANCEDB.md:2921-2964 |
+| S3 byte-range fetches with SSTable metadata | AI logic / storage layer; not the HTTP byte path | TURBOPUFFER.md:160-171 |
+| Multi-AI-gateway abstraction (Vercel AI Gateway / Portkey / OpenRouter front) | Every customer-validated LLM app uses a single model family; switching cost is calibration upstream of transport. (Original M7 framing had this; transcripts rejected it.) | Parahelp, Magic Patterns, Giga (see YC RA transcript ranges in plan) |
+| Framework-side judge / sampling-N-traces orchestration | AI logic; user-side. T1.1 spawn_child + T1.2 fanout are the byte-path primitives user code uses. | Parahelp |
+| Durable workflow / job-queue (snapshot/restore, retry, idempotency at framework level) | Orchestration = user-side. Trigger.dev / Hatchet / Temporal own this category. | Parahelp, Trigger.dev |
+| Voice multi-channel (per-speaker isolated channels on one HTTP/2 connection) | We're http1-only by design (M3 hardening); multi-channel is an upstream/voice-stack concern | David AI (YC RA) |
+| Framework-level AI-eval pipeline | AI logic; user-side. CoCounsel's per-prompt eval lives in product code; Lancelot exposes the metrics they need (T2.x). | Jake / CoCounsel |
+| Customer-supplied plain-text NL-config that the framework interprets via LLM | Same: AI logic. Reducto's product, not its framework. | Reducto |
+| Multi-tier agent orchestration ("AI Worker" / "Frontal" / etc.) | Same: orchestration is user-side | HappyRobot |
+| LLM-classification taxonomy / domain engines | Same: AI-application pattern | Numeral / Sphere |
 
-The pattern: **Lancelot's role is to make the byte path under each of these AI patterns fast, observable, and reliable** — not to absorb the AI logic into the framework. The transcripts make this distinction visible at section-level.
+The pattern: **Lancelot's role is to make the byte path under each of these AI patterns fast, observable, and reliable** — not to absorb the AI logic into the framework. Both the YC Root Access transcripts AND the 8 Rust-project teardowns make this distinction visible at section-level.
 
 ## How each M7 item is validated
 
@@ -110,14 +149,20 @@ Every item ships with: (1) a **real harness** (subprocess + HTTP for transport p
 
 ## Sequencing
 
-1. **T1.4 `lancelot.mcp` adapter + T1.5 minimal-return doc** can start immediately — independent of TransportPool changes.
-2. **T1.1 spawn_child → T1.2 fanout → T1.3 LLM-aware OTel attrs** — chain (each depends on TransportPool internals from previous).
+1. **T1.4 `lancelot.mcp` adapter + T1.5 minimal-return doc** can start immediately — independent of TransportPool changes. T4.4 (ForegroundWork dispatch queue) is the implementation constraint.
+2. **T1.1 spawn_child → T1.2 fanout → T1.3 LLM-aware OTel attrs** — chain (each depends on TransportPool internals from previous). T4.5 (triple-channel RPC) constrains T1.1; T4.3 (asymmetric backpressure) constrains both.
 3. **T2.1 cost ContextVar + T2.3 fleet rollup + T2.4 cardinality cap + T2.5 adverse-path emit** — independent, parallel-safe.
 4. **T2.2 per-upstream RED** — gates on T1.3 (LLM-aware OTel attrs).
 5. **T2.6 multi-region session-affinity verification** — gates on T3.1 (at least one multi-region recipe deployed).
 6. **T3.2 `lancelot.secrets` + T3.3 agent-identity ContextVar + T3.4 mTLS + T3.5 region-aware routing** — independent, parallel-safe.
 7. **T3.1 multi-region deploy recipes** — gates on T3.2 (secrets needed for cross-region credential rotation) + T3.5 (routing). Render first (M5/M6 precedent), AWS multi-AZ, Fly.io.
-8. **M7 exit tag** — all T1/T2/T3 items shipped with smoke + soak green; doc committed; ANALYSIS.md showing the distributed-trace + cost picture for the multi-region deploy.
+8. **Track T4 items**:
+   - T4.1 (`cfg(test)` buffer=1), T4.10 (Levenshtein 404), T4.11 (Ctrl+C poll), T4.13 (`intern!`), T4.14 (scratch buffer) — all parallel-safe; pure local hot-path wins. Can land anytime in the M7 sequence.
+   - T4.2 (`select_biased!` + Drop-guard) — gates the existing `serve()` graceful-drain audit; land BEFORE any new multi-region deploy lands to keep graceful drain robust.
+   - T4.6 (per-tenant `MemoryPool`) — gates T2.4 (cardinality cap) extension to memory dimension.
+   - T4.7 (`consume_budget`) + T4.12 (snafu errors) — independent.
+   - T4.8 (`queue_wait_ms`) + T4.9 (`x-should-retry`) — independent.
+9. **M7 exit tag** — all T1/T2/T3/T4 items shipped with smoke + soak green; doc committed; ANALYSIS.md showing the distributed-trace + cost picture for the multi-region deploy.
 
 ## Estimation summary
 
@@ -126,7 +171,8 @@ Every item ships with: (1) a **real harness** (subprocess + HTTP for transport p
 | T1 outbound primitives + MCP | ~12-15 h | ~30 min smoke | TransportPool changes are the biggest unknown |
 | T2 distributed observability | ~10-12 h | ~30 min smoke | All 6 items relatively bounded |
 | T3 multi-region + secrets + identity | ~14-18 h coding | ~9-12 h wall clock (3 deploys × 3h each incl. provisioning) | Multi-region deploys are the wall-clock long pole |
-| **Total** | **~36-45 h coding** | **~10-13 h wall-clock (with parallel deploys)** | Larger than M6 (M6 was ~16-26h coding); ~3-5 days sequential, ~2-3 days parallel |
+| T4 Rust hot-path discipline | ~20-30 h coding | ~30 min criterion bench | 4 items (T4.4/T4.5/T4.3/T4.6) integrate into other tracks; rest are independent |
+| **Total** | **~56-75 h coding** | **~10-13 h wall-clock (with parallel deploys)** | Larger than M6 (~16-26h); ~5-7 days sequential, ~3-4 days parallel |
 
 ## Definition of "no bullshit" (unchanged, restated)
 
@@ -143,6 +189,8 @@ M6 ships agents.md + MCP docs + code-first README. M7 extends the LLM-recommenda
 ---
 
 **Cross-references:**
+- **Rust patterns catalog (added 2026-05-24):** [`docs/peer-source-recheck/M7-RUST-PATTERNS.md`](../peer-source-recheck/M7-RUST-PATTERNS.md) — full citations for the 14 Track-T4 ADOPT items + 14 VALIDATEs + 12 AVOIDs extracted via 4 parallel agents from 8 Rust-project teardowns (Polars, Lakesail, Ripgrep, Turbopuffer, Datafusion, LanceDB, Tauri, Zed; ~78k source lines).
+
 - M5 plan (committed): `docs/plans/M5-PLAN-PROVE-VS-PEERS-AND-ADOPTABLE.md`
 - M6 plan (committed, unchanged by M7 work): `docs/plans/M6-PLAN-SPEED-STABILITY-ADOPTION.md`
 - M5 lab-body results: `benchmarks/results/M5/ANALYSIS.md`
