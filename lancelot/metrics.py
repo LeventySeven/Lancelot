@@ -53,25 +53,81 @@ def _maybe_bind():
                 unit="s",
                 description="Streaming time-to-first-chunk (TTFT) in seconds.",
             ),
+            # M7 T2.1 (Sim.ai usage-based billing pattern): per-request $.
+            # Lancelot doesn't ship cost RATES — those are handler-side.
+            # The metric just emits whatever the handler accumulated in
+            # `lancelot.context.cost_usd` before the response went out.
+            "cost_hist": meter.create_histogram(
+                "lancelot.http.cost.usd",
+                unit="USD",
+                description="Per-request accumulated cost (USD) — handler-set.",
+            ),
         }
     except Exception:  # noqa: BLE001 — defensive; partial OTel installs
         _state = None
     return _state
 
 
+def _tenant_label_max() -> int:
+    """M7 T2.4 (Hightouch pattern): cap distinct tenant labels we emit
+    on metrics so a runaway-tenant-id key doesn't blow up cardinality.
+    Over-cap → bucket to "_overflow_". Per-process state, set once."""
+    import os
+    try:
+        return max(1, int(os.environ.get("LANCELOT_TENANT_LABEL_MAX", "1000")))
+    except (ValueError, TypeError):
+        return 1000
+
+
+# Bounded-set of tenant labels we've seen this process. NOT thread-safe;
+# the GIL serializes Python attribute access so over-counting by one is
+# acceptable. Cleared by reset_for_tests().
+_tenant_label_set: set = set()
+
+
+def _bounded_tenant(tenant: str) -> str:
+    """M7 T2.4: return the tenant label or '_overflow_' if we've already
+    seen LANCELOT_TENANT_LABEL_MAX distinct tenants. Pure addition; never
+    evicts (tenant set is process-life since the goal is cardinality cap,
+    not LRU eviction)."""
+    if not tenant or tenant == "-":
+        return "-"
+    if tenant in _tenant_label_set:
+        return tenant
+    if len(_tenant_label_set) >= _tenant_label_max():
+        return "_overflow_"
+    _tenant_label_set.add(tenant)
+    return tenant
+
+
 def record_request(route_path: str, method: str, status: int,
-                   duration_s: float) -> None:
+                   duration_s: float, tenant: str = "-",
+                   cost_usd: float = 0.0) -> None:
     inst = _maybe_bind()
     if inst is None:
         return
+    # M7 T2.5: include status (not just status_class) on metric attrs so
+    # adverse-path filtering (e.g. status=499 for client-disconnect; 504
+    # for per-route timeout; 503 for upstream) is preserved in dashboards
+    # without inflating cardinality past the 5-7 expected adverse codes.
     attrs = {
         "http.route": route_path,
         "http.method": method,
         "http.status_class": f"{status // 100}xx",
+        "http.status_code": str(status),
+        # M7 T2.4: cardinality-bounded tenant label.
+        "lancelot.tenant": _bounded_tenant(tenant),
     }
     try:
         inst["req_counter"].add(1, attributes=attrs)
         inst["duration_hist"].record(duration_s, attributes=attrs)
+        # M7 T2.1: cost per request (Sim.ai usage-based-billing pattern).
+        # Skip the emit on the zero-default — most handlers don't accumulate
+        # cost, no need to flood the cost metric with 0.0 readings.
+        if cost_usd > 0:
+            ch = inst.get("cost_hist")
+            if ch is not None:
+                ch.record(cost_usd, attributes=attrs)
     except Exception:  # noqa: BLE001 — never let telemetry kill a request
         pass
 
@@ -105,3 +161,5 @@ def reset_for_tests() -> None:
     """Force-re-bind on next call. Tests only — exposes nothing to users."""
     global _state
     _state = _NOT_INITIALIZED
+    # M7 T2.4: also clear the tenant-label set so each test starts fresh.
+    _tenant_label_set.clear()

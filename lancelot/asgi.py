@@ -173,14 +173,34 @@ async def _http(app, scope, receive, send):
     async def send_with_rid(msg):
         # Echo `x-request-id` ONLY when the client sent one (FastAPI byte-parity
         # for the common no-correlation case). Also capture the final status.
+        # M7 T2.1: emit `x-lancelot-cost-usd` ALWAYS when cost was accumulated
+        # (the handler chose to set it; zero by default → no header).
         if msg.get("type") == "http.response.start":
             _final_status_holder[0] = msg.get("status", 500)
-            if _rid_from_client:
-                hdrs = list(msg.get("headers", []))
-                if not any(k == b"x-request-id" for k, _ in hdrs):
+            hdrs = msg.get("headers")
+            need_mutation = False
+            if _rid_from_client and not any(
+                    k == b"x-request-id" for k, _ in (hdrs or [])):
+                need_mutation = True
+            try:
+                from lancelot.context import cost_usd as _cost_var
+                _cost_now = _cost_var.get()
+                if _cost_now > 0.0 and not any(
+                        k == b"x-lancelot-cost-usd" for k, _ in (hdrs or [])):
+                    need_mutation = True
+            except Exception:  # noqa: BLE001
+                _cost_now = 0.0
+            if need_mutation:
+                hdrs = list(hdrs or [])
+                if _rid_from_client and not any(
+                        k == b"x-request-id" for k, _ in hdrs):
                     hdrs.append((b"x-request-id",
                                  _rid.encode("ascii", "ignore")))
-                    msg = {**msg, "headers": hdrs}
+                if _cost_now > 0.0 and not any(
+                        k == b"x-lancelot-cost-usd" for k, _ in hdrs):
+                    hdrs.append((b"x-lancelot-cost-usd",
+                                 f"{_cost_now:.6f}".encode("ascii")))
+                msg = {**msg, "headers": hdrs}
         await send(msg)
 
     # Set the ContextVars + bump the counters INSIDE the try so the `finally`
@@ -200,9 +220,22 @@ async def _http(app, scope, receive, send):
         in_flight_delta(-1)
         try:
             from lancelot.metrics import record_request
+            # M7 T2.1 + T2.4: pass tenant + cost into the metric record.
+            # Both default to "-"/0.0 if the handler didn't set them; no
+            # cardinality / cost-metric inflation in the common case.
+            try:
+                from lancelot.context import (
+                    cost_usd as _cost_var,
+                    tenant_id as _tenant_var,
+                )
+                _cost = _cost_var.get()
+                _tenant = _tenant_var.get()
+            except Exception:  # noqa: BLE001
+                _cost, _tenant = 0.0, "-"
 
             record_request(path, method, _final_status_holder[0],
-                           _time.perf_counter() - _t0)
+                           _time.perf_counter() - _t0,
+                           tenant=_tenant, cost_usd=_cost)
         except Exception:  # noqa: BLE001
             pass
         try:
