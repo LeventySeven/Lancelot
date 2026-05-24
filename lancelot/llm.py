@@ -23,12 +23,44 @@ class TransportPool:
 
     def __init__(self, *, transport=None, max_retries: int = 3,
                  backoff_base: float = 0.2, backoff_max: float = 8.0,
-                 timeout: float = 30.0):
+                 timeout: float = 30.0,
+                 mtls_cert: str | None = None,
+                 mtls_key: str | None = None,
+                 mtls_ca: str | None = None):
+        """M7 T3.4 mTLS args (Infisical PKI pattern):
+            mtls_cert: client certificate path (PEM)
+            mtls_key:  client key path (PEM)
+            mtls_ca:   optional custom CA bundle (PEM) for verifying
+                       the upstream's cert. None = system trust store.
+        All three default off. Cert + key together are required for
+        mTLS (one without the other raises ValueError). Pass an
+        already-built httpx.AsyncClient via `transport=` if you need
+        an exotic auth method that we don't model.
+        """
         import httpx  # lazy: lancelot core stays pydantic-only
 
+        # mTLS argument validation: cert + key are paired.
+        if (mtls_cert is None) != (mtls_key is None):
+            raise ValueError(
+                "TransportPool: mtls_cert and mtls_key must be set "
+                "together (one without the other is meaningless)")
+
+        client_kw = {"transport": transport, "timeout": timeout, "http2": False}
+        if mtls_cert and mtls_key:
+            # httpx accepts a (cert, key) tuple as the cert= kwarg.
+            client_kw["cert"] = (mtls_cert, mtls_key)
+        if mtls_ca:
+            client_kw["verify"] = mtls_ca
+
         self._httpx = httpx
-        self._client = httpx.AsyncClient(transport=transport,
-                                         timeout=timeout, http2=False)
+        self._client = httpx.AsyncClient(**client_kw)
+        self._mtls_cert = mtls_cert
+        self._mtls_key = mtls_key
+        self._mtls_ca = mtls_ca
+        self._client_kw_template = {
+            k: v for k, v in client_kw.items() if k != "transport"
+        }
+        self._transport = transport
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
@@ -42,6 +74,31 @@ class TransportPool:
 
     async def aclose(self):
         await self._client.aclose()
+
+    async def reload_mtls(self) -> None:
+        """M7 T3.4: re-open the underlying client with the SAME cert
+        paths so a SIGHUP-triggered cert rotation (the operator
+        replaced the cert/key files on disk) takes effect on the
+        next outbound call.
+
+        In-flight calls on the existing client KEEP USING the old
+        cert (no mid-stream cert swap — httpx loads on connect, the
+        old TLS state lives on the existing connection). When the
+        old client closes, new connections pick up the rotated cert.
+        Bounded clean-up: we close the OLD client after rebuilding.
+        """
+        if not (self._mtls_cert and self._mtls_key):
+            return  # no mTLS configured; nothing to reload
+        old = self._client
+        client_kw = {
+            "transport": self._transport,
+            **self._client_kw_template,
+        }
+        self._client = self._httpx.AsyncClient(**client_kw)
+        try:
+            await old.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _retry_after_seconds(resp) -> float | None:
