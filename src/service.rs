@@ -31,8 +31,19 @@ type RespBody = BoxBody<Bytes, std::io::Error>;
 
 /// Max request body the production path will buffer before returning 413
 /// (audit CRITICAL #1 — the M0 path collected unbounded bodies, a trivial
-/// remote memory-DoS). Matches the Python ASGI seam's _MAX_BODY (16 MiB).
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// remote memory-DoS). Default 16 MiB; tunable via `LANCELOT_MAX_BODY`
+/// (clamped [1 KiB, 1 GiB]) — mirrors the Python ASGI seam's `_resolve_max_body`.
+/// Upload APIs raise it; tight JSON microservices lower it.
+fn max_body() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LANCELOT_MAX_BODY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1024, 1024 * 1024 * 1024))
+            .unwrap_or(16 * 1024 * 1024)
+    })
+}
 
 /// Max concurrent connections the accept loop will serve (domain-web skill:
 /// an unbounded `loop { accept; spawn }` is a DoS-amplification vector — a
@@ -228,7 +239,7 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
     // allocation per connection (remote memory-DoS). A truncated/aborted
     // body is a 400, NOT a silent empty-body 200.
-    let body = match Limited::new(req.into_body(), MAX_BODY).collect().await {
+    let body = match Limited::new(req.into_body(), max_body()).collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, b"request entity too large"),
     };

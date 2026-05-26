@@ -30,6 +30,7 @@ class App:
                  exception_handlers: dict | None = None,
                  strict_content_type: bool = True,
                  dependencies: list | None = None,
+                 json_max_depth: int = 128,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -61,6 +62,10 @@ class App:
         # FastAPI 0.110+ feature: app-wide default for content-type checking
         # on JSON-body routes. Per-route / per-router override allowed.
         self.strict_content_type: bool = strict_content_type
+        # OPS3: JSON-nesting-depth DoS guard limit (read by the ASGI seam).
+        # 128 = Robyn's value; raise for deep config payloads, lower to
+        # tighten protection on shallow-schema APIs.
+        self._json_max_depth: int = json_max_depth
         # App-wide dependencies — prepended to every route's dep list.
         # Same semantics as `APIRouter(dependencies=[])`: validation /
         # auth runs before the handler; the return value is discarded.

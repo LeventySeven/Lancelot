@@ -2,8 +2,48 @@
 conformance/test driver (deliberately NOT the fast path; spec §2,
 harness-design §1.2)."""
 import inspect
+import os
 
-_MAX_BODY = 16 * 1024 * 1024  # 16 MiB cap on the ASGI migration path (A4)
+_MAX_BODY_DEFAULT = 16 * 1024 * 1024  # 16 MiB default cap (A4)
+
+
+def _resolve_max_body() -> int:
+    """Operator knob: LANCELOT_MAX_BODY overrides the 16 MiB body cap on the
+    ASGI path (mirrors the Rust server's `max_body()`). Clamped to
+    [1 KiB, 1 GiB]; invalid/out-of-range falls back to the default. Upload
+    APIs raise it; tight JSON microservices lower it."""
+    raw = os.environ.get("LANCELOT_MAX_BODY")
+    if raw is None:
+        return _MAX_BODY_DEFAULT
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _MAX_BODY_DEFAULT
+    if n < 1024 or n > 1024 * 1024 * 1024:
+        return _MAX_BODY_DEFAULT
+    return n
+
+
+_MAX_BODY = _resolve_max_body()
+
+
+def _resolve_max_query_params() -> int:
+    """Operator knob: LANCELOT_MAX_QUERY_PARAMS bounds the number of query
+    parameters parsed (DoS guard — unbounded parse_qs builds an arbitrarily
+    large dict). Default 512 (nginx-like). Clamped to [16, 65536]."""
+    raw = os.environ.get("LANCELOT_MAX_QUERY_PARAMS")
+    if raw is None:
+        return 512
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 512
+    if n < 16 or n > 65536:
+        return 512
+    return n
+
+
+_MAX_QUERY_PARAMS = _resolve_max_query_params()
 
 
 def build_asgi(app):
@@ -63,8 +103,16 @@ async def _lifespan(app, receive, send):
         if msg["type"] == "lifespan.startup":
             try:
                 await cm.__aenter__()
-            except BaseException as e:  # noqa: BLE001 - report per ASGI spec
-                await send({"type": "lifespan.startup.failed", "message": repr(e)})
+            except BaseException:  # noqa: BLE001 - report per ASGI spec
+                # OPS1: send the FULL traceback (not repr) so the ASGI server
+                # logs a real stack and the operator can diagnose the crash —
+                # a `repr(e)` one-liner loses the failing frame. We still
+                # fail-fast-not-raise (the deliberate Lancelot contract:
+                # test_startup_exception_is_failfast_not_swallowed) — the
+                # traceback rides in the protocol message, which uvicorn logs.
+                import traceback
+                await send({"type": "lifespan.startup.failed",
+                            "message": traceback.format_exc()})
                 return
             await send({"type": "lifespan.startup.complete"})
         elif msg["type"] == "lifespan.shutdown":
@@ -77,8 +125,10 @@ async def _lifespan(app, receive, send):
             # invokes user shutdown code.
             try:
                 await cm.__aexit__(None, None, None)
-            except BaseException as e:  # noqa: BLE001
-                await send({"type": "lifespan.shutdown.failed", "message": repr(e)})
+            except BaseException:  # noqa: BLE001
+                import traceback
+                await send({"type": "lifespan.shutdown.failed",
+                            "message": traceback.format_exc()})
                 return
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -388,11 +438,18 @@ async def _http_dispatch(app, scope, receive, send):
         if b"json" in _ct.lower():
             from lancelot._json_guard import exceeds_depth
 
-            if exceeds_depth(body, 128):
+            if exceeds_depth(body, getattr(app, "_json_max_depth", 128)):
                 await _send_json(send, 400,
                                  b'{"detail":"JSON body nested too deep"}')
                 return
-    qs = parse_qs(scope.get("query_string", b"").decode())
+    # SEC3: bound the query-param count BEFORE parse_qs builds the dict — an
+    # unbounded `?k0=…&k1=…×N` floods memory. Cheap pre-count on the raw bytes.
+    _raw_qs = scope.get("query_string", b"")
+    if _raw_qs and _raw_qs.count(b"&") + 1 > _MAX_QUERY_PARAMS:
+        await _send_json(send, 400,
+                         b'{"detail":"Too many query parameters"}')
+        return
+    qs = parse_qs(_raw_qs.decode())
     query = {k: v[-1] for k, v in qs.items()}
     query_multi = dict(qs)  # full multi-value form (bucket-model uses)
     headers = {}  # FIRST-wins (Starlette parity; blocks header smuggling — A2)

@@ -24,6 +24,9 @@ class TransportPool:
     def __init__(self, *, transport=None, max_retries: int = 3,
                  backoff_base: float = 0.2, backoff_max: float = 8.0,
                  timeout: float = 30.0,
+                 max_connections: int | None = None,
+                 max_keepalive_connections: int | None = None,
+                 keepalive_expiry: float | None = None,
                  mtls_cert: str | None = None,
                  mtls_key: str | None = None,
                  mtls_ca: str | None = None):
@@ -45,7 +48,36 @@ class TransportPool:
                 "TransportPool: mtls_cert and mtls_key must be set "
                 "together (one without the other is meaningless)")
 
-        client_kw = {"transport": transport, "timeout": timeout, "http2": False}
+        # TP1: connection-pool knobs (Turbopuffer/Bifrost pattern). httpx's
+        # silent defaults (100/20/5s) cap fanout + multi-model routing under
+        # load; surface them as kwargs + env. The httpx connection pool IS the
+        # outbound transport path, so these are byte-path knobs.
+        import os as _os
+
+        def _env_int(name, default):
+            try:
+                return int(_os.environ[name])
+            except (KeyError, ValueError):
+                return default
+
+        def _env_float(name, default):
+            try:
+                return float(_os.environ[name])
+            except (KeyError, ValueError):
+                return default
+
+        mc = max_connections if max_connections is not None else \
+            _env_int("LANCELOT_UPSTREAM_MAX_CONNECTIONS", 100)
+        mk = max_keepalive_connections if max_keepalive_connections is not None \
+            else _env_int("LANCELOT_UPSTREAM_MAX_KEEPALIVE", 20)
+        ke = keepalive_expiry if keepalive_expiry is not None else \
+            _env_float("LANCELOT_UPSTREAM_KEEPALIVE_EXPIRY", 5.0)
+        self.limits = httpx.Limits(max_connections=mc,
+                                   max_keepalive_connections=mk,
+                                   keepalive_expiry=ke)
+
+        client_kw = {"transport": transport, "timeout": timeout,
+                     "http2": False, "limits": self.limits}
         if mtls_cert and mtls_key:
             # httpx accepts a (cert, key) tuple as the cert= kwarg.
             client_kw["cert"] = (mtls_cert, mtls_key)
@@ -153,6 +185,13 @@ class TransportPool:
         method = method.upper()
         kw = self._inject_traceparent(kw)
         idempotent = method in _IDEMPOTENT
+        # TP2: stamp a stable Idempotency-Key on retry-eligible (idempotent)
+        # calls so the upstream can dedupe a retry against the original when a
+        # response was lost in transit (Turbopuffer/Stainless pattern). Set
+        # ONCE here so every retry attempt below reuses the SAME key; a
+        # caller-supplied key always wins. POST/PATCH never retry, so no key.
+        if idempotent:
+            kw = self._inject_idempotency(kw)
         attempt = 0
         import time as _time
         while True:
@@ -250,6 +289,18 @@ class TransportPool:
         kw = self._inject_traceparent(kw)
         kw.setdefault("timeout", self._stream_timeout)  # no read deadline; caller can override
         return self._client.stream(method, url, **kw)
+
+    @staticmethod
+    def _inject_idempotency(kw):
+        """Add a stable `Idempotency-Key` unless the caller already set one
+        (case-insensitive). Generated once per logical request and reused
+        across retries by the caller (kw persists across the retry loop)."""
+        headers = dict(kw.get("headers") or {})
+        if any(k.lower() == "idempotency-key" for k in headers):
+            return kw  # caller's key wins
+        import uuid
+        headers["idempotency-key"] = f"lancelot-{uuid.uuid4()}"
+        return {**kw, "headers": headers}
 
     @staticmethod
     def _inject_traceparent(kw):

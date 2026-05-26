@@ -54,8 +54,11 @@ fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     if let Ok(s) = obj.cast::<PyString>() {
         return Ok(Bytes::copy_from_slice(s.to_str()?.as_bytes()));
     }
-    if obj.hasattr("render")? {
-        let r = obj.call_method0("render")?;
+    // M8: intern "render" — the one hot-path attr name T4.13 missed. This
+    // hasattr fires on EVERY streamed chunk (incl. bytes/str token chunks where
+    // it short-circuits False), so the interned-string compare matters.
+    if obj.hasattr(pyo3::intern!(py, "render"))? {
+        let r = obj.call_method0(pyo3::intern!(py, "render"))?;
         if let Ok(b) = r.cast::<PyBytes>() {
             return Ok(Bytes::copy_from_slice(b.as_bytes()));
         }

@@ -2,6 +2,14 @@
 (doc HTML, the openapi JSON) without the ASGI seam re-`_to_json`-ing it."""
 
 
+def _strip_ctl(s) -> str:
+    """Drop CR/LF and other control chars (< 0x20 and DEL) so user-supplied
+    cookie data can't split the Set-Cookie header into a second response
+    header (HTTP response-splitting). Same A3 CR-safety pattern already used
+    for media_type / session_affinity, generalized to all control chars."""
+    return "".join(ch for ch in str(s) if ch >= " " and ch != "\x7f")
+
+
 class Response:
     media_type = "text/plain"
 
@@ -25,21 +33,29 @@ class Response:
                    secure: bool = False, httponly: bool = False,
                    samesite: str | None = "lax"):
         """Build a Set-Cookie header. Multiple cookies accumulate via a
-        list value under the `set-cookie` key (asgi seam emits each)."""
-        parts = [f"{key}={value}"]
+        list value under the `set-cookie` key (asgi seam emits each).
+
+        Security: key/value/path/domain are stripped of control chars so a
+        CRLF in user-supplied cookie data can't inject a second header
+        (response-splitting). `samesite` is validated against the spec enum."""
+        parts = [f"{_strip_ctl(key)}={_strip_ctl(value)}"]
         if max_age is not None:
-            parts.append(f"Max-Age={max_age}")
+            parts.append(f"Max-Age={int(max_age)}")
         if expires is not None:
-            parts.append(f"Expires={expires}")
+            parts.append(f"Expires={_strip_ctl(expires)}")
         if path:
-            parts.append(f"Path={path}")
+            parts.append(f"Path={_strip_ctl(path)}")
         if domain:
-            parts.append(f"Domain={domain}")
+            parts.append(f"Domain={_strip_ctl(domain)}")
         if secure:
             parts.append("Secure")
         if httponly:
             parts.append("HttpOnly")
         if samesite:
+            if str(samesite).lower() not in ("strict", "lax", "none"):
+                raise ValueError(
+                    f"invalid samesite {samesite!r}; "
+                    "expected one of 'strict', 'lax', 'none'")
             parts.append(f"SameSite={samesite}")
         header_value = "; ".join(parts)
         existing = self.headers.get("set-cookie")

@@ -52,11 +52,20 @@ class UploadFile:
         return {"type": "string", "format": "binary"}
 
 
-def parse_multipart(body: bytes, content_type: str) -> dict:
+def parse_multipart(body: bytes, content_type: str, *,
+                    max_fields: int = 1000, max_files: int = 1000,
+                    max_part_size: int = 16 * 1024 * 1024) -> dict:
     """Parse a multipart/form-data body using python-multipart (lazy-
     imported). Returns {field_name: value-or-UploadFile, ...} matching
     FastAPI's FormData shape (single value per key for now; multi-value
-    is on the M1-EXIT roadmap)."""
+    is on the M1-EXIT roadmap).
+
+    DoS caps (Starlette parity — `formparsers.py` MultiPartParser): an
+    attacker can pack tens of thousands of tiny parts inside the 16 MiB
+    body cap, forcing a giant dict + per-part validation. `max_fields` /
+    `max_files` bound the part count; `max_part_size` bounds a single
+    part's in-memory accumulation. Breaching any cap raises ValueError
+    (the ASGI seam maps it to 400)."""
     try:
         from python_multipart import MultipartParser
         from python_multipart.multipart import parse_options_header
@@ -71,6 +80,7 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
         return {}
     result: dict = {}
     current_field: dict | None = None
+    counts = {"fields": 0, "files": 0}
 
     def on_part_begin():
         nonlocal current_field
@@ -95,12 +105,23 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
             current_field["content_type"] = val.decode()
 
     def on_part_data(data, start, end):
+        if len(current_field["data"]) + (end - start) > max_part_size:
+            raise ValueError(
+                f"multipart part too large (> {max_part_size} bytes)")
         current_field["data"].extend(data[start:end])
 
     def on_part_end():
         f = current_field
         if f["name"] is None:
             return
+        if f["filename"] is not None:
+            counts["files"] += 1
+            if counts["files"] > max_files:
+                raise ValueError(f"too many files (> {max_files})")
+        else:
+            counts["fields"] += 1
+            if counts["fields"] > max_fields:
+                raise ValueError(f"too many fields (> {max_fields})")
         if f["filename"] is not None:
             uf = UploadFile(filename=f["filename"],
                             content_type=f["content_type"],
