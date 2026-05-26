@@ -12,8 +12,46 @@ runtime dep is still `pydantic` only — `import lancelot` does NOT import
 this module; `lancelot.llm` is the opt-in AI surface."""
 import asyncio
 import random
+import time as _time_mod
 
 _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
+
+
+class UpstreamIdleTimeout(Exception):
+    """An upstream stream produced no bytes for the configured idle window —
+    the connection stalled (no data, no close). Raised by
+    TransportPool.idle_guarded_chunks so a zombie stream can't hold a
+    connection open (and block graceful drain) forever."""
+
+    def __init__(self, idle_secs: float):
+        super().__init__(f"upstream stream idle for {idle_secs}s")
+        self.idle_secs = idle_secs
+
+
+class _TokenBucket:
+    """Minimal asyncio token bucket (calls/second). asyncio is single-threaded
+    cooperative — state only mutates synchronously between awaits, so no lock.
+    Starts full (one burst of `rate`), refills at `rate`/s capped at `rate`."""
+
+    __slots__ = ("_rate", "_tokens", "_last")
+
+    def __init__(self, rate: float):
+        if rate <= 0:
+            raise ValueError("rate_limit must be > 0")
+        self._rate = float(rate)
+        self._tokens = float(rate)
+        self._last = _time_mod.monotonic()
+
+    async def acquire(self) -> None:
+        while True:
+            now = _time_mod.monotonic()
+            self._tokens = min(self._rate,
+                               self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            await asyncio.sleep((1.0 - self._tokens) / self._rate)
 
 
 class TransportPool:
@@ -28,6 +66,8 @@ class TransportPool:
                  max_connections: int | None = None,
                  max_keepalive_connections: int | None = None,
                  keepalive_expiry: float | None = None,
+                 block_private_ips: bool = False,
+                 rate_limit: float | None = None,
                  mtls_cert: str | None = None,
                  mtls_key: str | None = None,
                  mtls_ca: str | None = None):
@@ -116,6 +156,26 @@ class TransportPool:
         # runaway streams are bounded instead by client-disconnect cancellation
         # (C2). Stolen from Bifrost's separate streaming-client timeout policy.
         self._stream_timeout = httpx.Timeout(timeout, read=None)
+        # SSRF guard (opt-in): validate user-supplied outbound URLs before any
+        # I/O. Default OFF so fixed-provider LLM calls aren't resolved/blocked.
+        self._block_private_ips = block_private_ips
+        # Per-stream inter-chunk idle timeout (Bifrost NewIdleTimeoutReader):
+        # close a stalled upstream SSE. 0 = off (default; don't silently break
+        # existing long streams). LANCELOT_UPSTREAM_STREAM_IDLE_SECS overrides.
+        try:
+            self._stream_idle_secs = float(
+                _os.environ.get("LANCELOT_UPSTREAM_STREAM_IDLE_SECS", "0"))
+        except ValueError:
+            self._stream_idle_secs = 0.0
+        # Outbound rate cap (calls/s token bucket) so bursty fanout doesn't
+        # explode a shared API key (Hatchet pattern). None = unlimited (default).
+        if rate_limit is None:
+            try:
+                _rl = float(_os.environ.get("LANCELOT_UPSTREAM_RATE_LIMIT", "0"))
+                rate_limit = _rl if _rl > 0 else None
+            except ValueError:
+                rate_limit = None
+        self._bucket = _TokenBucket(rate_limit) if rate_limit else None
 
     async def aclose(self):
         await self._client.aclose()
@@ -196,6 +256,11 @@ class TransportPool:
         into the request's `cost_usd` ContextVar — so the parent request
         sees the sub-LLM-call's cost automatically (Sim.ai pattern)."""
         method = method.upper()
+        if self._block_private_ips:
+            from lancelot.net import assert_safe_url
+            assert_safe_url(url)  # raises SSRFError before any network I/O
+        if self._bucket is not None:
+            await self._bucket.acquire()  # outbound rate cap (calls/s)
         kw = self._inject_traceparent(kw)
         idempotent = method in _IDEMPOTENT
         # TP2: stamp a stable Idempotency-Key on retry-eligible (idempotent)
@@ -322,9 +387,33 @@ class TransportPool:
         verbs may retry once before opening the stream. Returns an httpx
         Response context (use `async with pool.stream(...) as r:`)."""
         method = method.upper()
+        if self._block_private_ips:
+            from lancelot.net import assert_safe_url
+            assert_safe_url(url)
         kw = self._inject_traceparent(kw)
         kw.setdefault("timeout", self._stream_timeout)  # no read deadline; caller can override
         return self._client.stream(method, url, **kw)
+
+    async def idle_guarded_chunks(self, response, idle_secs: float | None = None):
+        """Yield `response.aiter_bytes()` chunks, but raise UpstreamIdleTimeout
+        if no chunk arrives within the idle window (defaults to the pool's
+        LANCELOT_UPSTREAM_STREAM_IDLE_SECS). idle<=0 → plain pass-through.
+        Use as: `async with pool.stream(...) as r:
+                     async for chunk in pool.idle_guarded_chunks(r): ...`"""
+        idle = self._stream_idle_secs if idle_secs is None else idle_secs
+        if idle <= 0:
+            async for chunk in response.aiter_bytes():
+                yield chunk
+            return
+        it = response.aiter_bytes().__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+            except asyncio.TimeoutError:
+                raise UpstreamIdleTimeout(idle) from None
+            except StopAsyncIteration:
+                return
+            yield chunk
 
     @staticmethod
     def _inject_idempotency(kw):
@@ -432,6 +521,10 @@ class TransportPool:
         sem = asyncio.Semaphore(concurrency) if concurrency else None
 
         async def _run(coro):
+            # Rate gate BEFORE the concurrency slot: rate caps sustained calls/s,
+            # concurrency caps burst width — orthogonal (Hatchet pattern).
+            if self._bucket is not None:
+                await self._bucket.acquire()
             if sem is None:
                 return await coro
             async with sem:

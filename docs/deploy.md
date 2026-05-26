@@ -157,6 +157,29 @@ avoids spending app CPU on what the edge does better.
 | `LANCELOT_HEADER_TIMEOUT_MS` | 15000 | slow-loris deadline: drop a client that dribbles request headers past this. |
 | `LANCELOT_DRAIN_SECS` | 10 | graceful-shutdown drain: on SIGTERM, finish in-flight requests up to this long before exiting (0 = exit immediately). |
 | `LANCELOT_STREAM_BUFFER` | 256 | streaming channel depth (backpressure vs throughput; see `benchmarks/README.md` for the knee). |
+| `LANCELOT_UPSTREAM_RATE_LIMIT` | 0 (off) | outbound LLM calls/second cap (token bucket) on `TransportPool` — keeps bursty `fanout()` from tripping a shared API key's rate limit. Also `TransportPool(rate_limit=...)`. |
+| `LANCELOT_UPSTREAM_STREAM_IDLE_SECS` | 0 (off) | per-stream inter-chunk idle deadline for `pool.idle_guarded_chunks()` — a stalled upstream SSE (no bytes, no close) is cut instead of holding the connection open (and blocking drain) forever. 60 is a sane production value. |
+
+## Outbound LLM transport hardening (`lancelot.llm.TransportPool`)
+
+- **SSRF guard** (opt-in): `TransportPool(block_private_ips=True)` validates every
+  outbound URL via `lancelot.net.assert_safe_url` before any I/O — blocks
+  private / loopback / link-local / CGNAT / the cloud-metadata endpoint
+  (`169.254.169.254`), incl. IPv4-mapped-IPv6 and obfuscated literals. Default
+  off (fixed-provider LLM calls are unaffected). Use it when a handler forwards
+  a **user-supplied** URL (webhook delivery, "fetch this URL" tools).
+- **Stalled-stream watchdog**: `async for c in pool.idle_guarded_chunks(r): …`
+  raises `UpstreamIdleTimeout` if the upstream goes silent past the idle window.
+- **Outbound rate cap**: `rate_limit=` (above) — orthogonal to `fanout(concurrency=)`
+  (concurrency = burst width; rate = sustained calls/s).
+
+## Webhooks (`lancelot.webhook` — stdlib, sign/verify only)
+
+`sign(body, secret)` / `verify(body, headers, secret)` implement the Standard
+Webhooks scheme (HMAC-SHA256 over `{id}.{ts}.{body}`, constant-time compare,
+timestamp freshness, key-rotation). Sign outbound deliveries so the receiver can
+trust them; verify inbound ones. This is the crypto only — delivery/retries are
+yours (or the proxy's). Secret: `"whsec_" + base64.b64encode(os.urandom(32)).decode()`.
 
 ## Graceful shutdown
 

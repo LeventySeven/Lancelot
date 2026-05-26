@@ -51,8 +51,11 @@ def test_llm_request_emits_cost_event_with_token_breakdown():
         assert ev.attrs["gen_ai.usage.output_tokens"] == 5
         assert ev.attrs["gen_ai.usage.cached_input_tokens"] == 2
         assert ev.attrs["gen_ai.response.model"] == "gpt-4o-mini-2024-07-18"
-        # Cost calculated against the built-in price table
-        assert ev.attrs["gen_ai.cost.usd"] > 0
+        # Lancelot does NOT ship rates (they change weekly) — the SINK emits
+        # the token breakdown; cost.usd is None here and is computed only via
+        # upstream_metrics with the user's own set_rate_table(). (M14: removed
+        # the stale hardcoded PRICE_TABLE — policy-consistent, no faked prices.)
+        assert ev.attrs["gen_ai.cost.usd"] is None
     finally:
         set_sink(None)
 
