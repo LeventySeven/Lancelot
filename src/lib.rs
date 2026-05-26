@@ -20,6 +20,27 @@ fn _ping() -> &'static str {
     "lancelot-m0"
 }
 
+/// Build the embedded asyncio loop, preferring uvloop. uvloop is the SAME
+/// C-based loop uvicorn uses to beat us on tiny one-shot responses (the one
+/// conceded loss in the honest perf envelope); running our handler dispatch on
+/// it shrinks the per-request asyncio overhead (call_soon_threadsafe / future
+/// scheduling) the FFI bridge pays. Soft-dep — uvloop stays OUT of the runtime
+/// deps (cardinal rule: pydantic-only); if it isn't installed we fall back to
+/// stdlib asyncio. `LANCELOT_LOOP=asyncio` forces stdlib (escape hatch / A-B).
+fn make_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let force_stdlib = std::env::var("LANCELOT_LOOP")
+        .map(|v| v.eq_ignore_ascii_case("asyncio"))
+        .unwrap_or(false);
+    if !force_stdlib {
+        if let Ok(uvloop) = py.import("uvloop") {
+            if let Ok(loop_) = uvloop.call_method0("new_event_loop") {
+                return Ok(loop_);
+            }
+        }
+    }
+    py.import("asyncio")?.call_method0("new_event_loop")
+}
+
 /// `routes`: list of (method, path, handler). `const_routes` (optional, trailing
 /// keyword for back-compat): list of (method, path, body, content_type, status)
 /// served as prebaked bytes straight from Rust — zero GIL/Request/handler (the
@@ -37,7 +58,7 @@ fn run(
     port: u16,
     const_routes: Option<Vec<(String, String, Vec<u8>, String, u16)>>,
 ) -> PyResult<()> {
-    let event_loop = py.import("asyncio")?.call_method0("new_event_loop")?;
+    let event_loop = make_event_loop(py)?;
     let locals = pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)?;
     let const_routes = const_routes.unwrap_or_default();
     let mut router = crate::router::Router::new();
