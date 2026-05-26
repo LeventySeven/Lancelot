@@ -449,7 +449,9 @@ async def _http_dispatch(app, scope, receive, send):
         await _send_json(send, 400,
                          b'{"detail":"Too many query parameters"}')
         return
-    qs = parse_qs(_raw_qs.decode())
+    # P4: skip the parse_qs + .decode() alloc entirely on the common empty-QS
+    # case (most POST/API calls carry no query string).
+    qs = parse_qs(_raw_qs.decode()) if _raw_qs else {}
     query = {k: v[-1] for k, v in qs.items()}
     query_multi = dict(qs)  # full multi-value form (bucket-model uses)
     headers = {}  # FIRST-wins (Starlette parity; blocks header smuggling — A2)
@@ -815,10 +817,17 @@ async def _http_dispatch(app, scope, receive, send):
                         _kp_task.cancel()
                     if not _disc_watch.done():
                         _disc_watch.cancel()
-                    await _flush_serialized()
-                    await _send_serialized({
-                        "type": "http.response.body",
-                        "body": b"", "more_body": False})
+                    # R2: a send() on a broken socket (client gone) must NOT
+                    # replace the CancelledError we're propagating — that would
+                    # corrupt yield-dep teardown exc_info + lose the cancel
+                    # signal. Swallow send failures during final flush/close.
+                    try:
+                        await _flush_serialized()
+                        await _send_serialized({
+                            "type": "http.response.body",
+                            "body": b"", "more_body": False})
+                    except Exception:  # noqa: BLE001
+                        pass
                 return
             # FastAPI: an async-generator handler (async def with yield)
             # returns the async-gen directly; calling it (no await) gives
@@ -1007,6 +1016,15 @@ async def _http_dispatch(app, scope, receive, send):
                                 "body": b"", "more_body": False})
                     if lreq._background._tasks:
                         await lreq._background()
+                    # R1: run the response-level background (Starlette parity).
+                    # StreamingResponse(..., background=fn) was silently dropped
+                    # — temp-file/DB-session/audit cleanup never fired.
+                    _rb = getattr(result, "background", None)
+                    if _rb is not None and callable(_rb):
+                        import inspect as _ispb
+                        _rbr = _rb()
+                        if _ispb.isawaitable(_rbr):
+                            await _rbr
                     return
                 # Starlette init_headers wire order: explicit user headers
                 # FIRST (lowercased — Starlette parity), then content-length,
@@ -1047,6 +1065,9 @@ async def _http_dispatch(app, scope, receive, send):
 
                 try:
                     rm = route.response_model
+                    # P1: reuse the adapter built at registration (fallback to a
+                    # fresh one for any Route constructed off the normal path).
+                    _ta = getattr(route, "_response_ta", None) or TypeAdapter(rm)
                     if (isinstance(rm, type) and issubclass(rm, _BM)
                             and not isinstance(result, rm)):
                         _val = rm.model_validate(result, from_attributes=True)
@@ -1055,9 +1076,8 @@ async def _http_dispatch(app, scope, receive, send):
                         # list[Model] / dict[str, Model] / Optional[Model]
                         # paths — TypeAdapter recursively coerces ORM-style
                         # objects only when this flag is set.
-                        _val = TypeAdapter(rm).validate_python(
+                        _val = _ta.validate_python(
                             result, from_attributes=True)
-                    _ta = TypeAdapter(rm)
                     payload = _ta.dump_json(
                         _val,
                         by_alias=route.response_model_by_alias,

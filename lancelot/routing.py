@@ -155,13 +155,18 @@ class Route:
         # Validate response_model at REGISTRATION time (FastAPI parity):
         # a non-Pydantic-compatible type raises FastAPIError so the dev's
         # mistake surfaces immediately, not at first request.
+        self._response_ta = None
         if self.response_model is not None:
             from lancelot.exceptions import FastAPIError
 
             try:
                 from pydantic import TypeAdapter as _TA
 
-                _TA(self.response_model)
+                # P1: build the response_model adapter ONCE at registration and
+                # KEEP it (was validated-then-discarded here, then rebuilt TWICE
+                # per request in the ASGI seam — ~1.9µs/req on response_model
+                # routes). TypeAdapter is stateless, so reuse is identical.
+                self._response_ta = _TA(self.response_model)
             except Exception as _e:
                 raise FastAPIError(
                     f"Invalid response_model {self.response_model!r}"
