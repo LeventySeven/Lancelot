@@ -46,6 +46,31 @@ def _resolve_max_query_params() -> int:
 _MAX_QUERY_PARAMS = _resolve_max_query_params()
 
 
+def _parse_cookies(headers: dict) -> dict:
+    """Lenient RFC-6265 cookie parse shared by the HTTP + WS seams. Bypasses
+    http.cookies.SimpleCookie (it silently DROPS cookies whose values contain
+    real-world chars like `[ ] " ,` — e.g. JSON-shaped cookies), same as
+    FastAPI/Starlette. Split on `;`; first `=` is the name/value boundary;
+    quoted values de-quoted; first occurrence wins (cookie-bomb defense)."""
+    cookies: dict = {}
+    raw = headers.get("cookie")
+    if not raw:
+        return cookies
+    for _piece in raw.split(";"):
+        _piece = _piece.strip()
+        if not _piece:
+            continue
+        _i = _piece.find("=")
+        if _i <= 0:
+            continue  # malformed pair (no `=` or starts with `=`)
+        _ck = _piece[:_i].strip()
+        _cv = _piece[_i + 1:].strip()
+        if len(_cv) >= 2 and _cv[0] == '"' and _cv[-1] == '"':
+            _cv = _cv[1:-1]
+        cookies.setdefault(_ck, _cv)
+    return cookies
+
+
 def build_asgi(app):
     async def asgi(scope, receive, send):
         if scope["type"] == "lifespan":
@@ -228,26 +253,22 @@ async def _http(app, scope, receive, send):
         if msg.get("type") == "http.response.start":
             _final_status_holder[0] = msg.get("status", 500)
             hdrs = msg.get("headers")
-            need_mutation = False
-            if _rid_from_client and not any(
-                    k == b"x-request-id" for k, _ in (hdrs or [])):
-                need_mutation = True
+            # Scan the header list ONCE per key (was scanned twice each); nobody
+            # adds these keys between the decision and the mutation.
+            _keys = {k for k, _ in (hdrs or [])}
             try:
                 from lancelot.context import cost_usd as _cost_var
                 _cost_now = _cost_var.get()
-                if _cost_now > 0.0 and not any(
-                        k == b"x-lancelot-cost-usd" for k, _ in (hdrs or [])):
-                    need_mutation = True
             except Exception:  # noqa: BLE001
                 _cost_now = 0.0
-            if need_mutation:
+            need_rid = _rid_from_client and b"x-request-id" not in _keys
+            need_cost = _cost_now > 0.0 and b"x-lancelot-cost-usd" not in _keys
+            if need_rid or need_cost:
                 hdrs = list(hdrs or [])
-                if _rid_from_client and not any(
-                        k == b"x-request-id" for k, _ in hdrs):
+                if need_rid:
                     hdrs.append((b"x-request-id",
                                  _rid.encode("ascii", "ignore")))
-                if _cost_now > 0.0 and not any(
-                        k == b"x-lancelot-cost-usd" for k, _ in hdrs):
+                if need_cost:
                     hdrs.append((b"x-lancelot-cost-usd",
                                  f"{_cost_now:.6f}".encode("ascii")))
                 msg = {**msg, "headers": hdrs}
@@ -467,23 +488,7 @@ async def _http_dispatch(app, scope, receive, send):
     # cookies. FastAPI/Starlette also bypass SimpleCookie for the same
     # reason. Our parser: split on `;`, strip whitespace, first `=` is the
     # name/value boundary, RFC-6265 §4.1.1 quoted values are de-quoted.
-    cookies: dict = {}
-    if "cookie" in headers:
-        for _piece in headers["cookie"].split(";"):
-            _piece = _piece.strip()
-            if not _piece:
-                continue
-            _i = _piece.find("=")
-            if _i <= 0:
-                continue  # malformed pair (no `=` or starts with `=`)
-            _ck = _piece[:_i].strip()
-            _cv = _piece[_i + 1:].strip()
-            # RFC 6265 §4.1.1: cookie-value MAY be quoted-string.
-            if len(_cv) >= 2 and _cv[0] == '"' and _cv[-1] == '"':
-                _cv = _cv[1:-1]
-            # First occurrence wins (Starlette parity; defends against
-            # cookie-bomb where a client re-asserts a known name).
-            cookies.setdefault(_ck, _cv)
+    cookies = _parse_cookies(headers)
     params = route.match(path) or {}
     from lancelot.requests import _BodyAccessor as _BA
 
@@ -529,8 +534,7 @@ async def _http_dispatch(app, scope, receive, send):
                     "input": None,
                 }]})
                 await _send_json(send, 422, err_body)
-                sent = True
-                return
+                return  # response already emitted; `sent` is set below at 562
         bname, bval = route.body
         if body:
             if getattr(route, "body_kind", "json") == "form":
@@ -1281,20 +1285,7 @@ async def _ws(app, scope, receive, send):
     query = {k: v[-1] for k, v in qs.items()}
     # Lenient cookie parser (same as HTTP seam — SimpleCookie drops
     # cookies with brackets/quotes; ours keeps them).
-    cookies: dict = {}
-    if "cookie" in headers:
-        for _piece in headers["cookie"].split(";"):
-            _piece = _piece.strip()
-            if not _piece:
-                continue
-            _i = _piece.find("=")
-            if _i <= 0:
-                continue
-            _ck = _piece[:_i].strip()
-            _cv = _piece[_i + 1:].strip()
-            if len(_cv) >= 2 and _cv[0] == '"' and _cv[-1] == '"':
-                _cv = _cv[1:-1]
-            cookies.setdefault(_ck, _cv)
+    cookies = _parse_cookies(headers)
     lreq = LRequest("GET", path, query, headers, cookies, params, b"",
                     scope["app"])
     lreq.query_params_multi = dict(qs)

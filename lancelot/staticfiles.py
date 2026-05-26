@@ -8,6 +8,7 @@ messages), 304 (NotModifiedResponse allow-set, no body), GET/HEAD only,
 FileResponse header order (content-type FIRST). The Rust tower-http::fs /
 sendfile(2) realization (src/static_files.rs, WBS U14) is the spec §3-69
 unification; multi-range / directory-index are ledgered RED."""
+import asyncio
 import hashlib
 import os
 from email.utils import formatdate, parsedate
@@ -140,8 +141,14 @@ class StaticFiles:
             await send({"type": "http.response.body", "body": b""})
             return
 
-        with open(full, "rb") as fh:
-            data = fh.read()
+        # Read off the event loop: a synchronous read of a large static file
+        # would stall the reactor for every concurrent request (Starlette uses
+        # anyio.open_file; asyncio.to_thread is the stdlib, zero-dep equivalent).
+        def _read():
+            with open(full, "rb") as fh:
+                return fh.read()
+
+        data = await asyncio.to_thread(_read)
         rng = req_headers.get("range")
         # Starlette FileResponse raw header order: content-type FIRST,
         # then accept-ranges, content-length, last-modified, etag

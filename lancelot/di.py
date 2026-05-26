@@ -11,6 +11,18 @@ from lancelot.params import Depends, Required, extract_field
 from lancelot.validation import compile_validator
 
 
+def _parse_multipart_or_400(body, ct):
+    """Parse multipart, mapping the DoS-cap ValueError (too many fields/files,
+    oversized part) to HTTP 400 — Starlette parity. Unmapped, it would bubble
+    to the seam's `except Exception` and surface as a misleading 500."""
+    from lancelot.uploads import parse_multipart
+    try:
+        return parse_multipart(body, ct)
+    except ValueError as e:
+        from lancelot.exceptions import HTTPException
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
 @dataclass
 class SubDep:
     call: typing.Callable
@@ -367,9 +379,7 @@ def _raw_for(fi, request):
                     ct = hv
                     break
             if "multipart/form-data" in ct:
-                from lancelot.uploads import parse_multipart
-
-                form = parse_multipart(request.body, ct)
+                form = _parse_multipart_or_400(request.body, ct)
             else:
                 form = {}
             request._multipart_cache = form
@@ -420,9 +430,7 @@ def _raw_for(fi, request):
             # Re-use the multipart cache (text parts become str values).
             mp = getattr(request, "_multipart_cache", None)
             if mp is None:
-                from lancelot.uploads import parse_multipart
-
-                mp = parse_multipart(request.body, ct)
+                mp = _parse_multipart_or_400(request.body, ct)
                 request._multipart_cache = mp
             v = mp.get(key)
             return v, key in mp

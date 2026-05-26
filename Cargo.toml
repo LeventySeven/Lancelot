@@ -21,11 +21,12 @@ pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time", "sync", "macros"] }
 # R3 streaming pump: ReceiverStream adapts the bounded mpsc → hyper StreamBody.
 tokio-stream = "0.1"
-hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+# http1-only by design (cleartext-behind-a-TLS-proxy; h2c was unguarded). The
+# http2/server-auto features compiled in dead h2 code — dropped.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 http = "1"
-tower = { version = "0.5", features = ["util"] }
 # R7: FutureExt::catch_unwind for FFI seam panic safety. Default features
 # off — we only need the executor-agnostic FutureExt traits.
 futures = { version = "0.3", default-features = false, features = ["std"] }

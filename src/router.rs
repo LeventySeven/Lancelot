@@ -54,6 +54,14 @@ impl Router {
     /// Returns None if no path is "close enough" (avoids misleading
     /// suggestions). Pure-Rust, no extra dep.
     pub fn closest_path(&self, query: &str) -> Option<String> {
+        // DoS guard: this runs on every 404 with the attacker-controlled URI.
+        // hyper accepts URIs up to ~hundreds of KB; without a cap, levenshtein
+        // allocates O(uri_len) per registered route per request. Real typo'd
+        // paths are tiny — anything over 256 bytes gets the plain 404, no
+        // suggestion. Caps per-call work to a constant regardless of input.
+        if query.len() > 256 {
+            return None;
+        }
         let q_lower = query.to_ascii_lowercase();
         let threshold = (query.len() / 3).max(2);
         let mut best: Option<(usize, &String)> = None;
@@ -143,6 +151,18 @@ mod tests {
         assert_eq!(r.closest_path("/healtz"), Some("/healthz".to_string()));
         // exact match — also "closest", since distance 0
         assert_eq!(r.closest_path("/users"), Some("/users".to_string()));
+    }
+
+    #[test]
+    fn closest_path_oversized_query_is_rejected_cheaply() {
+        let mut r = Router::new();
+        r.add("GET", "/users", 0).unwrap();
+        // DoS guard: a huge attacker URI returns None without running the
+        // O(len) levenshtein DP per route. Anything > 256 bytes is dropped.
+        let huge = "/".to_string() + &"a".repeat(500_000);
+        assert_eq!(r.closest_path(&huge), None);
+        // boundary: 256 chars still considered; 257 rejected.
+        assert!(r.closest_path(&"a".repeat(257)).is_none());
     }
 
     #[test]

@@ -75,7 +75,9 @@ class FileBackend:
     may have been updated externally)."""
 
     def __init__(self, base_dir: str, *, encoding: str = "utf-8"):
-        self.base = base_dir
+        # realpath the base so a symlinked base can't defeat the containment
+        # check below (same guard pattern as staticfiles.StaticFiles).
+        self.base = os.path.realpath(base_dir)
         self.encoding = encoding
         self._cache: dict[str, str] = {}
         self._cached_keys_loaded = False
@@ -84,7 +86,16 @@ class FileBackend:
         # Cache per-name; refresh() invalidates.
         if name in self._cache:
             return self._cache[name]
-        p = os.path.join(self.base, name)
+        # SEC: keep the resolved path inside base. `name` may be attacker-
+        # controlled (e.g. wired from a request); os.path.join discards base on
+        # an absolute name, and ".." escapes — realpath+commonpath blocks both.
+        try:
+            p = os.path.realpath(os.path.join(self.base, name))
+            if os.path.commonpath([p, self.base]) != self.base:
+                _log.warning("FileBackend: path-traversal attempt for %r", name)
+                return None
+        except (ValueError, OSError):
+            return None
         try:
             with open(p, "r", encoding=self.encoding) as f:
                 v = f.read().rstrip("\n")

@@ -75,8 +75,11 @@ pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Bytes
                 ));
             }
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => {
-                e.restore(py); // Clear the error before falling through.
-                pyo3::PyErr::take(py);
+                // orjson raised TypeError on a non-serializable input — fall
+                // through to the pydantic-core path. pyo3 already detached the
+                // error into `e` (CPython indicator is clear), so dropping it is
+                // enough; the old restore()+take() pair was a no-op round-trip.
+                drop(e);
             }
             Err(e) => return Err(e),
         }

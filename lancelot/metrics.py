@@ -79,15 +79,23 @@ def _maybe_bind():
     return _state
 
 
+_tenant_label_max_cached: int | None = None
+
+
 def _tenant_label_max() -> int:
     """M7 T2.4 (Hightouch pattern): cap distinct tenant labels we emit
     on metrics so a runaway-tenant-id key doesn't blow up cardinality.
-    Over-cap → bucket to "_overflow_". Per-process state, set once."""
-    import os
-    try:
-        return max(1, int(os.environ.get("LANCELOT_TENANT_LABEL_MAX", "1000")))
-    except (ValueError, TypeError):
-        return 1000
+    Over-cap → bucket to "_overflow_". Per-process state, set once — so we
+    read+parse the env ONCE and memoize (was re-reading on every new tenant)."""
+    global _tenant_label_max_cached
+    if _tenant_label_max_cached is None:
+        import os
+        try:
+            _tenant_label_max_cached = max(
+                1, int(os.environ.get("LANCELOT_TENANT_LABEL_MAX", "1000")))
+        except (ValueError, TypeError):
+            _tenant_label_max_cached = 1000
+    return _tenant_label_max_cached
 
 
 # Bounded-set of tenant labels we've seen this process. NOT thread-safe;
@@ -179,7 +187,8 @@ def in_flight_delta(delta: int) -> None:
 
 def reset_for_tests() -> None:
     """Force-re-bind on next call. Tests only — exposes nothing to users."""
-    global _state
+    global _state, _tenant_label_max_cached
     _state = _NOT_INITIALIZED
     # M7 T2.4: also clear the tenant-label set so each test starts fresh.
     _tenant_label_set.clear()
+    _tenant_label_max_cached = None  # re-read the env cap on next call

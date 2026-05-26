@@ -443,11 +443,11 @@ class TransportPool:
         pending = set(tasks)
         try:
             # Loop until we have `target_n` successes or all tasks done.
-            t0 = asyncio.get_event_loop().time() if deadline else None
+            t0 = asyncio.get_running_loop().time() if deadline else None
             while pending and successes < target_n:
                 timeout = None
                 if deadline is not None and t0 is not None:
-                    remaining = deadline - (asyncio.get_event_loop().time() - t0)
+                    remaining = deadline - (asyncio.get_running_loop().time() - t0)
                     if remaining <= 0:
                         break
                     timeout = remaining

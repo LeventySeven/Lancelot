@@ -12,6 +12,14 @@ import json as _json
 from dataclasses import dataclass
 
 
+def _clean_field(s: str) -> str:
+    """Strip CR/LF/NUL + control chars from an SSE field value. A newline in
+    `id:`/`event:` smuggles an extra frame; a NUL in `id:` silently resets the
+    client's lastEventId (WHATWG SSE §9.2.6). Same A3 strip used for
+    media_type / cookies."""
+    return "".join(ch for ch in str(s) if ch >= " " and ch != "\x7f")
+
+
 @dataclass
 class Event:
     """One server-sent event. `name` becomes `event:`; `data` is
@@ -24,8 +32,8 @@ class Event:
     def render(self) -> bytes:
         out = []
         if self.id is not None:
-            out.append(f"id: {self.id}")
-        out.append(f"event: {self.name}")
+            out.append(f"id: {_clean_field(self.id)}")
+        out.append(f"event: {_clean_field(self.name)}")
         out.append("data: " + _json.dumps(self.data, separators=(",", ":")))
         out.append("")
         out.append("")

@@ -114,6 +114,16 @@ class CORSMiddleware:
     def __init__(self, app, *, allow_origins=(), allow_methods=("GET",),
                  allow_headers=(), allow_credentials=False, max_age=600):
         self.app = app
+        # SEC: wildcard origin + credentials reflects ANY Origin back with
+        # Access-Control-Allow-Credentials: true → cross-origin credentialed
+        # access (SOP bypass). Fail loud at construction (Starlette parity)
+        # rather than silently serving the dangerous config.
+        if "*" in allow_origins and allow_credentials:
+            raise ValueError(
+                "CORSMiddleware: allow_credentials=True cannot be combined "
+                "with allow_origins=['*'] (it reflects every Origin with "
+                "credentials — a same-origin-policy bypass). List explicit "
+                "allowed origins instead.")
         self.allow_origins = list(allow_origins)
         self.allow_all_origins = "*" in self.allow_origins
         self.allow_methods = list(allow_methods)
