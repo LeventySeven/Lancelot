@@ -3,13 +3,17 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "lancelot"
+# Distribution name (the `pip install` name). The PyPI name `lancelot` is held
+# by an abandoned 2009 package, so we publish as `lancelot-framework`; the
+# IMPORT name stays `lancelot` (distribution name != import name).
+name = "lancelot-framework"
 version = "0.1.0"
 description = "FastAPI-compatible Python AI/cloud/web backend framework (Rust core via pyo3 + hyper + tokio)"
 requires-python = ">=3.11"
 dependencies = ["pydantic>=2.7"]
 readme = "README.md"
 license = { text = "Apache-2.0" }
+authors = [{ name = "LeventySeven" }]
 keywords = ["fastapi", "asgi", "ai", "llm", "streaming", "backend", "framework", "rust", "pyo3"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -26,6 +30,11 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
+
+[project.urls]
+Homepage = "https://github.com/LeventySeven/Lancelot"
+Repository = "https://github.com/LeventySeven/Lancelot"
+Issues = "https://github.com/LeventySeven/Lancelot/issues"
 
 # Runtime dep stays pydantic-ONLY (cardinal rule). These extras are opt-in and
 # never pulled by `import lancelot`. `bench` = the load-comparison baselines
