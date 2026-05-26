@@ -28,3 +28,6 @@ dhat-heap.json
 *.env
 conformance/log.txt
 .claude/
+
+# dev scratch
+log.txt

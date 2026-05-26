@@ -50,3 +50,14 @@ mcp = ["mcp[cli]>=1.0"]
 features = ["pyo3/extension-module"]
 module-name = "lancelot._native"
 python-source = "."
+# Keep the sdist LEAN: ship only what's needed to build + run (lancelot/, src/,
+# Cargo.*, pyproject, README, LICENSE, rust-toolchain). Exclude the dev tree —
+# benchmarks/results, the vendored-FastAPI conformance harness (third-party
+# MIT), tests, docs, internal plans, scratch.
+exclude = [
+    "benchmarks/**/*", "tests/**/*", "conformance/**/*", "docs/**/*",
+    "benches/**/*", "research/**/*", "researchfms/**/*", "tools/**/*",
+    ".github/**/*", "wip/**/*", "dist/**/*", "target/**/*",
+    "CLAUDE.md", "ULTIMATE-PLAN.md", "log.txt", "Makefile",
+    "**/*.so", "**/__pycache__/**/*", "**/*.pyc", "**/.DS_Store",
+]

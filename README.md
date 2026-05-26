@@ -34,18 +34,41 @@
 
 (Tiny one-shot: uvicorn+uvloop wins — Lancelot's `@app.const` tier is the answer for fixed responses, ~183k rps. See `docs/deploy.md`.)
 
+## Install
+
+```bash
+pip install lancelot-framework            # prebuilt wheels — no Rust toolchain needed
+pip install 'lancelot-framework[orjson]'  # optional: faster JSON serialization
+```
+
+Distribution name is **`lancelot-framework`**; the import stays **`lancelot`**
+(the PyPI name `lancelot` is held by an unrelated 2009 package). Requires Python ≥ 3.11.
+
 ## Quickstart
 
 ```bash
-# 1. Clone + build (Rust toolchain required for first build)
+pip install lancelot-framework 'uvicorn[standard]'
+python -m uvicorn myapp:app --loop uvloop --http httptools   # FastAPI-parity path
+```
+
+```python
+# myapp.py — import name stays `lancelot`
+from lancelot import FastAPI
+app = FastAPI()
+
+@app.get("/healthz")
+async def healthz() -> str:
+    return "ok"
+```
+
+<details><summary>Build from source (contributors / unsupported platform)</summary>
+
+```bash
 git clone https://github.com/LeventySeven/Lancelot.git && cd Lancelot
 python -m venv .venv && source .venv/bin/activate
-pip install maturin && maturin develop --release
-pip install 'uvicorn[standard]'   # for the ASGI surface
-
-# 2. Run a FastAPI-shaped app
-python -m uvicorn myapp:app --loop uvloop --http httptools
+pip install maturin && maturin develop --release   # Rust toolchain required
 ```
+</details>
 
 Migration: 1 line in most apps. See **[`docs/migration/from-fastapi.md`](docs/migration/from-fastapi.md)** for the import swap + the four documented behavior divergences + Render/VPS deploy recipes.
 
