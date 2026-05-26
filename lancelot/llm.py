@@ -24,6 +24,7 @@ class TransportPool:
     def __init__(self, *, transport=None, max_retries: int = 3,
                  backoff_base: float = 0.2, backoff_max: float = 8.0,
                  timeout: float = 30.0,
+                 retry_budget_ms: int | None = None,
                  max_connections: int | None = None,
                  max_keepalive_connections: int | None = None,
                  keepalive_expiry: float | None = None,
@@ -96,6 +97,18 @@ class TransportPool:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
+        # T1 (Portkey MAX_RETRY_LIMIT_MS): wall-clock cap on the whole retry
+        # chain so a runaway Retry-After (e.g. 3×30s) can't hold an outbound
+        # call open far longer than the operator expects — bounds the call's
+        # contribution to graceful-drain + per-route-timeout budgets. Default
+        # 60 s; env LANCELOT_UPSTREAM_RETRY_BUDGET_MS; None disables the cap.
+        if retry_budget_ms is None:
+            try:
+                retry_budget_ms = int(
+                    _os.environ.get("LANCELOT_UPSTREAM_RETRY_BUDGET_MS", 60000))
+            except ValueError:
+                retry_budget_ms = 60000
+        self.retry_budget_ms = retry_budget_ms
         # Streaming LLM responses legitimately outlive the unary `timeout` — a
         # steady token feed must NOT be severed by a total/read deadline (a 30s
         # unary read timeout kills any stream with a >30s generation). Keep
@@ -194,10 +207,25 @@ class TransportPool:
             kw = self._inject_idempotency(kw)
         attempt = 0
         import time as _time
+        _budget_start = _time.monotonic()
         while True:
             t0 = _time.perf_counter()
-            resp = await self._await_cancellable(
-                self._client.request(method, url, **kw), request)
+            try:
+                resp = await self._await_cancellable(
+                    self._client.request(method, url, **kw), request)
+            except self._httpx.TimeoutException:
+                # T2: classify transport-level timeouts (Read/Connect/Pool/
+                # Write) into the upstream metric taxonomy (408 → "timeout")
+                # so they're visible in lancelot.upstream.* alongside HTTP
+                # 408/504. Behavior preserved: we do NOT auto-retry a timeout
+                # — propagate to the caller as before.
+                try:
+                    from lancelot.upstream_metrics import record_upstream
+                    record_upstream(url, 408, _time.perf_counter() - t0,
+                                    body=None)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             elapsed = _time.perf_counter() - t0
             # M7 T1.3 + T2.2: emit per-call upstream metric + accumulate
             # cost into parent's cost_usd ContextVar.
@@ -219,6 +247,14 @@ class TransportPool:
                 wait = min(self.backoff_max,
                            self.backoff_base * (2 ** attempt)
                            + random.random() * self.backoff_base)
+            # T1: bail if this sleep would push the total retry wall-clock past
+            # the budget — return the last response instead of holding the call
+            # open (e.g. a 30s Retry-After under a 1s budget never sleeps).
+            if self.retry_budget_ms is not None:
+                spent_ms = (_time.monotonic() - _budget_start) * 1000.0
+                if spent_ms + wait * 1000.0 > self.retry_budget_ms:
+                    self._maybe_emit_cost(resp)
+                    return resp
             await asyncio.sleep(wait)
             attempt += 1
 

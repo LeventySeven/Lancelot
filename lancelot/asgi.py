@@ -781,6 +781,35 @@ async def _http_dispatch(app, scope, receive, send):
                 except _asyncio.CancelledError:
                     lreq._cancel_event.set()
                     raise
+                except Exception:  # noqa: BLE001
+                    # S1 (AI-backend pattern — Ollama streamResponse): the
+                    # handler raised AFTER the 200 + headers were sent, so we
+                    # can't switch to a 500. Flush buffered good chunks, then
+                    # emit a final SSE error frame so the client sees FAILURE
+                    # instead of a stream that truncates yet looks complete
+                    # (the finally below sends a clean EOF). Log for the
+                    # operator; do NOT re-raise — the response is committed.
+                    import json as _json
+                    import logging as _logging
+                    import traceback as _tb
+                    try:
+                        from lancelot.context import request_id as _rid_cv
+                        _rid = _rid_cv.get()
+                    except Exception:  # noqa: BLE001
+                        _rid = "-"
+                    try:
+                        await _flush_serialized()
+                        _err = ("event: error\ndata: " + _json.dumps(
+                            {"error": "internal server error",
+                             "request_id": _rid}) + "\n\n").encode()
+                        await _send_serialized({
+                            "type": "http.response.body",
+                            "body": _err, "more_body": True})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _logging.getLogger("lancelot.stream").error(
+                        "stream handler raised after response start:\n%s",
+                        _tb.format_exc())
                 finally:
                     if _kp_task is not None and not _kp_task.done():
                         _kp_task.cancel()
