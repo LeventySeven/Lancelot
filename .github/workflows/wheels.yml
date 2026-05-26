@@ -1,0 +1,74 @@
+# Build + publish prebuilt wheels so `pip install lancelot` works in a slim
+# Docker image with ZERO Rust toolchain — the whole point of being Docker-
+# deployable like FastAPI. Lancelot is abi3-py311 (Cargo: pyo3 abi3-py311), so
+# ONE wheel per (OS, arch) covers Python 3.11+ — small matrix, fast builds.
+#
+# Triggers: a version tag (v*) builds + publishes to PyPI; manual dispatch and
+# PRs build-only (CI sanity, no publish). Publish uses PyPI Trusted Publishing
+# (OIDC) — configure the project on PyPI; no token secret needed.
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: ["src/**", "Cargo.toml", "pyproject.toml", ".github/workflows/wheels.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: wheel (${{ matrix.platform.os }} / ${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          # Linux is what containers/PaaS run — manylinux x86_64 + aarch64 cover
+          # the overwhelming majority of cloud hosts (Render/Railway/Fly/Cloud
+          # Run/ECS/GKE). macOS + Windows cover local dev installs.
+          - { os: linux,   runner: ubuntu-latest,  target: x86_64,  manylinux: auto }
+          - { os: linux,   runner: ubuntu-latest,  target: aarch64, manylinux: auto }
+          - { os: macos,   runner: macos-latest,   target: aarch64, manylinux: "" }
+          - { os: macos,   runner: macos-13,       target: x86_64,  manylinux: "" }
+          - { os: windows, runner: windows-latest, target: x64,     manylinux: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Build wheels (abi3 — one wheel covers Python 3.11+)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with: { command: sdist, args: --out dist }
+      - uses: actions/upload-artifact@v4
+        with: { name: wheels-sdist, path: dist }
+
+  publish:
+    name: publish to PyPI
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # PyPI Trusted Publishing (OIDC) — no token secret
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, pattern: wheels-*, merge-multiple: true }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with: { packages-dir: dist }

@@ -106,6 +106,14 @@ class App:
         self._mounts.append((prefix.rstrip("/"), app))
         self._asgi = None
 
+    def run(self, host: str | None = None, port: int | None = None) -> None:
+        """Serve on the native Rust server. host/port default from env
+        (LANCELOT_HOST, PORT/LANCELOT_PORT) so `CMD ["python","app.py"]` with
+        a trailing `app.run()` deploys cleanly on any PaaS — set
+        LANCELOT_HOST=0.0.0.0 in the container. For the FastAPI-parity path
+        (works on every ASGI platform) run `uvicorn yourmod:app` instead."""
+        run(self, host, port)
+
     def add_middleware(self, mw_cls, **opts):
         """U20 escape hatch: an unmodified pure-ASGI middleware wrapping the
         app callable. NEVER BaseHTTPMiddleware/call_next. Last-added is the
@@ -634,6 +642,30 @@ class App:
 Lancelot = App
 
 
-def run(app: "App", host: str = "127.0.0.1", port: int = 8000):
+def _resolve_bind(host, port):
+    """Resolve the bind address: explicit arg > env > default. `PORT` is the
+    universal PaaS convention (Render / Railway / Heroku / Cloud Run / Fly all
+    inject it); `LANCELOT_PORT` is the namespaced override. Host defaults to the
+    SAFE `127.0.0.1` (loopback) — set `LANCELOT_HOST=0.0.0.0` to accept external
+    traffic in a container (the deploy/Dockerfile does this). We deliberately do
+    NOT read bare `$HOST`: many shells/PaaS set it to the machine hostname, which
+    would bind to the wrong interface (the Robyn ROBYN_HOST-namespacing reason)."""
+    import os
+    if host is None:
+        host = os.environ.get("LANCELOT_HOST", "127.0.0.1")
+    if port is None:
+        raw = (os.environ.get("LANCELOT_PORT")
+               or os.environ.get("PORT") or "")
+        port = int(raw) if raw.strip().isdigit() else 8000
+    return host, int(port)
+
+
+def run(app: "App", host: str | None = None, port: int | None = None):
+    """Serve `app` on the native Rust server, binding from env when host/port
+    are omitted (`LANCELOT_HOST`, `PORT`/`LANCELOT_PORT`) so it deploys cleanly
+    on PaaS — set `LANCELOT_HOST=0.0.0.0` in a container. For the FastAPI-parity
+    deploy path (works on every ASGI platform) use instead:
+        `uvicorn yourmod:app --host 0.0.0.0 --port $PORT --workers N`."""
+    host, port = _resolve_bind(host, port)
     routes = [(r.method, r.path, r.handler) for r in app.routes]
     _native.run(routes, host, port)

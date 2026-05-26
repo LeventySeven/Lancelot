@@ -13,6 +13,96 @@ Two deployable surfaces:
    serialization** and **streaming** (see `benchmarks/README.md`); for tiny
    one-shot JSON, uvicorn+uvloop is faster. Deploy notes below.
 
+## Containers & PaaS — bind address ($PORT, 0.0.0.0)
+
+Every PaaS injects a `$PORT` and expects you to bind `0.0.0.0:$PORT`. The two
+deploy commands:
+
+```bash
+# FastAPI-parity path — works on EVERY ASGI platform (recommended default):
+uvicorn yourmod:app --host 0.0.0.0 --port $PORT --workers $WEB_CONCURRENCY \
+        --loop uvloop --http httptools
+
+# Native Rust server path (large-payload + streaming wins). app.run() reads the
+# bind from env, so this needs no flags:
+#   LANCELOT_HOST=0.0.0.0   (set it in the container; default is 127.0.0.1)
+#   PORT / LANCELOT_PORT    (PORT is the platform's; LANCELOT_PORT overrides)
+python yourmod.py     # where yourmod.py ends with `app.run()`
+```
+
+`app.run()` / `lancelot.run(app)` resolve `host`/`port` from env (explicit args
+win): `LANCELOT_HOST` → else `127.0.0.1`; `LANCELOT_PORT` → `PORT` → else `8000`.
+Bare `$HOST` is **ignored on purpose** (shells/PaaS often set it to the machine
+hostname). The default host stays loopback (`127.0.0.1`) so you don't
+accidentally expose a dev server — **you must set `LANCELOT_HOST=0.0.0.0` for a
+container to receive traffic** (the Dockerfile below does this).
+
+## Docker
+
+Lancelot ships **prebuilt abi3 wheels** (manylinux x86_64/aarch64, macOS,
+Windows — one wheel per arch covers Python 3.11+). So a production image is the
+same slim, Rust-free image you'd write for FastAPI — `pip install lancelot`
+pulls the compiled extension, no Rust toolchain in the build:
+
+```dockerfile
+FROM python:3.13-slim
+WORKDIR /app
+# Prebuilt wheel — no Rust toolchain needed in the image.
+RUN pip install --no-cache-dir lancelot "uvicorn[standard]"
+COPY . .
+ENV LANCELOT_HOST=0.0.0.0
+# FastAPI-parity path (portable, load-balances via --workers):
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${WEB_CONCURRENCY:-1} --loop uvloop --http httptools"]
+# …or the native server (app.py ends with `app.run()`):  CMD ["python", "app.py"]
+```
+
+Notes that make this image production-clean:
+- **Worker count is cgroup-aware.** The native server reads the container's CPU
+  quota (cgroup v2 `cpu.max`), not the host's core count — no thread explosion
+  when the platform caps you (the failure mode that bites `os.cpu_count()`-based
+  servers in containers). Override with `LANCELOT_WORKERS`.
+- **`SIGTERM` is graceful.** `docker stop` / a rolling deploy sends SIGTERM; the
+  server stops accepting and drains in-flight requests (bounded by
+  `LANCELOT_DRAIN_SECS`, default 10) — no dropped requests, no hard-kill.
+- **Lean import.** `import lancelot` pulls only `pydantic` (no httpx / starlette
+  / otel at import) → fast cold start, small layer.
+- **Scaling:** one process per core is the model — on Linux the native server
+  uses `SO_REUSEPORT`; with uvicorn use `--workers N`. (See multiprocess section.)
+
+If you'd rather build from source (bleeding edge / a platform without a matching
+wheel), add a builder stage: `FROM rust + maturin` → `maturin build --release`,
+then `pip install` the wheel in the slim runtime stage.
+
+## Platform recipes (honest matrix)
+
+**First-class — container / long-running-process PaaS** (Lancelot runs as a
+normal ASGI/HTTP server; deploy is identical to FastAPI):
+
+| Platform | How |
+|---|---|
+| **Render / Railway / Fly.io / Heroku / DigitalOcean App Platform** | Push the Dockerfile above, or set the start command to the `uvicorn … --port $PORT` line. They inject `$PORT`; set `LANCELOT_HOST=0.0.0.0`. |
+| **Google Cloud Run** | Container image above. Cloud Run sets `$PORT` (8080); listen on `0.0.0.0:$PORT`. One process; let Cloud Run scale horizontally. |
+| **AWS (ECS / Fargate / App Runner / Elastic Beanstalk) / GKE / any Kubernetes** | Same container image. Front it with the platform's load balancer (terminates TLS — the server is cleartext HTTP/1.1 by design). Use `/livez` + `/readyz` for probes. |
+
+**Serverless / edge — possible but a poorer fit for ANY persistent server**
+(be honest with yourself before reaching for these):
+
+- **AWS Lambda:** works via an ASGI→Lambda adapter (`mangum`) + a container
+  image or a layer carrying the manylinux wheel. Same as running FastAPI on
+  Lambda. The native Rust server is not for Lambda (no persistent socket); use
+  `app` (the ASGI callable) through Mangum.
+- **Vercel / Netlify:** these are optimized for JS/edge functions; their Python
+  function runtimes are constrained and not built for a compiled-extension ASGI
+  server. If you must, use their container/serverless-function path with the
+  ASGI adapter — but a container PaaS above is the right home for a Lancelot app.
+
+**Not a host — a backend you connect TO:**
+
+- **Supabase:** Supabase is Postgres + Auth + Edge Functions (Deno/TS). You don't
+  *host* a Lancelot app on Supabase; you run Lancelot on a container PaaS above
+  and **connect to** Supabase Postgres from your handlers. (Supabase Edge
+  Functions are Deno, not a Python host.)
+
 ## Scaling the Rust server: MULTIPROCESS, not multi-thread
 
 The Rust server **anti-scales with tokio worker threads** — Python execution is
