@@ -473,7 +473,9 @@ class App:
 
     def stream(self, path: str, *, stream_interval: int = 1,
                sse_keepalive: float = 15.0, sse: bool = False,
-               done_sentinel: str | None = "[DONE]", **kwargs):
+               done_sentinel: str | None = "[DONE]",
+               defer_status: bool = False,
+               max_stream_silence: float | None = None, **kwargs):
         """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
         an async generator yielding `lancelot.stream.Event` items; the
         framework owns SSE framing + cancellation propagation.
@@ -496,7 +498,26 @@ class App:
         the bare-model path and the EOF sentinel change. The framing is
         done by `lancelot.stream.sse_adapter` (a Python wrapper that emits
         already-framed bytes), so the uvicorn ASGI seam AND the native R3
-        pump produce identical bytes with the R3 pump untouched."""
+        pump produce identical bytes with the R3 pump untouched.
+
+        M16 P1 `defer_status` (default False -> byte-identical to today): when
+        True, the seam pulls the FIRST item BEFORE committing the 200 + SSE
+        headers, so a handler that raises (HTTPException / ProblemDetail / any
+        error) BEFORE its first `yield` produces a REAL 4xx/5xx + JSON body
+        instead of a half-open 200 + an SSE error frame (the pre-200 streaming
+        status the inference-server crowd hand-rolls). ASGI-seam (uvicorn) ONLY
+        — the native `app.run()` server forwards only `(method, path, handler)`
+        and has no per-route config (same documented limitation as native
+        lifespan / DI; see the note in `src/stream.rs`).
+
+        M16 P2 `max_stream_silence` (default None = off): when set (seconds),
+        the seam cancels the generator (its `finally`/`aclose` runs) and closes
+        the connection if only keepalive pings — no real DATA — have flowed for
+        this long. The last-DATA send is tracked separately from the last-PING
+        send, so a keepalive ping never resets the data-silence timer (this also
+        fixes the keepalive self-reset where a ping-only zombie stream would
+        otherwise never be detected). Symmetric with the upstream
+        `idle_guarded_chunks` concept; ASGI-seam (uvicorn) only."""
         import dataclasses as _dc
 
         known = {f.name for f in _dc.fields(Route)}
@@ -504,6 +525,8 @@ class App:
         kw["is_stream"] = True
         kw["stream_interval"] = stream_interval
         kw["sse_keepalive"] = sse_keepalive
+        kw["defer_status"] = defer_status
+        kw["max_stream_silence"] = max_stream_silence
 
         def deco(fn):
             handler = fn
