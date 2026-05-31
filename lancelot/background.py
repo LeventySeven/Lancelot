@@ -3,6 +3,7 @@ response is sent) + the detached background pool (WBS U33). Sync tasks
 run on the M1-P5 blocking pool so they never pin the reactor; FastAPI
 runs them via run_in_threadpool too. Stdlib-only (runtime dep =
 pydantic)."""
+import contextvars
 import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -55,9 +56,18 @@ class BackgroundPool:
                 raise QueueFull()
             self._depth += 1
 
+        # M15 T3 (#12): snapshot the CALLER's context NOW (synchronously, in
+        # the request's context) so the detached job sees the per-request
+        # request_id / trace_id / tenant_id / agent_id — matching pool.offload
+        # / run_backpressured (pool.py), which already copy_context(). Without
+        # this the job runs in an empty context and reads the "-"/0.0
+        # sentinels. copy_context() also isolates the job's own ContextVar
+        # writes from the caller (no bleed-back).
+        ctx = contextvars.copy_context()
+
         def _run():
             try:
-                fn(*args, **kwargs)
+                ctx.run(fn, *args, **kwargs)
             finally:
                 with self._lock:
                     self._depth -= 1
