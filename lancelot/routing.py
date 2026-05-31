@@ -707,3 +707,35 @@ class Router:
             if params is not None:
                 return r, params
         return None, 404
+
+    def remove(self, path: str, method: str | None = None) -> int:
+        """M15 T12: live-remove route(s) from EVERY tier. Returns the count
+        removed. `method=None` removes every method on that path (incl. WS).
+
+        This is the byte-path correctness guarantee: dropping a route from
+        `self.routes` alone would leave a stale O(1) `_const` hit (or a live
+        `_dyn` regex entry) still serving the dead path. We evict from
+        `_const`, `_const_paths`, `_dyn`, AND `routes` atomically.
+
+        Cold path (live mutation, not per-request) — straightforward filters,
+        no impact on `match()`/`match_ws()` happy-path cost."""
+        want = None if method is None else method.upper()
+
+        def _hit(r) -> bool:
+            return r.path == path and (want is None or r.method == want)
+
+        removed = [r for r in self.routes if _hit(r)]
+        if not removed:
+            return 0
+        # routes (the canonical list) + the two derived tiers.
+        self.routes = [r for r in self.routes if not _hit(r)]
+        self._const = {
+            k: r for k, r in self._const.items() if not _hit(r)
+        }
+        self._dyn = [r for r in self._dyn if not _hit(r)]
+        # _const_paths is method-agnostic: only drop the path once NO const
+        # route (under any remaining method) still uses it — otherwise a
+        # surviving sibling method's 405 detection would break.
+        if not any(r.path == path for r in self._const.values()):
+            self._const_paths.discard(path)
+        return len(removed)

@@ -564,6 +564,43 @@ class App:
         for m in (methods or ["GET"]):
             self.router.add(Route(m.upper(), path, endpoint, **kw))
 
+    # --- M15 T12: live route add/remove (Python/uvicorn ASGI tier) ---------
+    #
+    # NOTE ON SCOPE (binding decision): live route mutation applies to the
+    # Python/dynamic (uvicorn) serving path ONLY. The native `_native.run`
+    # server (`lancelot.run` / `App.run`) builds its Rust router + prebaked
+    # const tier ONCE at startup from `app.routes` and owns them for the
+    # process lifetime — there is no post-startup FFI handle to mutate that
+    # router or the prebaked `service::Prebaked` set, and that server is a
+    # fixed-route multiprocess deploy by design (Batches 2 & 4 confirmed it
+    # doesn't even run lifespan/DI). So a route added/removed AFTER the
+    # native server has started is NOT reflected on it. Mutate the app BEFORE
+    # `run()`, or deploy under uvicorn (`app.asgi()`) where these take effect
+    # immediately. (The Rust `Router::remove` exists + is unit-tested for
+    # completeness, but is not wired to a running-server mutation path.)
+    def add_route_live(self, path: str, endpoint, *, methods=None, **kwargs):
+        """Register a route at runtime (uvicorn/ASGI tier) and invalidate the
+        memoized OpenAPI schema so `/openapi.json` reflects it. Same kwargs as
+        `add_api_route`; default methods=['GET']. See the scope note above —
+        this does NOT affect an already-running native `run()` server."""
+        self.add_api_route(path, endpoint, methods=methods, **kwargs)
+        self._openapi_cache = None  # rebuild on next /openapi.json access
+
+    def remove_route(self, path: str, method: str | None = None) -> int:
+        """Remove route(s) at runtime from EVERY routing tier (the O(1) const
+        tier, the regex tier, and `app.routes`) and invalidate the memoized
+        OpenAPI schema. Returns the number of routes removed. `method=None`
+        removes every method (incl. WebSocket) registered on `path`.
+
+        Evicting from all tiers is the correctness point: dropping only from
+        `app.routes` would leave a stale const-tier hit serving a dead route.
+        See the scope note above — this does NOT affect an already-running
+        native `run()` server (its router is built once at startup)."""
+        n = self.router.remove(path, method)
+        if n:
+            self._openapi_cache = None  # rebuild on next /openapi.json access
+        return n
+
     def get(self, p, **kw): return self._add("GET", p, **kw)
     def post(self, p, **kw): return self._add("POST", p, **kw)
     def put(self, p, **kw): return self._add("PUT", p, **kw)
