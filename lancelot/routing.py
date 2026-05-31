@@ -224,14 +224,15 @@ class Route:
                     f"Invalid response_model {self.response_model!r}"
                 ) from _e
             # M17 P4 FENCE: skip-validation serializes the RAW handler result
-            # (no validated instance is ever built). Verified against
-            # pydantic-core 2.13: only `exclude_unset` reads
-            # `__pydantic_fields_set__` (which a raw object lacks → it raises
-            # PydanticSerializationError at serialize time). `by_alias`,
-            # `exclude_none`, `include`, `exclude`, and `exclude_defaults`
-            # (value-based) all work on a raw object. So fence ONLY
-            # exclude_unset, and fail LOUD at registration rather than be
-            # silently 500 at the first request.
+            # (no validated instance is ever built). `exclude_unset` needs
+            # `__pydantic_fields_set__` to know which fields were explicitly
+            # set — a raw (non-validated) result has no such record, so the
+            # flag CANNOT be honored (pydantic-core either errors or silently
+            # returns ALL fields, depending on the result type — either way
+            # the output is wrong). `by_alias`, `exclude_none`, `include`,
+            # `exclude`, and `exclude_defaults` (value-based) all work on a raw
+            # object. So fence ONLY exclude_unset, and fail LOUD at
+            # registration rather than emit silently-wrong output at runtime.
             if (self.response_model_skip_validation
                     and self.response_model_exclude_unset):
                 raise FastAPIError(
