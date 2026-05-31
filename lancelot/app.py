@@ -455,7 +455,8 @@ class App:
         return deco
 
     def stream(self, path: str, *, stream_interval: int = 1,
-               sse_keepalive: float = 15.0, **kwargs):
+               sse_keepalive: float = 15.0, sse: bool = False,
+               done_sentinel: str | None = "[DONE]", **kwargs):
         """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
         an async generator yielding `lancelot.stream.Event` items; the
         framework owns SSE framing + cancellation propagation.
@@ -466,7 +467,19 @@ class App:
 
         `sse_keepalive` (default 15.0 s): emit an SSE comment line on idle
         so CDNs / nginx / browsers don't time out during slow LLM streams.
-        Set to None or 0 to disable (not recommended)."""
+        Set to None or 0 to disable (not recommended).
+
+        M15 T7: `sse=True` turns on SSE-of-models framing — a yielded
+        Pydantic model / dict is framed as one `data: <pydantic-core
+        json>\\n\\n` frame (an EventSource client parses this; a bare JSON
+        line it does not), and on clean exhaustion a terminal
+        `data: <done_sentinel>\\n\\n` is auto-emitted (default `[DONE]`,
+        the OpenAI-streaming convention; pass `done_sentinel=None` to
+        disable). `Event`/`bytes`/`str` yields stay BYTE-IDENTICAL — only
+        the bare-model path and the EOF sentinel change. The framing is
+        done by `lancelot.stream.sse_adapter` (a Python wrapper that emits
+        already-framed bytes), so the uvicorn ASGI seam AND the native R3
+        pump produce identical bytes with the R3 pump untouched."""
         import dataclasses as _dc
 
         known = {f.name for f in _dc.fields(Route)}
@@ -476,7 +489,23 @@ class App:
         kw["sse_keepalive"] = sse_keepalive
 
         def deco(fn):
-            self.router.add(Route("GET", path, fn, **kw))
+            handler = fn
+            if sse:
+                # Wrap the user async generator so each call returns an
+                # SSE-of-models stream (model -> data:<json>\n\n, plus the
+                # [DONE] sentinel on clean exhaustion). The wrapper is the
+                # registered handler, so BOTH transports (uvicorn ASGI seam +
+                # native _native.run, which passes r.handler straight through)
+                # get the same framed bytes. functools.wraps preserves the
+                # async-gen identity the seams introspect.
+                import functools as _ft
+                from lancelot.stream import sse_adapter
+
+                @_ft.wraps(fn)
+                def handler(*a, _fn=fn, **kw2):  # noqa: ANN001
+                    return sse_adapter(_fn(*a, **kw2), done_sentinel=done_sentinel)
+
+            self.router.add(Route("GET", path, handler, **kw))
             return fn
 
         return deco

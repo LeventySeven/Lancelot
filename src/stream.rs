@@ -45,6 +45,22 @@ use tokio::sync::mpsc::Sender;
 /// uses its render(); everything else is serialized via the pydantic-core
 /// JSON seam + a trailing newline (JSON-lines, matching the ASGI seam's
 /// `application/jsonl` auto-wrap).
+///
+/// M15 T7 (SSE-of-models framing + the `[DONE]` sentinel): the
+/// `data: <json>\n\n` model framing AND the terminal `data: [DONE]\n\n`
+/// sentinel are intentionally produced by the PYTHON wrapper
+/// `lancelot.stream.sse_adapter` (enabled per route via
+/// `@app.stream(sse=True, done_sentinel=...)`), NOT here. That wrapper yields
+/// already-framed `bytes`, which hit the `PyBytes` passthrough below verbatim —
+/// so the native R3 pump and the uvicorn ASGI seam (`asgi._stream_chunk_bytes`)
+/// emit BYTE-IDENTICAL output with a SINGLE source of truth for the framing,
+/// and this hot pump stays untouched (CLAUDE.md Tier-D: do not regress R3 — no
+/// per-chunk cross-thread bridging, same-thread `try_push`, bounded
+/// backpressure all preserved). DO NOT move SSE framing into this function:
+/// the native server receives only `(method, path, handler)` and has no
+/// per-route `sse`/`done_sentinel` config to key off, and a second framing
+/// implementation here would risk byte-drift from the Python seam. Keep the
+/// `bytes`/`str` passthrough below intact — it is what makes the parity hold.
 fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     // Build `Bytes` directly (no Vec→Bytes second copy): the common bytes/str
     // token-stream chunks copy once; the channel send takes the `Bytes` as-is.
