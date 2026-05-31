@@ -37,11 +37,24 @@ class Request:
 
     @property
     def cancelled(self) -> bool:
-        """M2-P4: True after the client has disconnected mid-stream
-        (set by the ASGI seam). Handlers can poll this to short-circuit
-        upstream LLM calls and stop $$ on un-watched tokens."""
+        """True after the client has disconnected and the ASGI seam set the
+        cancel event. The event is armed on `@app.stream` routes (always) and
+        on UNARY routes that opt into `cancel_on_disconnect=True` (M15 T6).
+        Handlers can poll this to short-circuit upstream LLM calls and stop
+        $$ on tokens nobody is watching. On routes that didn't arm a watcher
+        (the fast-path default) this stays False — the seam never paid to
+        poll the socket."""
         ev = self._cancel_event
         return bool(ev is not None and ev.is_set())
+
+    async def is_disconnected(self) -> bool:
+        """FastAPI-named async alias for `self.cancelled` (eases migration
+        from Starlette/FastAPI `await request.is_disconnected()`). It does NOT
+        itself poll receive() — the seam's background disconnect watcher (on
+        stream routes / cancel_on_disconnect unary routes) sets the event; this
+        just reports its state. Async so it's a drop-in for the FastAPI call
+        shape, but resolves immediately."""
+        return self.cancelled
 
     @property
     def state(self):

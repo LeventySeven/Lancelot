@@ -31,6 +31,7 @@ class App:
                  strict_content_type: bool = True,
                  dependencies: list | None = None,
                  json_max_depth: int = 128,
+                 cancel_on_disconnect: bool = False,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -84,6 +85,11 @@ class App:
         # Same semantics as `APIRouter(dependencies=[])`: validation /
         # auth runs before the handler; the return value is discarded.
         self.dependencies: list = list(dependencies or [])
+        # M15 T6 (#1): App-wide default for client-disconnect→cancel on UNARY
+        # handlers. A route's own `cancel_on_disconnect=` (None=inherit) wins;
+        # this is the fallback. Default False — opting in is per-route or here,
+        # so the tiny fast path is never armed implicitly.
+        self.cancel_on_disconnect: bool = cancel_on_disconnect
         # Graceful-shutdown flag — flipped by lifespan_shutdown,
         # `app.initiate_shutdown()`, or `app.install_signal_handlers()`.
         # /readyz returns 503 + Retry-After while True so the LB stops

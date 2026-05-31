@@ -48,6 +48,15 @@ class Route:
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
     sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
+    # M15 T6 (#1): extend the C2 client-disconnect→cancel machinery (shipped
+    # only on @app.stream) to UNARY handlers. When True (or the App-level
+    # default), an async / timeout='d handler's in-flight `await` is CANCELLED
+    # the moment the client hard-closes — so the user stops paying for an
+    # upstream LLM call nobody is watching. yield-dep teardown still runs
+    # (B4 semantics). None = inherit the App default (default False). OFF by
+    # default so the tiny one-shot fast path pays NOTHING (no receive()-poll
+    # watcher armed unless the route opts in).
+    cancel_on_disconnect: bool | None = None
     # FastAPI 0.110+ feature: reject JSON-body routes when the request's
     # Content-Type isn't JSON. None = inherit (router → app → True default).
     strict_content_type: bool | None = None

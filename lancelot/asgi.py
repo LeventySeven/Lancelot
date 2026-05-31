@@ -485,6 +485,70 @@ def _stream_chunk_bytes(ev):
     return (_json.dumps(ev, separators=(",", ":"), default=str) + "\n").encode("utf-8")
 
 
+async def _watch_disconnect(receive, cancel_event):
+    """C2 (validated under load — M4): poll receive() for `http.disconnect`
+    and set `cancel_event` the moment the client leaves.
+
+    Factored out of the `@app.stream` branch (M15 T6) so BOTH the streaming
+    path and the new UNARY cancel-on-disconnect path share ONE watcher. The
+    body has already been fully drained by the seam before either path arms
+    this, so the only event this ever sees is `http.disconnect` (there are no
+    more body chunks to steal).
+
+    Catches BaseException (incl. CancelledError AND any server-adapter
+    receive() error): stop watching CLEANLY, never leave an unretrieved task
+    exception (audit MED-1). The task then completes normally so a later
+    `.cancel()` is a harmless no-op.
+    """
+    try:
+        while True:
+            m = await receive()
+            if m.get("type") == "http.disconnect":
+                cancel_event.set()
+                return
+    except BaseException:  # noqa: BLE001
+        return
+
+
+async def _race_handler_vs_disconnect(coro, cancel_event):
+    """Await `coro` (the unary handler call), but if `cancel_event` fires
+    first (the client disconnected), CANCEL the handler task and raise
+    asyncio.CancelledError — which propagates out of the `async with
+    solve_async(...)` body so the yield-dependency AsyncExitStack tears down
+    with the real exc_info (DB-rollback / file-close still runs — B4).
+
+    This is the same FIRST_COMPLETED dual-task shape as
+    `TransportPool._await_cancellable` (lancelot/llm.py), re-implemented as a
+    free function HERE so the UNARY hot path never imports `lancelot.llm`
+    (which pulls httpx — cardinal rule #3: a non-LLM unary route must not drag
+    in the HTTP client just to be cancellable).
+    """
+    import asyncio as _aio
+
+    task = _aio.ensure_future(coro)
+    wait_event = _aio.ensure_future(cancel_event.wait())
+    try:
+        done, _pending = await _aio.wait(
+            {task, wait_event}, return_when=_aio.FIRST_COMPLETED)
+        if task in done:
+            # Handler finished first — drop the waiter, return its result
+            # (or re-raise the handler's exception).
+            wait_event.cancel()
+            return task.result()
+        # Disconnect fired first — cancel the handler and propagate.
+        task.cancel()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 - swallow; we re-raise Cancelled below
+            pass
+        raise _aio.CancelledError("client disconnected; handler cancelled")
+    finally:
+        if not task.done():
+            task.cancel()
+        if not wait_event.done():
+            wait_event.cancel()
+
+
 async def _http_dispatch(app, scope, receive, send):
     """The original `_http` body, factored out so the wrapper above can
     own the per-request lifecycle (counter, request-id, RED metrics)
@@ -820,21 +884,10 @@ async def _http_dispatch(app, scope, receive, send):
                 # disconnect during the handler await, so it was only noticed
                 # when a send failed — i.e. AFTER the upstream had already
                 # completed (the user paid for tokens nobody was watching).
-                async def _watch_disconnect():
-                    # Catch BaseException (incl. CancelledError AND any server-
-                    # adapter receive() error): stop watching CLEANLY, never
-                    # leave an unretrieved task exception (audit MED-1). The task
-                    # then completes normally so the `finally` cancel is a no-op.
-                    try:
-                        while True:
-                            m = await receive()
-                            if m.get("type") == "http.disconnect":
-                                lreq._cancel_event.set()
-                                return
-                    except BaseException:  # noqa: BLE001
-                        return
-
-                _disc_watch = _asyncio.ensure_future(_watch_disconnect())
+                # M15 T6: the watcher is now the shared module-level helper
+                # (also used by the unary cancel_on_disconnect path).
+                _disc_watch = _asyncio.ensure_future(
+                    _watch_disconnect(receive, lreq._cancel_event))
                 gen = route.handler(**kwargs)
                 await send({"type": "http.response.start", "status": 200,
                             "headers": [
@@ -1004,35 +1057,83 @@ async def _http_dispatch(app, scope, receive, send):
             import asyncio as _asyncio_timeout
             _to = route.timeout
 
-            if _isp_local.isasyncgenfunction(route.handler) or \
-                    _isp_local.isgeneratorfunction(route.handler):
-                result = route.handler(**kwargs)
-            elif route.plan.is_async:
-                if _to is not None:
-                    try:
-                        result = await _asyncio_timeout.wait_for(
+            # M15 T6 (#1): UNARY client-disconnect→cancel. Resolve the
+            # effective flag: the route's own `cancel_on_disconnect`
+            # (None=inherit) wins over the App-level default. Resolved HERE
+            # (not at registration) so it's correct for EVERY registration
+            # path (decorators, api_route, add_api_route, include_router,
+            # raw Route(...)). FAST-PATH GUARANTEE: when the flag is False
+            # (the default) NOTHING below runs — no _cancel_event, no
+            # receive()-polling watcher, no extra task — so the tiny one-shot
+            # handler path pays zero (the shape closest to Starlette+uvloop).
+            _cancel_on_disc = route.cancel_on_disconnect
+            if _cancel_on_disc is None:
+                _cancel_on_disc = getattr(app, "cancel_on_disconnect", False)
+            # Only async / timeout='d handlers can be meaningfully cancelled
+            # mid-await; a plain sync handler with no timeout runs to
+            # completion on the offload pool regardless (a CancelledError on
+            # the future can't interrupt the OS thread — same limit the
+            # timeout path has). Arm the watcher only when there's an await to
+            # race against.
+            _arm_disc = bool(_cancel_on_disc) and (
+                route.plan.is_async or _to is not None) and not (
+                _isp_local.isasyncgenfunction(route.handler)
+                or _isp_local.isgeneratorfunction(route.handler))
+
+            _disc_watch_unary = None
+            if _arm_disc:
+                lreq._cancel_event = _asyncio_timeout.Event()
+                _disc_watch_unary = _asyncio_timeout.ensure_future(
+                    _watch_disconnect(receive, lreq._cancel_event))
+
+            async def _call_handler():
+                # Build the inner awaitable (async direct, or sync→offload),
+                # honoring per-route timeout=. A TimeoutError here is mapped
+                # to 504 by the caller; otherwise the (possibly cancelled)
+                # result/exception propagates.
+                if route.plan.is_async:
+                    if _to is not None:
+                        return await _asyncio_timeout.wait_for(
                             route.handler(**kwargs), timeout=_to)
-                    except _asyncio_timeout.TimeoutError:
-                        await _send_json(send, 504,
-                                         b'{"detail":"Request timeout"}')
-                        sent = True
-                        return
-                else:
-                    result = await route.handler(**kwargs)
-            else:
+                    return await route.handler(**kwargs)
                 if _to is not None:
-                    try:
-                        result = await _asyncio_timeout.wait_for(
-                            get_pool().offload(route.handler, **kwargs),
-                            timeout=_to)
-                    except _asyncio_timeout.TimeoutError:
-                        await _send_json(send, 504,
-                                         b'{"detail":"Request timeout"}')
-                        sent = True
-                        return
+                    return await _asyncio_timeout.wait_for(
+                        get_pool().offload(route.handler, **kwargs),
+                        timeout=_to)
+                return await get_pool().offload(route.handler, **kwargs)
+
+            try:
+                if _isp_local.isasyncgenfunction(route.handler) or \
+                        _isp_local.isgeneratorfunction(route.handler):
+                    # Async/sync-generator handler: returned un-awaited (the
+                    # StreamingResponse auto-wrap below owns its iteration +
+                    # per-chunk cancellation via request.cancelled). Never
+                    # raced here — there's no in-line await to cancel.
+                    result = route.handler(**kwargs)
+                elif _arm_disc:
+                    # Race the handler against the client disconnect. On a
+                    # hard close the handler task is cancelled and
+                    # CancelledError propagates OUT of `async with
+                    # solve_async(...)` → its `except BaseException` feeds the
+                    # real exc_info into every yield-dep's __aexit__ (DB
+                    # rollback / file-close STILL runs — B4 preserved, exactly
+                    # like the timeout path).
+                    result = await _race_handler_vs_disconnect(
+                        _call_handler(), lreq._cancel_event)
                 else:
-                    result = await get_pool().offload(
-                        route.handler, **kwargs)
+                    result = await _call_handler()
+            except _asyncio_timeout.TimeoutError:
+                await _send_json(send, 504,
+                                 b'{"detail":"Request timeout"}')
+                sent = True
+                return
+            finally:
+                # Stop the unary disconnect watcher (no-op if it already
+                # returned on disconnect; cancel cleanly otherwise so no
+                # orphan task / unretrieved-exception warning).
+                if _disc_watch_unary is not None \
+                        and not _disc_watch_unary.done():
+                    _disc_watch_unary.cancel()
             # Tear down scope="function" yield-deps NOW (between handler
             # return and response emit) — FastAPI parity. Request-scope
             # deps stay on the inner solve_async stack and close after
