@@ -517,7 +517,19 @@ class App:
         send, so a keepalive ping never resets the data-silence timer (this also
         fixes the keepalive self-reset where a ping-only zombie stream would
         otherwise never be detected). Symmetric with the upstream
-        `idle_guarded_chunks` concept; ASGI-seam (uvicorn) only."""
+        `idle_guarded_chunks` concept; ASGI-seam (uvicorn) only.
+
+        M17 P6 `error_frame` (default False -> byte-identical to today; pairs
+        with `sse=True`): make the seam crash/cancel-aware. When True, the seam
+        (a) routes a mid-stream raise through a SCRUBBED RFC-9457 ProblemDetail
+        error frame (never leaks `str(exc)` by default) instead of the legacy
+        hardcoded `{"error":"internal server error"}`; (b) GUARANTEES the
+        terminal `done_sentinel` frame on EVERY non-disconnect end (clean
+        exhaustion, mid-stream raise, OR the M16 `max_stream_silence` abort) so
+        a client can always tell a finished stream from a dropped one; (c) emits
+        the error frame on a genuine INTERNAL cancel (the silence-abort) but
+        NEVER on a client disconnect (a disconnected client can't read it).
+        ASGI-seam (uvicorn) only."""
         import dataclasses as _dc
 
         known = {f.name for f in _dc.fields(Route)}
@@ -527,6 +539,10 @@ class App:
         kw["sse_keepalive"] = sse_keepalive
         kw["defer_status"] = defer_status
         kw["max_stream_silence"] = max_stream_silence
+        # M17 P6: the seam reads `done_sentinel` to GUARANTEE the terminal
+        # sentinel on its error/abort finalize paths (clean exhaustion already
+        # emits it via sse_adapter). It only matters under `error_frame=True`.
+        kw["done_sentinel"] = done_sentinel
 
         def deco(fn):
             handler = fn

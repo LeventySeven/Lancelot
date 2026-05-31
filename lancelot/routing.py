@@ -63,6 +63,22 @@ class Route:
     # change). ASGI-seam (uvicorn) only — symmetric with the upstream
     # idle_guarded_chunks concept.
     max_stream_silence: float | None = None
+    # M17 P6: opt-in crash/cancel-aware SSE finalization. When True, the seam
+    # (a) routes the mid-stream error frame through a scrubbed RFC-9457
+    # ProblemDetail shape instead of the hardcoded {"error":...}; (b) GUARANTEES
+    # the terminal `done_sentinel` frame is emitted on EVERY non-disconnect end
+    # (clean exhaustion, mid-stream raise, or internal silence-abort) so a
+    # client can always tell a finished stream from a dropped one; (c) emits the
+    # error frame on a genuine INTERNAL cancel (the M16 max_stream_silence
+    # abort) but NEVER on a client disconnect (a disconnected client can't read
+    # it). Default False -> byte-identical to today. ASGI-seam (uvicorn) only.
+    error_frame: bool = False
+    # M17 P6: the terminal sentinel string the seam emits in its finalize path
+    # under error_frame (mirrors the sse_adapter `done_sentinel`, default
+    # "[DONE]"; None disables the terminal frame). Set by @app.stream so the
+    # seam's error/abort finalize matches the clean-exhaustion sentinel that
+    # sse_adapter already emits. Only consulted when error_frame is True.
+    done_sentinel: str | None = "[DONE]"
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
     # M15 T6 (#1): extend the C2 client-disconnect→cancel machinery (shipped
     # only on @app.stream) to UNARY handlers. When True (or the App-level
