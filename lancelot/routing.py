@@ -63,6 +63,22 @@ class Route:
     # change). ASGI-seam (uvicorn) only — symmetric with the upstream
     # idle_guarded_chunks concept.
     max_stream_silence: float | None = None
+    # M17 P6: opt-in crash/cancel-aware SSE finalization. When True, the seam
+    # (a) routes the mid-stream error frame through a scrubbed RFC-9457
+    # ProblemDetail shape instead of the hardcoded {"error":...}; (b) GUARANTEES
+    # the terminal `done_sentinel` frame is emitted on EVERY non-disconnect end
+    # (clean exhaustion, mid-stream raise, or internal silence-abort) so a
+    # client can always tell a finished stream from a dropped one; (c) emits the
+    # error frame on a genuine INTERNAL cancel (the M16 max_stream_silence
+    # abort) but NEVER on a client disconnect (a disconnected client can't read
+    # it). Default False -> byte-identical to today. ASGI-seam (uvicorn) only.
+    error_frame: bool = False
+    # M17 P6: the terminal sentinel string the seam emits in its finalize path
+    # under error_frame (mirrors the sse_adapter `done_sentinel`, default
+    # "[DONE]"; None disables the terminal frame). Set by @app.stream so the
+    # seam's error/abort finalize matches the clean-exhaustion sentinel that
+    # sse_adapter already emits. Only consulted when error_frame is True.
+    done_sentinel: str | None = "[DONE]"
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
     # M15 T6 (#1): extend the C2 client-disconnect→cancel machinery (shipped
     # only on @app.stream) to UNARY handlers. When True (or the App-level
@@ -85,6 +101,13 @@ class Route:
     response_model_exclude_unset: bool = False
     response_model_exclude_defaults: bool = False
     response_model_exclude_none: bool = False
+    # M17 P4 (opt-in, default False = byte-identical parity): skip the
+    # `model_validate` pass and serialize the handler result DIRECTLY through
+    # the cached TypeAdapter's `dump_json` (~4x cheaper on a large read; the
+    # user vouches for the shape — a non-conforming return serializes as-is,
+    # NOT coerced/rejected). FENCE: incompatible with response_model flags that
+    # require a validated instance — see __post_init__ (registration raises).
+    response_model_skip_validation: bool = False
     response_class: Any = None
     responses: dict | None = None
     operation_id: str | None = None
@@ -200,6 +223,24 @@ class Route:
                 raise FastAPIError(
                     f"Invalid response_model {self.response_model!r}"
                 ) from _e
+            # M17 P4 FENCE: skip-validation serializes the RAW handler result
+            # (no validated instance is ever built). `exclude_unset` needs
+            # `__pydantic_fields_set__` to know which fields were explicitly
+            # set — a raw (non-validated) result has no such record, so the
+            # flag CANNOT be honored (pydantic-core either errors or silently
+            # returns ALL fields, depending on the result type — either way
+            # the output is wrong). `by_alias`, `exclude_none`, `include`,
+            # `exclude`, and `exclude_defaults` (value-based) all work on a raw
+            # object. So fence ONLY exclude_unset, and fail LOUD at
+            # registration rather than emit silently-wrong output at runtime.
+            if (self.response_model_skip_validation
+                    and self.response_model_exclude_unset):
+                raise FastAPIError(
+                    "response_model_skip_validation=True is incompatible with "
+                    "response_model_exclude_unset=True: exclude_unset reads "
+                    "`__pydantic_fields_set__`, which only a validated "
+                    "instance has. Drop one of the two flags."
+                )
         # FastAPI parity: if the handler's return annotation contains a
         # Starlette/Lancelot Response (or subclass), reject at registration.
         # Response isn't a valid response_model (can't validate against it).

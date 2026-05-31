@@ -1045,6 +1045,18 @@ async def _http_dispatch(app, scope, receive, send):
                 _send_lock = _asyncio.Lock() \
                     if (_ka is not None and _ka > 0) else None
 
+                # M17 P6: opt-in crash/cancel-aware finalization. When off
+                # (default) the legacy hardcoded error frame + bare EOF stay
+                # byte-identical. When on, the error frame is a SCRUBBED
+                # ProblemDetail and the terminal `done_sentinel` is GUARANTEED on
+                # every non-disconnect end. `_terminal_emitted` tracks whether
+                # the sentinel already went out on this path (the clean-exhaust
+                # path emits it via sse_adapter; the error/abort paths emit it
+                # explicitly) so the finally never double-sends it.
+                _error_frame_on = getattr(route, "error_frame", False)
+                _done_sentinel = getattr(route, "done_sentinel", None)
+                _terminal_emitted = False
+
                 def _last_any():
                     return _last_data if _last_data > _last_ping else _last_ping
 
@@ -1088,6 +1100,46 @@ async def _http_dispatch(app, scope, receive, send):
                             "body": bytes(_buf), "more_body": True})
                         _buf = bytearray()
                         _buf_count = 0
+
+                # M17 P6: build the mid-stream error frame. Under error_frame the
+                # body is a SCRUBBED RFC-9457 ProblemDetail (type/title/status +
+                # request_id; NEVER str(exc)); otherwise the legacy hardcoded
+                # frame (byte-identical). Bytes only — no send (the caller sends
+                # under the serialized lock so the keepalive ping can't interleave).
+                def _build_error_frame_bytes():
+                    import json as _json_ef
+                    try:
+                        from lancelot.context import request_id as _rid_cv
+                        _rid = _rid_cv.get()
+                    except Exception:  # noqa: BLE001
+                        _rid = "-"
+                    if _error_frame_on:
+                        from lancelot.exceptions import ProblemDetail as _PD
+                        _pd = _PD(500, detail="internal server error",
+                                  extensions={"request_id": _rid})
+                        return ("event: error\ndata: "
+                                + _json_ef.dumps(_pd.problem_dict())
+                                + "\n\n").encode()
+                    return ("event: error\ndata: " + _json_ef.dumps(
+                        {"error": "internal server error",
+                         "request_id": _rid}) + "\n\n").encode()
+
+                # M17 P6: emit the terminal `done_sentinel` frame (idempotent via
+                # `_terminal_emitted`). Used by the error/abort finalize paths to
+                # GUARANTEE a client can tell a finished stream from a dropped one
+                # (clean exhaustion already emits the sentinel via sse_adapter).
+                async def _emit_terminal_sentinel():
+                    nonlocal _terminal_emitted
+                    if _terminal_emitted or not _error_frame_on \
+                            or _done_sentinel is None:
+                        return
+                    _terminal_emitted = True
+                    from lancelot.stream import _clean_field, _sse_data_frame
+                    frame = _sse_data_frame(
+                        _clean_field(_done_sentinel).encode("utf-8"))
+                    await _send_serialized({
+                        "type": "http.response.body",
+                        "body": frame, "more_body": True})
 
                 # M16 P2: the consumption runs as its OWN task so the watchdog
                 # (keepalive + silence-abort) can CANCEL it on a max-silence
@@ -1169,12 +1221,31 @@ async def _http_dispatch(app, scope, receive, send):
                             await _it.aclose()
                         except Exception:  # noqa: BLE001
                             pass
+                        # M17 P6: a silence-abort is a genuine INTERNAL cancel
+                        # (the client is STILL connected — only the upstream
+                        # went silent), so under error_frame the client gets a
+                        # scrubbed error frame + the guaranteed terminal sentinel
+                        # so it can distinguish "we aborted you" from a clean end
+                        # or a dropped socket. (The client-disconnect branch
+                        # below emits NEITHER — a gone client can't read them.)
+                        if _error_frame_on:
+                            try:
+                                await _flush_serialized()
+                                await _send_serialized({
+                                    "type": "http.response.body",
+                                    "body": _build_error_frame_bytes(),
+                                    "more_body": True})
+                                await _emit_terminal_sentinel()
+                            except Exception:  # noqa: BLE001
+                                pass
                         import logging as _logging_p2
                         _logging_p2.getLogger("lancelot.stream").info(
                             "stream aborted after %ss of data-silence "
                             "(max_stream_silence)", _max_silence)
                     else:
-                        # A real client disconnect / outer cancellation.
+                        # A real client disconnect / outer cancellation. NO error
+                        # frame / sentinel — the client is gone (M17 P6: the
+                        # cancel-arm frame fires ONLY on an internal cancel).
                         lreq._cancel_event.set()
                         raise
                 except Exception:  # noqa: BLE001
@@ -1185,22 +1256,22 @@ async def _http_dispatch(app, scope, receive, send):
                     # instead of a stream that truncates yet looks complete
                     # (the finally below sends a clean EOF). Log for the
                     # operator; do NOT re-raise — the response is committed.
-                    import json as _json
+                    #
+                    # M17 P6: under error_frame the frame is a SCRUBBED
+                    # ProblemDetail (vs the legacy hardcoded {"error":...}) and
+                    # the terminal `done_sentinel` is GUARANTEED after it (the
+                    # raise short-circuited sse_adapter's clean-exhaustion
+                    # sentinel). Default-off -> the legacy frame + no sentinel,
+                    # byte-identical to today.
                     import logging as _logging
                     import traceback as _tb
                     try:
-                        from lancelot.context import request_id as _rid_cv
-                        _rid = _rid_cv.get()
-                    except Exception:  # noqa: BLE001
-                        _rid = "-"
-                    try:
                         await _flush_serialized()
-                        _err = ("event: error\ndata: " + _json.dumps(
-                            {"error": "internal server error",
-                             "request_id": _rid}) + "\n\n").encode()
                         await _send_serialized({
                             "type": "http.response.body",
-                            "body": _err, "more_body": True})
+                            "body": _build_error_frame_bytes(),
+                            "more_body": True})
+                        await _emit_terminal_sentinel()
                     except Exception:  # noqa: BLE001
                         pass
                     _logging.getLogger("lancelot.stream").error(
@@ -1520,7 +1591,15 @@ async def _http_dispatch(app, scope, receive, send):
                     # P1: reuse the adapter built at registration (fallback to a
                     # fresh one for any Route constructed off the normal path).
                     _ta = getattr(route, "_response_ta", None) or TypeAdapter(rm)
-                    if (isinstance(rm, type) and issubclass(rm, _BM)
+                    # M17 P4: skip-validation -> serialize the RAW result
+                    # straight through dump_json (no model_validate pass).
+                    # pydantic-core duck-types ORM-style attributes against the
+                    # schema; the user vouches for the shape. The fence (in
+                    # Route.__post_init__) guarantees exclude_unset is NOT set
+                    # here, so dump_json never needs __pydantic_fields_set__.
+                    if route.response_model_skip_validation:
+                        _val = result
+                    elif (isinstance(rm, type) and issubclass(rm, _BM)
                             and not isinstance(result, rm)):
                         _val = rm.model_validate(result, from_attributes=True)
                     else:
