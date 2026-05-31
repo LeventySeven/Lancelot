@@ -13,6 +13,15 @@ Two deployable surfaces:
    serialization** and **streaming** (see `benchmarks/README.md`); for tiny
    one-shot JSON, uvicorn+uvloop is faster. Deploy notes below.
 
+> **Lifecycle hooks run on surface #1 only.** The native server serves route
+> handlers and drains in-flight connections on SIGTERM, but does **not** drive
+> the ASGI lifespan protocol. `lifespan=`, `@app.on_event`,
+> `@app.lifetime_task`, and mounted sub-app lifespans run **only under uvicorn**
+> (surface #1) — under `app.run()` they silently no-op (e.g. an
+> `@app.on_event("startup")` that sets `app.state.client` never fires, so the
+> first request sees an unset attribute). If your app needs startup/shutdown
+> hooks or supervised background daemons, deploy under uvicorn.
+
 ## Containers & PaaS — bind address ($PORT, 0.0.0.0)
 
 Every PaaS injects a `$PORT` and expects you to bind `0.0.0.0:$PORT`. The two
@@ -203,7 +212,10 @@ the two compose (we don't reimplement spans). RED metrics auto-emit when
 ## Health checks
 
 `lancelot.App` auto-registers `/livez` (process alive) and `/readyz` (lifespan
-started + in-flight under threshold) for Kubernetes probes.
+started + in-flight under threshold) for Kubernetes probes. The "lifespan
+started" gate is meaningful only under uvicorn (surface #1); the native
+`app.run()` server does not run the lifespan, so prebake `/readyz` as a
+const-bytes route there (see below).
 
 On the Rust `_native` server, serve fixed-response endpoints (health probes,
 static config, cached payloads) via the **const-bytes tier** — prebaked bytes

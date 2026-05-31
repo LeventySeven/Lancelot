@@ -196,7 +196,14 @@ class App:
         (LANCELOT_HOST, PORT/LANCELOT_PORT) so `CMD ["python","app.py"]` with
         a trailing `app.run()` deploys cleanly on any PaaS — set
         LANCELOT_HOST=0.0.0.0 in the container. For the FastAPI-parity path
-        (works on every ASGI platform) run `uvicorn yourmod:app` instead."""
+        (works on every ASGI platform) run `uvicorn yourmod:app` instead.
+
+        LIFECYCLE CAVEAT: the native server runs route handlers and drains
+        in-flight connections on SIGTERM, but does NOT drive the ASGI lifespan
+        protocol. `lifespan=`, `@app.on_event`, `@app.lifetime_task`, and
+        mounted sub-app lifespans run ONLY under an ASGI server (uvicorn /
+        hypercorn). If you need startup/shutdown hooks or supervised daemons,
+        deploy under uvicorn."""
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
