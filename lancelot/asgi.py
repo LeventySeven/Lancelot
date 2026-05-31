@@ -622,6 +622,7 @@ async def _http_dispatch(app, scope, receive, send):
 
     from urllib.parse import parse_qs
 
+    from lancelot.batch import BatchOverloadError
     from lancelot.di import solve_async
     from lancelot.exceptions import HTTPException
     from lancelot.pool import PoolFull, get_pool
@@ -1457,6 +1458,16 @@ async def _http_dispatch(app, scope, receive, send):
             pbody = b'{"detail":"Service Unavailable"}'
             await send({"type": "http.response.start", "status": 503,
                         "headers": [(b"retry-after", b"1"),
+                                    (b"content-length",
+                                     str(len(pbody)).encode()),
+                                    (b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": pbody})
+    except BatchOverloadError as _bo:  # T9: @app.batch max_keys → sheddable 503
+        if not sent:
+            pbody = b'{"detail":"Service Unavailable"}'
+            _ra = str(int(getattr(_bo, "retry_after", 1))).encode("ascii")
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"retry-after", _ra),
                                     (b"content-length",
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})

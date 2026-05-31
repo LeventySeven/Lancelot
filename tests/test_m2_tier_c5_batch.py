@@ -200,7 +200,9 @@ def test_c5_rejects_wrong_signature_at_registration_time():
 def test_c5_max_keys_caps_registry_growth():
     """SECURITY: a client sending many unique keys MUST NOT be able to
     inflate the registry indefinitely. After `max_keys` distinct keys,
-    new keys are rejected with 500 (clean failure, not slow OOM)."""
+    new keys are SHED with 503 + Retry-After (M15 T9 changed this from the
+    old 500 — a full registry is transient back-pressure the client can
+    retry, not a server bug). Clean failure, not slow OOM."""
     app = lancelot.App()
 
     @app.batch("/b", batch_window_ms=10, max_batch=1, max_keys=3,
@@ -213,8 +215,10 @@ def test_c5_max_keys_caps_registry_growth():
         assert c.post("/b", json={"text": "x", "group": "g1"}).status_code == 200
         assert c.post("/b", json={"text": "x", "group": "g2"}).status_code == 200
         assert c.post("/b", json={"text": "x", "group": "g3"}).status_code == 200
-        # 4th distinct key: cap-blown, 500.
-        assert c.post("/b", json={"text": "x", "group": "g4"}).status_code == 500
+        # 4th distinct key: cap-blown → 503 + Retry-After (sheddable).
+        r = c.post("/b", json={"text": "x", "group": "g4"})
+        assert r.status_code == 503
+        assert "retry-after" in {k.lower() for k in r.headers}
         # But a key we've already seen still works (uses existing group).
         assert c.post("/b", json={"text": "x", "group": "g1"}).status_code == 200
 

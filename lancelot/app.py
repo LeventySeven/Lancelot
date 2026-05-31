@@ -376,13 +376,29 @@ class App:
 
     def batch(self, path: str, *, batch_window_ms: int = 50,
               max_batch: int = 16, max_keys: int = 1024,
-              key=None, **route_kwargs):
+              key=None, size_fn=None, max_size: int = 0,
+              **route_kwargs):
         """Tier-C.C5 (marquee): prefix-aware request grouping for AI
         workloads. The HTTP route accepts ONE payload per request; the
         wrapped handler receives a `list[Payload]` containing every
         request that arrived during `batch_window_ms` (or up to
         `max_batch`, whichever fires first). The framework fans the
         handler's `list[Result]` back to each waiter by index.
+
+        M15 T9 budget knobs:
+          - `size_fn(items: list) -> int` + `max_size`: when set, the
+            flush trigger is a byte/token BUDGET — a batch fires when
+            `size_fn(pending) >= max_size`, in ADDITION to the `max_batch`
+            COUNT trigger (so you can cap an upstream call by total bytes
+            or tokens, not just request count). An item that would push a
+            non-empty batch over `max_size` is DEFERRED to the next batch
+            (the current pending flushes first); a lone item that exceeds
+            the budget is still processed by itself. `size_fn` is your
+            callable — Lancelot ships no tokenizer (AI logic stays
+            user-side). Leave both unset for pure count-based batching.
+          - `max_keys` hit (too many distinct key-values) now sheds with
+            503 + Retry-After (a transient back-pressure signal the client
+            can retry), not a 500.
 
         Surface:
             @app.batch("/chat", batch_window_ms=50, max_batch=10,
@@ -425,7 +441,8 @@ class App:
             item_T = _typing.get_args(list_ann)[0]
 
             registry = _BatchRegistry(fn, window_s, max_batch, key,
-                                      max_keys=max_keys)
+                                      max_keys=max_keys, size_fn=size_fn,
+                                      max_size=max_size)
 
             # Synthesize an HTTP-level handler with one-payload signature.
             # The body name `item` becomes the JSON-body field; matches
