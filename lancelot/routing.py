@@ -101,6 +101,13 @@ class Route:
     response_model_exclude_unset: bool = False
     response_model_exclude_defaults: bool = False
     response_model_exclude_none: bool = False
+    # M17 P4 (opt-in, default False = byte-identical parity): skip the
+    # `model_validate` pass and serialize the handler result DIRECTLY through
+    # the cached TypeAdapter's `dump_json` (~4x cheaper on a large read; the
+    # user vouches for the shape — a non-conforming return serializes as-is,
+    # NOT coerced/rejected). FENCE: incompatible with response_model flags that
+    # require a validated instance — see __post_init__ (registration raises).
+    response_model_skip_validation: bool = False
     response_class: Any = None
     responses: dict | None = None
     operation_id: str | None = None
@@ -216,6 +223,23 @@ class Route:
                 raise FastAPIError(
                     f"Invalid response_model {self.response_model!r}"
                 ) from _e
+            # M17 P4 FENCE: skip-validation serializes the RAW handler result
+            # (no validated instance is ever built). Verified against
+            # pydantic-core 2.13: only `exclude_unset` reads
+            # `__pydantic_fields_set__` (which a raw object lacks → it raises
+            # PydanticSerializationError at serialize time). `by_alias`,
+            # `exclude_none`, `include`, `exclude`, and `exclude_defaults`
+            # (value-based) all work on a raw object. So fence ONLY
+            # exclude_unset, and fail LOUD at registration rather than be
+            # silently 500 at the first request.
+            if (self.response_model_skip_validation
+                    and self.response_model_exclude_unset):
+                raise FastAPIError(
+                    "response_model_skip_validation=True is incompatible with "
+                    "response_model_exclude_unset=True: exclude_unset reads "
+                    "`__pydantic_fields_set__`, which only a validated "
+                    "instance has. Drop one of the two flags."
+                )
         # FastAPI parity: if the handler's return annotation contains a
         # Starlette/Lancelot Response (or subclass), reject at registration.
         # Response isn't a valid response_model (can't validate against it).

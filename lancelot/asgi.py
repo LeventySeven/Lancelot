@@ -1591,7 +1591,15 @@ async def _http_dispatch(app, scope, receive, send):
                     # P1: reuse the adapter built at registration (fallback to a
                     # fresh one for any Route constructed off the normal path).
                     _ta = getattr(route, "_response_ta", None) or TypeAdapter(rm)
-                    if (isinstance(rm, type) and issubclass(rm, _BM)
+                    # M17 P4: skip-validation -> serialize the RAW result
+                    # straight through dump_json (no model_validate pass).
+                    # pydantic-core duck-types ORM-style attributes against the
+                    # schema; the user vouches for the shape. The fence (in
+                    # Route.__post_init__) guarantees exclude_unset is NOT set
+                    # here, so dump_json never needs __pydantic_fields_set__.
+                    if route.response_model_skip_validation:
+                        _val = result
+                    elif (isinstance(rm, type) and issubclass(rm, _BM)
                             and not isinstance(result, rm)):
                         _val = rm.model_validate(result, from_attributes=True)
                     else:
