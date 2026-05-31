@@ -927,6 +927,65 @@ async def _http_dispatch(app, scope, receive, send):
                 _disc_watch = _asyncio.ensure_future(
                     _watch_disconnect(receive, lreq._cancel_event))
                 gen = route.handler(**kwargs)
+                _it = gen.__aiter__()
+
+                # M16 P1: pre-200 streaming status (`defer_status=True`).
+                # Pull the FIRST item BEFORE committing http.response.start, so
+                # a handler that raises (HTTPException / ProblemDetail / any
+                # error) BEFORE its first `yield` produces a REAL 4xx/5xx + JSON
+                # body instead of a half-open 200 + an SSE error frame. Default
+                # off -> the block below is skipped entirely and the legacy
+                # send-200-then-pull path is byte-identical. The disconnect
+                # watcher is already armed; if the client is already gone the
+                # first __anext__ raises CancelledError, handled like any other
+                # pre-yield error (cleanly, before any status is sent).
+                _have_first = False
+                _first_item = None
+                _stream_empty = False
+                if getattr(route, "defer_status", False):
+                    try:
+                        _first_item = await _it.__anext__()
+                        _have_first = True
+                    except StopAsyncIteration:
+                        # Empty generator under defer_status: commit 200 + an
+                        # empty SSE body (a valid, immediately-closed stream).
+                        _stream_empty = True
+                    except _asyncio.CancelledError:
+                        # Client disconnected before the first chunk — nothing
+                        # was sent, so just unwind (no half-open response).
+                        lreq._cancel_event.set()
+                        if not _disc_watch.done():
+                            _disc_watch.cancel()
+                        try:
+                            await _it.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
+                    except HTTPException:
+                        # Pre-yield HTTPException / ProblemDetail -> a REAL
+                        # status + body. NOTHING was sent yet, so `sent` is
+                        # still False and the outer except-HTTPException path
+                        # (user handler / ProblemDetail / {"detail"}) emits the
+                        # byte-faithful response. Re-raise to reach it.
+                        if not _disc_watch.done():
+                            _disc_watch.cancel()
+                        try:
+                            await _it.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # Any other pre-yield error -> a REAL 500 (the outer
+                        # `except Exception` emits the plaintext 500). Again,
+                        # `sent` is False so no half-open 200 was committed.
+                        if not _disc_watch.done():
+                            _disc_watch.cancel()
+                        try:
+                            await _it.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise
+
                 await send({"type": "http.response.start", "status": 200,
                             "headers": [
                                 (b"content-type", b"text/event-stream"),
@@ -951,8 +1010,10 @@ async def _http_dispatch(app, scope, receive, send):
                 # (M6-T1.1: original `_flush` removed; the
                 # `_flush_serialized` below replaces it and serializes
                 # sends through the keepalive lock — see fix note.)
+                #
+                # `_it` was obtained ABOVE (M16 P1) so the optional pre-200
+                # first-item pull and this loop iterate the SAME async-iterator.
 
-                _it = gen.__aiter__()
                 # M6-T1.1 (fixes M5 lab-body 10× regression on
                 # uvicorn-lancelot /stream): the previous loop wrapped
                 # every __anext__ in wait_for(shield(ensure_future(...))),
@@ -966,19 +1027,42 @@ async def _http_dispatch(app, scope, receive, send):
                 # only fires when the main loop has been idle for _ka
                 # seconds. Sends are serialized through _send_locked
                 # (asyncio.Lock); the main loop is a clean async-for.
-                _last_send = _time.monotonic()
+                #
+                # M16 P2: track the last-DATA send SEPARATELY from the
+                # last-PING send. The keepalive idle check uses "time since
+                # ANY send" (max of the two) so its cadence is unchanged, but
+                # the silence-abort check uses last-DATA only — so a keepalive
+                # ping no longer resets the data-silence timer (the self-reset
+                # bug: a ping-only zombie stream would otherwise reset its own
+                # idle timer forever and never be detected). `max_stream_silence`
+                # (seconds, None=off) caps how long a stream may emit ONLY pings
+                # before the gen is cancelled (its finally/aclose runs) + closed.
+                _now0 = _time.monotonic()
+                _last_data = _now0          # last real-DATA send
+                _last_ping = _now0          # last keepalive-PING send
+                _max_silence = getattr(route, "max_stream_silence", None)
+                _silence_hit = False        # set by the keepalive loop on abort
                 _send_lock = _asyncio.Lock() \
                     if (_ka is not None and _ka > 0) else None
 
-                async def _send_serialized(msg):
-                    nonlocal _last_send
+                def _last_any():
+                    return _last_data if _last_data > _last_ping else _last_ping
+
+                async def _send_serialized(msg, *, is_data=True):
+                    nonlocal _last_data, _last_ping
                     if _send_lock is not None:
                         async with _send_lock:
                             await send(msg)
-                            _last_send = _time.monotonic()
+                            if is_data:
+                                _last_data = _time.monotonic()
+                            else:
+                                _last_ping = _time.monotonic()
                     else:
                         await send(msg)
-                        _last_send = _time.monotonic()
+                        if is_data:
+                            _last_data = _time.monotonic()
+                        else:
+                            _last_ping = _time.monotonic()
 
                 async def _flush_serialized():
                     nonlocal _buf, _buf_count, _ttft_done
@@ -1005,36 +1089,94 @@ async def _http_dispatch(app, scope, receive, send):
                         _buf = bytearray()
                         _buf_count = 0
 
-                async def _keepalive_loop():
-                    # Wake up periodically; only emit a ping if idle has
-                    # exceeded _ka. Sleeping for half the window keeps
-                    # max-idle-before-ping at ≤1.5 × _ka in the worst case.
-                    try:
-                        while True:
-                            await _asyncio.sleep(_ka / 2.0)
-                            idle = _time.monotonic() - _last_send
-                            if idle >= _ka:
-                                # Flush any buffered chunks first so a
-                                # slow client doesn't lose data behind
-                                # the ping.
-                                await _flush_serialized()
-                                await _send_serialized({
-                                    "type": "http.response.body",
-                                    "body": b":\n\n", "more_body": True})
-                    except _asyncio.CancelledError:
-                        return
-
-                _kp_task = (_asyncio.ensure_future(_keepalive_loop())
-                            if _send_lock is not None else None)
-                try:
-                    async for event in _it:
-                        _buf += _stream_chunk_bytes(event)
+                # M16 P2: the consumption runs as its OWN task so the watchdog
+                # (keepalive + silence-abort) can CANCEL it on a max-silence
+                # breach — cancellation propagates into the suspended __anext__,
+                # which throws into the generator at its yield point so its
+                # `finally`/`aclose` runs (teardown preserved). The wrapping is
+                # per-STREAM (one task), not per-chunk, so the M6-T1.1 hot-path
+                # win is untouched. Stash the P1 first item (if pulled) so it's
+                # emitted before the rest of the stream.
+                async def _consume():
+                    nonlocal _buf_count
+                    if _have_first:
+                        _buf.extend(_stream_chunk_bytes(_first_item))
                         _buf_count += 1
                         if _buf_count >= _interval:
                             await _flush_serialized()
+                    if _stream_empty:
+                        return
+                    async for event in _it:
+                        _buf.extend(_stream_chunk_bytes(event))
+                        _buf_count += 1
+                        if _buf_count >= _interval:
+                            await _flush_serialized()
+
+                async def _watchdog_loop():
+                    # Wake up periodically. (1) Keepalive: emit a ping if NO
+                    # send (data OR ping) for _ka — sleeping half the window
+                    # keeps max-idle-before-ping ≤1.5 × _ka. (2) Silence-abort
+                    # (M16 P2): if only pings (no DATA) have flowed for
+                    # _max_silence, cancel the consume task so the zombie stream
+                    # is dropped (its gen `finally`/`aclose` runs). Idle is
+                    # measured from last-DATA, so a keepalive ping does NOT reset
+                    # it (the self-reset fix).
+                    nonlocal _silence_hit
+                    _tick = _ka / 2.0 if (_ka is not None and _ka > 0) else None
+                    if _tick is None and _max_silence is not None:
+                        # No keepalive but a silence cap: poll on a fraction of
+                        # the cap so the abort lands near the deadline.
+                        _tick = max(0.05, _max_silence / 4.0)
+                    if _tick is None:
+                        return
+                    try:
+                        while True:
+                            await _asyncio.sleep(_tick)
+                            _mono = _time.monotonic()
+                            if _max_silence is not None and \
+                                    (_mono - _last_data) >= _max_silence:
+                                _silence_hit = True
+                                if not _consume_task.done():
+                                    _consume_task.cancel()
+                                return
+                            if _ka is not None and _ka > 0 and \
+                                    (_mono - _last_any()) >= _ka:
+                                # Flush any buffered chunks first so a slow
+                                # client doesn't lose data behind the ping.
+                                await _flush_serialized()
+                                await _send_serialized({
+                                    "type": "http.response.body",
+                                    "body": b":\n\n", "more_body": True},
+                                    is_data=False)
+                    except _asyncio.CancelledError:
+                        return
+
+                _consume_task = _asyncio.ensure_future(_consume())
+                _kp_task = (_asyncio.ensure_future(_watchdog_loop())
+                            if (_send_lock is not None
+                                or _max_silence is not None) else None)
+                try:
+                    await _consume_task
                 except _asyncio.CancelledError:
-                    lreq._cancel_event.set()
-                    raise
+                    if _silence_hit:
+                        # M16 P2: the WATCHDOG cancelled the consume task on a
+                        # max-silence breach (NOT a client disconnect). The
+                        # generator's teardown ran via the cancel that was
+                        # thrown into it; belt-and-suspenders aclose() below.
+                        # Do NOT propagate CancelledError — close the stream
+                        # cleanly (the finally sends EOF) like a normal end.
+                        try:
+                            await _it.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        import logging as _logging_p2
+                        _logging_p2.getLogger("lancelot.stream").info(
+                            "stream aborted after %ss of data-silence "
+                            "(max_stream_silence)", _max_silence)
+                    else:
+                        # A real client disconnect / outer cancellation.
+                        lreq._cancel_event.set()
+                        raise
                 except Exception:  # noqa: BLE001
                     # S1 (AI-backend pattern — Ollama streamResponse): the
                     # handler raised AFTER the 200 + headers were sent, so we
@@ -1069,6 +1211,16 @@ async def _http_dispatch(app, scope, receive, send):
                         _kp_task.cancel()
                     if not _disc_watch.done():
                         _disc_watch.cancel()
+                    # M16 P2: if the dispatch coroutine itself was cancelled
+                    # (graceful drain / outer timeout) while consuming, cancel
+                    # the consume task too so its generator's `finally`/`aclose`
+                    # runs and we don't leak an orphan task.
+                    if not _consume_task.done():
+                        _consume_task.cancel()
+                        try:
+                            await _consume_task
+                        except BaseException:  # noqa: BLE001
+                            pass
                     # R2: a send() on a broken socket (client gone) must NOT
                     # replace the CancelledError we're propagating — that would
                     # corrupt yield-dep teardown exc_info + lose the cancel

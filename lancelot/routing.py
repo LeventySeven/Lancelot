@@ -47,6 +47,22 @@ class Route:
     is_stream: bool = False  # @app.stream: yields lancelot.stream.Event
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
     sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
+    # M16 P1: pre-200 streaming status (eager-first-chunk). When True, the
+    # ASGI seam pulls the FIRST item BEFORE committing http.response.start, so
+    # a handler that raises (HTTPException / ProblemDetail / any error) BEFORE
+    # its first yield produces a REAL 4xx/5xx + JSON body instead of a
+    # half-open 200 + SSE error frame. Default False -> byte-identical to
+    # today. ASGI-seam (uvicorn) ONLY — the native app.run() server has no
+    # per-route config (see src/stream.rs note + the @app.stream docstring).
+    defer_status: bool = False
+    # M16 P2: stuck-stream silence-abort. When set (seconds), the seam cancels
+    # the generator (its finally/aclose runs) and closes the connection if only
+    # keepalive pings — no real DATA — have flowed for this long. Tracks the
+    # last-DATA send separately from the last-PING send so a keepalive ping
+    # never resets the data-silence timer. None = off (default; no behavior
+    # change). ASGI-seam (uvicorn) only — symmetric with the upstream
+    # idle_guarded_chunks concept.
+    max_stream_silence: float | None = None
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
     # M15 T6 (#1): extend the C2 client-disconnect→cancel machinery (shipped
     # only on @app.stream) to UNARY handlers. When True (or the App-level

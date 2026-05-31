@@ -28,6 +28,103 @@ class UpstreamIdleTimeout(Exception):
         self.idle_secs = idle_secs
 
 
+async def _race_chunk_vs_cancel(it, cancel_event, idle):
+    """M16 P8: pull the next upstream chunk (`it.__anext__()`), but if
+    `cancel_event` fires first (the client disconnected), cancel the pull and
+    raise asyncio.CancelledError so the relay/forward unwinds and the enclosing
+    `async with pool.stream(...)` aclose()s the upstream. Honors the per-stream
+    idle window (idle>0 → TimeoutError → UpstreamIdleTimeout upstream).
+
+    Same FIRST_COMPLETED dual-task shape as `TransportPool._await_cancellable`
+    (the unary cancel path) — re-used here for the streaming relay so a
+    disconnect stops paying for unwatched tokens on the relay path too."""
+    if cancel_event.is_set():
+        raise asyncio.CancelledError("client disconnected; upstream cancelled")
+    pull = asyncio.ensure_future(it.__anext__())
+    waiter = asyncio.ensure_future(cancel_event.wait())
+    timeout = idle if (idle and idle > 0) else None
+    try:
+        done, _pending = await asyncio.wait(
+            {pull, waiter}, timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            # Neither fired within the idle window → idle timeout.
+            raise asyncio.TimeoutError
+        if pull in done:
+            waiter.cancel()
+            return pull.result()       # chunk (or re-raises StopAsyncIteration)
+        # Cancel event fired first → abort the pull and propagate cancellation.
+        pull.cancel()
+        try:
+            await pull
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        raise asyncio.CancelledError("client disconnected; upstream cancelled")
+    finally:
+        if not pull.done():
+            pull.cancel()
+        if not waiter.done():
+            waiter.cancel()
+
+
+class _CancellableStreamCtx:
+    """M16 P8: async-CM wrapper for `client.stream(...)` that (a) tags the
+    entered httpx response with the request's `_cancel_event` so
+    `idle_guarded_chunks`/`relay` race each chunk against a client disconnect,
+    and (b) races the connection-OPEN itself against the event (so a disconnect
+    during connect cancels too) and aclose()s the upstream on exit. Only built
+    when `pool.stream(..., request=req)` carries a live cancel event — the
+    no-request path returns the bare httpx CM unchanged (zero overhead)."""
+
+    __slots__ = ("_pool", "_cm", "_event", "_resp")
+
+    def __init__(self, pool, cm, event):
+        self._pool = pool
+        self._cm = cm
+        self._event = event
+        self._resp = None
+
+    async def __aenter__(self):
+        if self._event.is_set():
+            raise asyncio.CancelledError("client disconnected; upstream cancelled")
+        # Race the connection-open against the disconnect (a slow connect to a
+        # dead-client request shouldn't block).
+        open_task = asyncio.ensure_future(self._cm.__aenter__())
+        waiter = asyncio.ensure_future(self._event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {open_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            if open_task in done:
+                waiter.cancel()
+                self._resp = open_task.result()
+            else:
+                # Disconnected before connect finished — unwind the open.
+                open_task.cancel()
+                try:
+                    await open_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                # Best-effort close of the underlying CM if it half-opened.
+                try:
+                    await self._cm.__aexit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise asyncio.CancelledError(
+                    "client disconnected; upstream cancelled")
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        # Tag the response so the chunk-iterators find the event.
+        try:
+            self._resp._lancelot_cancel_event = self._event
+        except Exception:  # noqa: BLE001
+            pass
+        return self._resp
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._cm.__aexit__(exc_type, exc, tb)
+
+
 class _TokenBucket:
     """Minimal asyncio token bucket (calls/second). asyncio is single-threaded
     cooperative — state only mutates synchronously between awaits, so no lock.
@@ -382,38 +479,110 @@ class TransportPool:
             if not wait_event.done():
                 wait_event.cancel()
 
-    async def stream(self, method: str, url: str, **kw):
+    async def stream(self, method: str, url: str, *, request=None, **kw):
         """Streaming outbound — POST/PATCH never retried; idempotent
         verbs may retry once before opening the stream. Returns an httpx
-        Response context (use `async with pool.stream(...) as r:`)."""
+        Response context (use `async with pool.stream(...) as r:`).
+
+        M16 P8: optional `request=` binds the stream to a Lancelot Request, the
+        streaming twin of the unary `request()` cancel-on-disconnect (C2). When
+        the client disconnects mid-stream (`request._cancel_event` fires), the
+        upstream chunk iteration is cancelled — so the user stops paying for LLM
+        tokens nobody is watching (the exact thing the unary path stops, on the
+        relay path). The cancel race is applied at chunk iteration by
+        `idle_guarded_chunks`/`relay` (which find the event tagged on the
+        response) AND at connection-open here. When `request=None` (default),
+        this is a zero-overhead pass-through — byte-identical to before.
+        Pure Python: no Rust pump variant (Tier-D — the per-chunk path is
+        upstream-rate-limited)."""
         method = method.upper()
         if self._block_private_ips:
             from lancelot.net import assert_safe_url
             assert_safe_url(url)
         kw = self._inject_traceparent(kw)
         kw.setdefault("timeout", self._stream_timeout)  # no read deadline; caller can override
-        return self._client.stream(method, url, **kw)
+        cm = self._client.stream(method, url, **kw)
+        ev = getattr(request, "_cancel_event", None) if request else None
+        if ev is None:
+            return cm  # zero-overhead pass-through (unchanged)
+        return _CancellableStreamCtx(self, cm, ev)
 
     async def idle_guarded_chunks(self, response, idle_secs: float | None = None):
         """Yield `response.aiter_bytes()` chunks, but raise UpstreamIdleTimeout
         if no chunk arrives within the idle window (defaults to the pool's
         LANCELOT_UPSTREAM_STREAM_IDLE_SECS). idle<=0 → plain pass-through.
         Use as: `async with pool.stream(...) as r:
-                     async for chunk in pool.idle_guarded_chunks(r): ...`"""
+                     async for chunk in pool.idle_guarded_chunks(r): ...`
+
+        M16 P8: if the stream was opened with `pool.stream(..., request=req)`,
+        the response carries a `_cancel_event`; each chunk pull then races that
+        event so a client disconnect aborts the upstream iteration (the iterator
+        is left suspended ≤1 chunk; the enclosing `async with pool.stream`
+        aclose()s the upstream). No-op overhead when no event is bound."""
         idle = self._stream_idle_secs if idle_secs is None else idle_secs
-        if idle <= 0:
-            async for chunk in response.aiter_bytes():
-                yield chunk
-            return
+        ev = getattr(response, "_lancelot_cancel_event", None)
         it = response.aiter_bytes().__aiter__()
         while True:
             try:
-                chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+                if ev is not None:
+                    chunk = await _race_chunk_vs_cancel(it, ev, idle)
+                elif idle > 0:
+                    chunk = await asyncio.wait_for(it.__anext__(), timeout=idle)
+                else:
+                    chunk = await it.__anext__()
             except asyncio.TimeoutError:
                 raise UpstreamIdleTimeout(idle) from None
             except StopAsyncIteration:
                 return
             yield chunk
+
+    def relay(self, method: str, url: str, *, request=None, **kw):
+        """M16 P8: upstream->client SSE relay primitive — open the upstream
+        stream, forward its chunks (via `idle_guarded_chunks`), cancel on
+        client disconnect, and `aclose()` the upstream in `finally`. The spine
+        of the inference reverse-proxy archetype (BentoML/r2r/langserve all
+        hand-roll open+forward+cleanup).
+
+        An async-context-manager yielding an async-iterator of the upstream's
+        chunks; it `aclose()`s the upstream when the `async with` block exits.
+        Use it INSIDE an `@app.stream` async-gen handler so iteration happens
+        within the block:
+
+            @app.stream("/proxy")
+            async def proxy(request):
+                async with pool.relay("POST", url, request=request) as upstream:
+                    async for chunk in upstream:
+                        yield chunk
+
+        Do NOT `return StreamingResponse(upstream)` from inside the `async with`:
+        the block exits on `return` and acloses the upstream BEFORE the response
+        iterates. For a StreamingResponse, drive `pool.stream(..., request=request)`
+        from within your own async-gen instead.
+
+        Pass `request=request` so a client disconnect cancels the upstream (the
+        whole point). Pure Python — NO Rust pump variant (Tier-D)."""
+        import contextlib as _cl
+
+        @_cl.asynccontextmanager
+        async def _cm():
+            forward = self._relay_forward(method, url, request=request, **kw)
+            try:
+                yield forward
+            finally:
+                # Ensure the upstream is torn down even if the consumer broke
+                # out early / returned a StreamingResponse without iterating to
+                # exhaustion (aclose drives the inner `async with` __aexit__).
+                await forward.aclose()
+
+        return _cm()
+
+    async def _relay_forward(self, method, url, *, request=None, **kw):
+        """The relay's forwarding async-generator: open the upstream stream,
+        yield each chunk, aclose() the upstream in `finally`. Cancellation
+        (client disconnect via `request=`) propagates through `aiter_bytes`."""
+        async with await self.stream(method, url, request=request, **kw) as r:
+            async for chunk in self.idle_guarded_chunks(r):
+                yield chunk
 
     @staticmethod
     def _inject_idempotency(kw):
@@ -660,6 +829,11 @@ class _ChildHandle:
             request = self._parent_request
         return await self._pool.request(method, url, request=request, **kw)
 
-    async def stream(self, method: str, url: str, **kw):
+    async def stream(self, method: str, url: str, *, request=None, **kw):
         kw = self._merge_headers(kw)
-        return await self._pool.stream(method, url, **kw)
+        # M16 P8: forward parent cancellation if no explicit request= override
+        # (same as _ChildHandle.request) so a sub-agent's relayed stream is
+        # cancelled when the parent client disconnects.
+        if request is None:
+            request = self._parent_request
+        return await self._pool.stream(method, url, request=request, **kw)

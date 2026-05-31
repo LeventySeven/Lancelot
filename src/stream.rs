@@ -61,6 +61,22 @@ use tokio::sync::mpsc::Sender;
 /// per-route `sse`/`done_sentinel` config to key off, and a second framing
 /// implementation here would risk byte-drift from the Python seam. Keep the
 /// `bytes`/`str` passthrough below intact — it is what makes the parity hold.
+///
+/// M16 P1 (`@app.stream(defer_status=True)` — pre-200 streaming status): the
+/// "pull the first chunk before committing the 200" behavior is implemented on
+/// the Python ASGI seam ONLY and is intentionally NOT mirrored here, for the
+/// SAME architectural reason as the SSE framing above — the native server has
+/// no per-route config (it forwards only `(method, path, handler)`), so there
+/// is nothing to key a per-route `defer_status` off. A *global* eager-first-
+/// chunk would have to `.await` the first `__anext__` BEFORE `handle()` sends
+/// `status(OK)` (service.rs ~265) — but `build_result` is deliberately SYNC and
+/// the gen's iteration is owned end-to-end by the on-loop `_drain` coroutine
+/// (one bridge crossing per stream). Splitting out the first pull would add a
+/// second bridge crossing + risk double-iteration, regressing the R3 pump for a
+/// niche pre-yield-error case. So `defer_status` is documented as ASGI-seam-only
+/// (consistent with the M15-documented native lifespan/DI limitations); the
+/// native path keeps committing `status(OK)` + lazy `StreamBody`. See
+/// `docs/plans/2026-05-31-m16-streaming-fixes.md` P1.
 fn chunk_to_bytes(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     // Build `Bytes` directly (no Vec→Bytes second copy): the common bytes/str
     // token-stream chunks copy once; the channel send takes the `Bytes` as-is.
