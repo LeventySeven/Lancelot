@@ -16,6 +16,11 @@ import time as _time_mod
 
 _IDEMPOTENT = frozenset({"GET", "HEAD", "PUT", "DELETE", "OPTIONS"})
 
+# M17 P7 review: bound the SSE usage-scan carry-over buffer. A real usage frame
+# is tiny; this caps memory for a track_usage upstream that never emits a frame
+# boundary (max_stream_silence guards silence, not byte-volume).
+_SSE_SCAN_CAP = 65536
+
 
 class UpstreamIdleTimeout(Exception):
     """An upstream stream produced no bytes for the configured idle window —
@@ -105,6 +110,10 @@ def _scan_last_data_frame(pending: bytes, chunk: bytes, last_frame):
         # parsing every content delta). The LAST such frame wins.
         if b"usage" in payload or b"usageMetadata" in payload:
             last_frame = payload
+    # Bound carry-over: keep only the trailing window (where the next frame
+    # boundary will land) so a no-"\n\n" stream can't accumulate unbounded.
+    if len(buf) > _SSE_SCAN_CAP:
+        buf = buf[-_SSE_SCAN_CAP:]
     return buf, last_frame
 
 
@@ -700,6 +709,12 @@ class TransportPool:
 
         Pass `request=request` so a client disconnect cancels the upstream (the
         whole point). Pure Python — NO Rust pump variant (Tier-D).
+
+        NOTE: do NOT put `sse=True` on a relay handler — a relay forwards the
+        upstream's ALREADY-framed SSE bytes (incl. its terminal `data: [DONE]`),
+        so `sse=True` would append a SECOND `[DONE]`. Use a plain `@app.stream`
+        (no `sse=`) and `yield` the relay chunks as-is. Set `track_usage=True`
+        to record streamed cost/tokens/TTFT (M17 P7).
 
         M17 P7 (opt-in `track_usage=True`): account the streamed call's
         cost/tokens/upstream-TTFT — the relayed twin of the unary
