@@ -51,6 +51,13 @@ class App:
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
+        # M15 T2 (#11): FastAPI's per-app operationId factory. Was swallowed
+        # into _extra_kwargs and ignored; now consumed by build_openapi as the
+        # fallback when a route has no explicit operation_id. None = use the
+        # built-in MUST-32 formula. (kwargs is the same dict stored above, so
+        # popping here also removes it from _extra_kwargs.)
+        self._generate_unique_id_function = kwargs.pop(
+            "generate_unique_id_function", None)
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
         # @app.on_event("startup"/"shutdown") deprecated decorator handlers.

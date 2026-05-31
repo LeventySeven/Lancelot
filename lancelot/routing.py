@@ -63,6 +63,10 @@ class Route:
     response_class: Any = None
     responses: dict | None = None
     operation_id: str | None = None
+    # M15 T2 (#11): a dict shallow-merged into THIS route's OpenAPI
+    # path-operation object (after the generated keys, so it can override).
+    # FastAPI-named; build-time only (the schema is memoized) → zero hot path.
+    openapi_extra: dict | None = None
     summary: str | None = None
     description: str | None = None
     tags: list | None = None
