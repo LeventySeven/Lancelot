@@ -1478,7 +1478,18 @@ async def _http_dispatch(app, scope, receive, send):
                     h, lreq, exc, scope, receive, send)
                 sent = True
                 return
-            ebody = _wire_json({"detail": exc.detail})
+            # M15 T11 (opt-in): a raised ProblemDetail emits RFC 9457
+            # `application/problem+json` (the RFC body, not `{"detail"}`).
+            # A PLAIN HTTPException is untouched below — the default error
+            # bytes stay byte-identical (conformance gate).
+            from lancelot.exceptions import (
+                ProblemDetail as _PD, PROBLEM_JSON_MEDIA_TYPE as _PJMT)
+            if isinstance(exc, _PD):
+                ebody = _wire_json(exc.problem_dict())
+                ctype = _PJMT.encode()
+            else:
+                ebody = _wire_json({"detail": exc.detail})
+                ctype = b"application/json"
             # Starlette JSONResponse(headers=exc.headers) wire order:
             # the exception's explicit headers FIRST (names lower-cased,
             # as Starlette init_headers does), then content-length, then
@@ -1486,7 +1497,7 @@ async def _http_dispatch(app, scope, receive, send):
             hdrs = [(str(k).lower().encode(), str(v).encode())
                     for k, v in exc.headers.items()]
             hdrs.append((b"content-length", str(len(ebody)).encode()))
-            hdrs.append((b"content-type", b"application/json"))
+            hdrs.append((b"content-type", ctype))
             await send({"type": "http.response.start",
                         "status": exc.status_code, "headers": hdrs})
             await send({"type": "http.response.body", "body": ebody})
