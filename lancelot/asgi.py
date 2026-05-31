@@ -307,7 +307,14 @@ async def _http(app, scope, receive, send):
             except Exception:  # noqa: BLE001
                 _cost, _tenant, _qw = 0.0, "-", 0.0
 
-            record_request(path, method, _final_status_holder[0],
+            # M15 T1 (#2): the metric label is the route TEMPLATE (stashed by
+            # _http_dispatch at the match site) or a bounded sentinel for the
+            # 404/405 no-match paths — never the concrete URL `path` (which
+            # would blow up cardinality for parameterized + sprayed routes).
+            # `__unmatched__` is a belt-and-suspenders default for any exit
+            # path that didn't reach the match site (e.g. the draining 503).
+            _route_label = scope.get("_lancelot_route") or "__unmatched__"
+            record_request(_route_label, method, _final_status_holder[0],
                            _time.perf_counter() - _t0,
                            tenant=_tenant, cost_usd=_cost,
                            queue_wait_ms=_qw)
@@ -355,8 +362,18 @@ async def _http_dispatch(app, scope, receive, send):
     scope.setdefault("app", _AppProxy(app))
 
     route, info = app.router.match(method, path)
+    # M15 T1 (#2): record the route TEMPLATE (e.g. `/items/{id}`), NOT the
+    # concrete URL (`/items/42`), as the `http.route` metric label — else a
+    # path-parameterized route explodes metric cardinality (one time-series
+    # per id). The `_http` finally reads this back; bounded sentinels are
+    # stashed on the no-match (404/405) paths below so a URL-spraying scanner
+    # can't blow up cardinality on the not-found path either.
+    if route is not None:
+        scope["_lancelot_route"] = route.path
     if route is None:
         status = info  # 404 or 405
+        scope["_lancelot_route"] = (
+            "__not_found__" if status == 404 else "__method_not_allowed__")
         # FastAPI redirect_slashes (default True): on 404, if the toggled-
         # slash path matches a route, return 307 to that path. Disabling
         # via `FastAPI(redirect_slashes=False)` keeps the 404.
@@ -746,8 +763,13 @@ async def _http_dispatch(app, scope, receive, send):
                                 from lancelot.metrics import record_stream_ttft
                                 _st = scope.get("_lancelot_t0")
                                 if _st is not None:
+                                    # M15 T1 (#2): TTFT twin — same cardinality
+                                    # fix as record_request. Use the route
+                                    # TEMPLATE (a streaming route is always
+                                    # matched, so the stash is set), not `path`.
                                     record_stream_ttft(
-                                        path, method,
+                                        scope.get("_lancelot_route") or path,
+                                        method,
                                         _time.perf_counter() - _st)
                             except Exception:  # noqa: BLE001
                                 pass
