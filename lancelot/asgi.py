@@ -348,28 +348,9 @@ async def _http(app, scope, receive, send):
     # else a fresh internal UUID4. traceparent: a valid W3C header exposes its
     # trace-id via context.trace_id and is forwarded by TransportPool onto
     # outbound LLM calls (the AI request joins the same distributed trace).
-    from lancelot.context import (request_id as _rid_var, new_request_id,
-                                  trace_id as _tid_var, trace_parent as _tp_var,
-                                  parse_traceparent)
-
-    _rid = None
-    _rid_from_client = False
-    _tp_raw = None
-    for _hk, _hv in scope.get("headers", []):
-        if _rid is None and _hk in (b"x-request-id", b"x-correlation-id"):
-            # SECURITY: we echo this back — strip CR/LF/NUL (response-header
-            # smuggling) and bound the length so a tiny client can't cost a
-            # huge header.
-            _cleaned = (_hv.decode("ascii", "ignore").replace("\r", "")
-                        .replace("\n", "").replace("\x00", ""))[:128]
-            if _cleaned:
-                _rid = _cleaned
-                _rid_from_client = True
-        elif _tp_raw is None and _hk == b"traceparent":
-            _tp_raw = _hv.decode("ascii", "ignore")
-    if not _rid:
-        _rid = new_request_id()
-    _tid = parse_traceparent(_tp_raw) if _tp_raw else None
+    # M15 T10: the scan + set/reset are factored into shared helpers so the
+    # WebSocket seam uses the EXACT same logic (no drift).
+    _rid, _rid_from_client, _tp_raw, _tid = _scan_request_context(scope)
 
     # Tier-B.B1+B4+B2: in-flight counter + RED in-flight gauge + duration clock.
     import time as _time
@@ -416,10 +397,8 @@ async def _http(app, scope, receive, send):
     try:
         app._active_requests += 1
         in_flight_delta(1)
-        _rid_token = _rid_var.set(_rid)
-        if _tid:
-            _tid_token = _tid_var.set(_tid)
-            _tp_token = _tp_var.set(_tp_raw.strip().lower())
+        _rid_token, _tid_token, _tp_token = _set_request_context(
+            _rid, _tid, _tp_raw)
         await _http_dispatch(app, scope, receive, send_with_rid)
     finally:
         app._active_requests -= 1
@@ -455,15 +434,73 @@ async def _http(app, scope, receive, send):
                            queue_wait_ms=_qw)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            if _rid_token is not None:
-                _rid_var.reset(_rid_token)
-            if _tid_token is not None:
-                _tid_var.reset(_tid_token)
-            if _tp_token is not None:
-                _tp_var.reset(_tp_token)
-        except Exception:  # noqa: BLE001
-            pass
+        _reset_request_context((_rid_token, _tid_token, _tp_token))
+
+
+def _scan_request_context(scope):
+    """Scan an ASGI scope's headers ONCE for the request-correlation inputs
+    Lancelot threads through ContextVars: the request-id (from
+    `X-Request-ID` / `X-Correlation-ID`, CR/LF/NUL-scrubbed + length-bounded
+    because we echo it) and the W3C `traceparent`. Mints a fresh request-id
+    when the client sent none. Returns `(rid, rid_from_client, tp_raw, tid)`.
+
+    Factored out of `_http` (M15 T10) so the WebSocket seam can share the
+    EXACT same scan — a WS connection then gets the same request-id echo +
+    traceparent propagation the HTTP path already has, with no drift."""
+    from lancelot.context import new_request_id, parse_traceparent
+
+    rid = None
+    rid_from_client = False
+    tp_raw = None
+    for hk, hv in scope.get("headers", []):
+        if rid is None and hk in (b"x-request-id", b"x-correlation-id"):
+            cleaned = (hv.decode("ascii", "ignore").replace("\r", "")
+                       .replace("\n", "").replace("\x00", ""))[:128]
+            if cleaned:
+                rid = cleaned
+                rid_from_client = True
+        elif tp_raw is None and hk == b"traceparent":
+            tp_raw = hv.decode("ascii", "ignore")
+    if not rid:
+        rid = new_request_id()
+    tid = parse_traceparent(tp_raw) if tp_raw else None
+    return rid, rid_from_client, tp_raw, tid
+
+
+def _set_request_context(rid, tid, tp_raw):
+    """Set the request-correlation ContextVars and return the reset tokens
+    `(rid_token, tid_token, tp_token)` (the latter two `None` when there's
+    no valid trace context). Caller MUST pass these to
+    `_reset_request_context` in a `finally` so nothing leaks across requests
+    / connections (M15 T10). Mirrors the set in `_http`."""
+    from lancelot.context import (request_id as _rid_var,
+                                  trace_id as _tid_var,
+                                  trace_parent as _tp_var)
+    rid_token = _rid_var.set(rid)
+    tid_token = tp_token = None
+    if tid:
+        tid_token = _tid_var.set(tid)
+        tp_token = _tp_var.set(tp_raw.strip().lower())
+    return rid_token, tid_token, tp_token
+
+
+def _reset_request_context(tokens):
+    """Reset the ContextVars set by `_set_request_context`. Token-based reset
+    (not blanket re-set to the default) so nested contexts restore correctly.
+    Fail-safe: a bad token never escapes the seam."""
+    from lancelot.context import (request_id as _rid_var,
+                                  trace_id as _tid_var,
+                                  trace_parent as _tp_var)
+    rid_token, tid_token, tp_token = tokens
+    try:
+        if rid_token is not None:
+            _rid_var.reset(rid_token)
+        if tid_token is not None:
+            _tid_var.reset(tid_token)
+        if tp_token is not None:
+            _tp_var.reset(tp_token)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stream_chunk_bytes(ev):
@@ -1560,6 +1597,15 @@ async def _ws(app, scope, receive, send):
     lreq.query_params_multi = dict(qs)
     lreq.headers_multi = headers_multi
     lreq._ws = ws
+    # M15 T10: set the request-correlation ContextVars from the handshake
+    # headers (same scan as the HTTP seam), so a WS handler gets request-id
+    # echo semantics AND — critically — `TransportPool` calls made from
+    # inside the handler forward the socket's `traceparent` to the upstream
+    # (the AI call joins the same distributed trace). RESET in `finally` so
+    # nothing leaks across connections sharing this loop.
+    _ws_rid, _ws_rid_from_client, _ws_tp_raw, _ws_tid = \
+        _scan_request_context(scope)
+    _ws_ctx_tokens = _set_request_context(_ws_rid, _ws_tid, _ws_tp_raw)
     try:
         async with solve_async(route.plan, lreq) as res:
             if res.errors:  # MUST-7: validation failure → close 1008
@@ -1587,6 +1633,10 @@ async def _ws(app, scope, receive, send):
             await ws.close(code=1011)
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        # RESET on disconnect/return so the next connection on this loop
+        # doesn't inherit this socket's request_id / trace context.
+        _reset_request_context(_ws_ctx_tokens)
 
 
 def _find_exc_handler(app, exc):
