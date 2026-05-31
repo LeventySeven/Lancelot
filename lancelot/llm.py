@@ -67,58 +67,119 @@ async def _race_chunk_vs_cancel(it, cancel_event, idle):
             waiter.cancel()
 
 
+def _scan_last_data_frame(pending: bytes, chunk: bytes, last_frame):
+    """M17 P7: feed `chunk` into the running SSE-frame scanner. SSE frames are
+    `\\n\\n`-terminated; chunks need not align to frame boundaries, so we buffer
+    incomplete trailing bytes in `pending`. For each COMPLETE frame we pull the
+    `data:` line(s) payload; we retain (as `last_frame`) the most recent data
+    payload whose raw bytes contain `b"usage"` — a cheap substring gate so we
+    JSON-parse at MOST one frame at stream end (not every frame). Returns
+    `(new_pending, new_last_frame)`. Provider-reported usage only: a stream with
+    no `usage` anywhere leaves `last_frame` None and nothing is recorded.
+
+    Handles the three provider shapes the streamed usage frame takes:
+      * OpenAI `stream_options={"include_usage": true}`: a near-terminal
+        `data: {...,"usage":{"prompt_tokens":..,"completion_tokens":..}}` frame
+        (then `data: [DONE]`).
+      * Anthropic `message_delta`: `data: {"usage":{"output_tokens":..}}`.
+      * Google: `data: {...,"usageMetadata":{...}}`.
+    """
+    buf = pending + chunk
+    # Process only complete frames; keep the (possibly partial) tail in pending.
+    while True:
+        idx = buf.find(b"\n\n")
+        if idx < 0:
+            break
+        frame = buf[:idx]
+        buf = buf[idx + 2:]
+        # Concatenate the payloads of all `data:` lines in this frame (SSE allows
+        # multi-line data; LLM providers use one, but be correct).
+        payload_parts = []
+        for line in frame.split(b"\n"):
+            if line.startswith(b"data:"):
+                payload_parts.append(line[5:].lstrip(b" "))
+        if not payload_parts:
+            continue
+        payload = b"\n".join(payload_parts)
+        # Cheap gate: only frames mentioning usage are candidates (avoids
+        # parsing every content delta). The LAST such frame wins.
+        if b"usage" in payload or b"usageMetadata" in payload:
+            last_frame = payload
+    return buf, last_frame
+
+
 class _CancellableStreamCtx:
     """M16 P8: async-CM wrapper for `client.stream(...)` that (a) tags the
     entered httpx response with the request's `_cancel_event` so
     `idle_guarded_chunks`/`relay` race each chunk against a client disconnect,
     and (b) races the connection-OPEN itself against the event (so a disconnect
-    during connect cancels too) and aclose()s the upstream on exit. Only built
-    when `pool.stream(..., request=req)` carries a live cancel event — the
-    no-request path returns the bare httpx CM unchanged (zero overhead)."""
+    during connect cancels too) and aclose()s the upstream on exit. Built when
+    `pool.stream(..., request=req)` carries a live cancel event OR when
+    `track_usage=True` (M17 P7) needs the response tagged for cost accounting —
+    the plain no-request/no-track path returns the bare httpx CM unchanged
+    (zero overhead).
 
-    __slots__ = ("_pool", "_cm", "_event", "_resp")
+    M17 P7: `track_url` (the upstream URL) is tagged onto the response as
+    `_lancelot_track_usage` so `idle_guarded_chunks` records streamed
+    cost/tokens/TTFT for it. When `event` is None (track_usage without a bound
+    request) there is no disconnect to race — the open is awaited directly."""
 
-    def __init__(self, pool, cm, event):
+    __slots__ = ("_pool", "_cm", "_event", "_resp", "_track_url")
+
+    def __init__(self, pool, cm, event, track_url=None):
         self._pool = pool
         self._cm = cm
         self._event = event
         self._resp = None
+        self._track_url = track_url
 
     async def __aenter__(self):
-        if self._event.is_set():
-            raise asyncio.CancelledError("client disconnected; upstream cancelled")
-        # Race the connection-open against the disconnect (a slow connect to a
-        # dead-client request shouldn't block).
-        open_task = asyncio.ensure_future(self._cm.__aenter__())
-        waiter = asyncio.ensure_future(self._event.wait())
-        try:
-            done, _ = await asyncio.wait(
-                {open_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
-            if open_task in done:
-                waiter.cancel()
-                self._resp = open_task.result()
-            else:
-                # Disconnected before connect finished — unwind the open.
-                open_task.cancel()
-                try:
-                    await open_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
-                # Best-effort close of the underlying CM if it half-opened.
-                try:
-                    await self._cm.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
+        if self._event is None:
+            # No client-disconnect event to race (track_usage-only path):
+            # await the open directly, no extra task allocations.
+            self._resp = await self._cm.__aenter__()
+        else:
+            if self._event.is_set():
                 raise asyncio.CancelledError(
                     "client disconnected; upstream cancelled")
-        finally:
-            if not waiter.done():
-                waiter.cancel()
-        # Tag the response so the chunk-iterators find the event.
-        try:
-            self._resp._lancelot_cancel_event = self._event
-        except Exception:  # noqa: BLE001
-            pass
+            # Race the connection-open against the disconnect (a slow connect to
+            # a dead-client request shouldn't block).
+            open_task = asyncio.ensure_future(self._cm.__aenter__())
+            waiter = asyncio.ensure_future(self._event.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {open_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if open_task in done:
+                    waiter.cancel()
+                    self._resp = open_task.result()
+                else:
+                    # Disconnected before connect finished — unwind the open.
+                    open_task.cancel()
+                    try:
+                        await open_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                    # Best-effort close of the underlying CM if it half-opened.
+                    try:
+                        await self._cm.__aexit__(None, None, None)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise asyncio.CancelledError(
+                        "client disconnected; upstream cancelled")
+            finally:
+                if not waiter.done():
+                    waiter.cancel()
+            # Tag the response so the chunk-iterators find the event.
+            try:
+                self._resp._lancelot_cancel_event = self._event
+            except Exception:  # noqa: BLE001
+                pass
+        # M17 P7: tag the upstream URL so idle_guarded_chunks accounts usage.
+        if self._track_url is not None:
+            try:
+                self._resp._lancelot_track_usage = self._track_url
+            except Exception:  # noqa: BLE001
+                pass
         return self._resp
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -447,6 +508,42 @@ class TransportPool:
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _record_stream_usage(url, last_frame, ttft_s):
+        """M17 P7: streamed twin of `_emit_upstream`. `last_frame` is the raw
+        bytes of the terminal SSE `data:` payload that carried usage (or None if
+        the stream never reported any). Parse it, run the existing
+        `extract_tokens` (provider-reported usage only — NO tiktoken), record the
+        `upstream.*` token/cost metrics (status 200 = a completed stream) with
+        the upstream-TTFT, and accumulate the per-call cost into the parent's
+        `cost_usd` ContextVar so `X-Lancelot-Cost-USD` covers streamed calls.
+
+        Best-effort: never raises into the user's stream. No usage frame (None or
+        unparseable / no usage block) -> record nothing (don't guess)."""
+        if last_frame is None:
+            return
+        try:
+            import json as _json
+            try:
+                body = _json.loads(last_frame)
+            except Exception:  # noqa: BLE001
+                return
+            if not isinstance(body, dict):
+                return
+            from lancelot.upstream_metrics import extract_tokens, record_upstream
+            tin, tout = extract_tokens(body)
+            if tin <= 0 and tout <= 0:
+                return  # provider-reported usage only; nothing to record
+            info = record_upstream(url, 200, 0.0, body=body, ttft_s=ttft_s)
+            if info.get("cost_usd", 0.0) > 0:
+                try:
+                    from lancelot.context import cost_usd as _cv
+                    _cv.set(_cv.get() + info["cost_usd"])
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _await_cancellable(self, coro, request):
         """Helper: await `coro`, but if `request` carries a cancel event
         that fires first, cancel the coro and raise asyncio.CancelledError.
@@ -479,7 +576,8 @@ class TransportPool:
             if not wait_event.done():
                 wait_event.cancel()
 
-    async def stream(self, method: str, url: str, *, request=None, **kw):
+    async def stream(self, method: str, url: str, *, request=None,
+                     track_usage: bool = False, **kw):
         """Streaming outbound — POST/PATCH never retried; idempotent
         verbs may retry once before opening the stream. Returns an httpx
         Response context (use `async with pool.stream(...) as r:`).
@@ -494,7 +592,23 @@ class TransportPool:
         response) AND at connection-open here. When `request=None` (default),
         this is a zero-overhead pass-through — byte-identical to before.
         Pure Python: no Rust pump variant (Tier-D — the per-chunk path is
-        upstream-rate-limited)."""
+        upstream-rate-limited).
+
+        M17 P7 (opt-in `track_usage=True`): the streamed twin of the unary
+        `_emit_upstream` cost/token accounting. `pool.request` records
+        `upstream.*` metrics + accumulates the per-call `cost_usd` ContextVar so
+        the `X-Lancelot-Cost-USD` trailer covers unary sub-LLM calls; the
+        streamed path recorded NOTHING (cost/tokens/upstream-TTFT silently 0).
+        With `track_usage=True`, `idle_guarded_chunks` retains the LAST SSE
+        `data:` frame as chunks flow, records upstream-TTFT on the first chunk,
+        and on clean end parses the retained frame with the existing
+        `extract_tokens` (provider-reported usage only — NO tiktoken/new dep),
+        computes cost via the SAME rate path `_emit_upstream` uses, records the
+        `upstream.*` token/cost metrics, and accumulates into `cost_usd`. The
+        flag is carried on the entered response (`_lancelot_track_usage`) so the
+        single accounting site is `idle_guarded_chunks` (which both `pool.stream`
+        and `pool.relay` iterate). Default off -> NO frame retention/scan
+        (zero overhead, byte-identical)."""
         method = method.upper()
         if self._block_private_ips:
             from lancelot.net import assert_safe_url
@@ -503,9 +617,10 @@ class TransportPool:
         kw.setdefault("timeout", self._stream_timeout)  # no read deadline; caller can override
         cm = self._client.stream(method, url, **kw)
         ev = getattr(request, "_cancel_event", None) if request else None
-        if ev is None:
+        if ev is None and not track_usage:
             return cm  # zero-overhead pass-through (unchanged)
-        return _CancellableStreamCtx(self, cm, ev)
+        return _CancellableStreamCtx(self, cm, ev,
+                                     track_url=(url if track_usage else None))
 
     async def idle_guarded_chunks(self, response, idle_secs: float | None = None):
         """Yield `response.aiter_bytes()` chunks, but raise UpstreamIdleTimeout
@@ -518,10 +633,25 @@ class TransportPool:
         the response carries a `_cancel_event`; each chunk pull then races that
         event so a client disconnect aborts the upstream iteration (the iterator
         is left suspended ≤1 chunk; the enclosing `async with pool.stream`
-        aclose()s the upstream). No-op overhead when no event is bound."""
+        aclose()s the upstream). No-op overhead when no event is bound.
+
+        M17 P7: if the stream was opened with `pool.stream(..., track_usage=True)`
+        the response carries `_lancelot_track_usage` (the upstream URL); this
+        loop then retains the LAST SSE `data:` frame as chunks flow, records
+        upstream-TTFT on the first chunk, and on CLEAN end parses the retained
+        frame + records cost/tokens (provider-reported usage only). No frame
+        retention/scan when the tag is absent (zero overhead)."""
         idle = self._stream_idle_secs if idle_secs is None else idle_secs
         ev = getattr(response, "_lancelot_cancel_event", None)
+        track_url = getattr(response, "_lancelot_track_usage", None)
         it = response.aiter_bytes().__aiter__()
+        # M17 P7 usage-tracking state (only touched when track_url is set).
+        _u_t0 = None
+        _u_ttft = None
+        _u_last_frame = None
+        _u_pending = b""
+        if track_url is not None:
+            _u_t0 = _time_mod.perf_counter()
         while True:
             try:
                 if ev is not None:
@@ -533,10 +663,19 @@ class TransportPool:
             except asyncio.TimeoutError:
                 raise UpstreamIdleTimeout(idle) from None
             except StopAsyncIteration:
+                # M17 P7: clean end -> account the retained terminal frame.
+                if track_url is not None:
+                    self._record_stream_usage(track_url, _u_last_frame, _u_ttft)
                 return
+            if track_url is not None:
+                if _u_ttft is None:
+                    _u_ttft = _time_mod.perf_counter() - _u_t0
+                _u_pending, _u_last_frame = _scan_last_data_frame(
+                    _u_pending, chunk, _u_last_frame)
             yield chunk
 
-    def relay(self, method: str, url: str, *, request=None, **kw):
+    def relay(self, method: str, url: str, *, request=None,
+              track_usage: bool = False, **kw):
         """M16 P8: upstream->client SSE relay primitive — open the upstream
         stream, forward its chunks (via `idle_guarded_chunks`), cancel on
         client disconnect, and `aclose()` the upstream in `finally`. The spine
@@ -560,12 +699,19 @@ class TransportPool:
         from within your own async-gen instead.
 
         Pass `request=request` so a client disconnect cancels the upstream (the
-        whole point). Pure Python — NO Rust pump variant (Tier-D)."""
+        whole point). Pure Python — NO Rust pump variant (Tier-D).
+
+        M17 P7 (opt-in `track_usage=True`): account the streamed call's
+        cost/tokens/upstream-TTFT — the relayed twin of the unary
+        `_emit_upstream` accounting. See `pool.stream`'s docstring; the flag is
+        forwarded to the underlying stream and the accounting happens in
+        `idle_guarded_chunks`. Default off -> byte-identical relay (no scan)."""
         import contextlib as _cl
 
         @_cl.asynccontextmanager
         async def _cm():
-            forward = self._relay_forward(method, url, request=request, **kw)
+            forward = self._relay_forward(method, url, request=request,
+                                          track_usage=track_usage, **kw)
             try:
                 yield forward
             finally:
@@ -576,11 +722,15 @@ class TransportPool:
 
         return _cm()
 
-    async def _relay_forward(self, method, url, *, request=None, **kw):
+    async def _relay_forward(self, method, url, *, request=None,
+                             track_usage: bool = False, **kw):
         """The relay's forwarding async-generator: open the upstream stream,
         yield each chunk, aclose() the upstream in `finally`. Cancellation
-        (client disconnect via `request=`) propagates through `aiter_bytes`."""
-        async with await self.stream(method, url, request=request, **kw) as r:
+        (client disconnect via `request=`) propagates through `aiter_bytes`.
+        M17 P7: `track_usage` is forwarded to `stream` so the streamed
+        cost/token/TTFT accounting fires in `idle_guarded_chunks`."""
+        async with await self.stream(method, url, request=request,
+                                     track_usage=track_usage, **kw) as r:
             async for chunk in self.idle_guarded_chunks(r):
                 yield chunk
 
