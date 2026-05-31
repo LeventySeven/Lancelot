@@ -30,14 +30,42 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
+class BatchOverloadError(Exception):
+    """Raised when the batch registry's `max_keys` cap is hit. The ASGI
+    seam maps this to a sheddable 503 + Retry-After (a load signal the
+    client can back off on) rather than a 500 — a full registry is
+    transient back-pressure, not a server bug.
+
+    `retry_after` is the integer seconds for the Retry-After header."""
+
+    def __init__(self, message: str, *, retry_after: int = 1):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 @dataclass
 class _BatchGroup:
     """One bucket. There's a separate group per `key`-value the user
     function partitions on. Mutex-protected so submissions and the
-    flush-timer don't race on `pending`."""
+    flush-timer don't race on `pending`.
+
+    `window_s` / `max_batch` are SNAPSHOTTED into the group at
+    construction (first submit for this key) — a later live retune of the
+    parent registry can't corrupt a half-built batch (M15 T9). The group
+    keeps using its captured values for its whole lifetime.
+
+    `size_fn` (optional, M15 T9): when set, the flush trigger is a
+    byte/token BUDGET — a batch flushes when `size_fn(pending) >=
+    max_size`, in ADDITION to the `max_batch` count trigger. An item that
+    would push a non-empty batch over the budget is DEFERRED to the next
+    batch (the current pending flushes first, the over-budget item starts
+    a fresh one). A single item that exceeds the budget alone is still
+    processed (in a batch by itself) — defer never strands it."""
     handler: Callable[..., Any]
     window_s: float
     max_batch: int
+    size_fn: Callable[[list], int] | None = None
+    max_size: int = 0
     pending: list = field(default_factory=list)  # list[(payload, Future)]
     timer_task: asyncio.Task | None = None
     lock: asyncio.Lock | None = None
@@ -49,16 +77,53 @@ class _BatchGroup:
         if self.lock is None:
             self.lock = asyncio.Lock()
 
+    def _over_budget_with(self, payload) -> bool:
+        """Would adding `payload` push a NON-EMPTY pending over the byte
+        budget? (An empty pending is never over-budget — a lone oversized
+        item must still be processed.)"""
+        if self.size_fn is None or not self.pending:
+            return False
+        prospective = [p for p, _ in self.pending] + [payload]
+        return self.size_fn(prospective) > self.max_size
+
+    def _budget_full(self) -> bool:
+        """Has the current pending REACHED the byte budget (flush trigger)?"""
+        if self.size_fn is None or not self.pending:
+            return False
+        return self.size_fn([p for p, _ in self.pending]) >= self.max_size
+
     async def submit(self, payload):
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        # `deferred_batch` is a snapshot of a pending list that this submit
+        # decided to flush BEFORE appending its own item (the defer-to-tail
+        # path). It's run OUTSIDE the lock, exactly once — the swapped-out
+        # list is unreachable to any other task, so there's no double-fire.
+        deferred_batch = None
         flush_now = False
         async with self.lock:
+            # Defer-to-tail: if this item would blow the budget for the
+            # current (non-empty) pending, flush what's already there first,
+            # then this item starts a fresh batch. Atomic list-swap under the
+            # lock guarantees the deferred items are owned by exactly one
+            # flush (this one) — exactly-once fanout.
+            if self._over_budget_with(payload):
+                deferred_batch = self.pending
+                self.pending = []
+                # The timer (if any) was armed for the now-deferred batch;
+                # leave it — it'll fire on the fresh pending or find it
+                # flushed-empty (→ early return). We re-arm below for the
+                # new item if needed.
             self.pending.append((payload, fut))
-            if len(self.pending) >= self.max_batch:
+            if len(self.pending) >= self.max_batch or self._budget_full():
                 flush_now = True
-            elif self.timer_task is None:
-                # First in the window: arm the timer.
+            elif self.timer_task is None or self.timer_task.done():
+                # First in this window (or the prior timer already fired):
+                # arm a fresh timer for the current pending.
                 self.timer_task = asyncio.ensure_future(self._wait_then_flush())
+        # Run the deferred batch first (it formed earlier), then ours. Both
+        # are no-ops if empty. Neither holds the lock here.
+        if deferred_batch:
+            await self._run_batch(deferred_batch)
         if flush_now:
             await self._flush()
         return await fut
@@ -127,16 +192,25 @@ class _BatchRegistry:
 
     SECURITY: `max_keys` caps the registry size so a malicious client
     can't inflate memory by sending an unbounded number of distinct
-    keys. When exceeded, new requests get a clean RuntimeError (which
-    surfaces as 500 to the client) — better than a slow OOM."""
+    keys. When exceeded, new requests get a clean BatchOverloadError (a
+    sheddable load signal → 503 + Retry-After at the ASGI seam) — better
+    than a slow OOM, and the client can back off rather than treating it
+    as a 500 server bug (M15 T9).
+
+    `size_fn` / `max_size` (optional, M15 T9): forwarded to each group so
+    the flush trigger can be a byte/token BUDGET, not just a count."""
 
     def __init__(self, handler, window_s: float, max_batch: int,
-                 key_fn: Callable | None, max_keys: int = 1024):
+                 key_fn: Callable | None, max_keys: int = 1024,
+                 size_fn: Callable[[list], int] | None = None,
+                 max_size: int = 0):
         self.handler = handler
         self.window_s = window_s
         self.max_batch = max_batch
         self.key_fn = key_fn
         self.max_keys = max_keys
+        self.size_fn = size_fn
+        self.max_size = max_size
         self._groups: dict = {}
         # Eager construction (see _BatchGroup.__post_init__ rationale).
         self._mu: asyncio.Lock = asyncio.Lock()
@@ -147,11 +221,16 @@ class _BatchRegistry:
             grp = self._groups.get(k)
             if grp is None:
                 if len(self._groups) >= self.max_keys:
-                    raise RuntimeError(
+                    raise BatchOverloadError(
                         f"@app.batch registry cap reached "
                         f"({self.max_keys} distinct keys); "
-                        "increase max_keys or coarsen the key function."
+                        "increase max_keys or coarsen the key function.",
+                        retry_after=1,
                     )
-                grp = _BatchGroup(self.handler, self.window_s, self.max_batch)
+                # SNAPSHOT window_s / max_batch / size budget into the group
+                # at construction — a later live retune of THIS registry
+                # can't retroactively change a group's trigger (T9).
+                grp = _BatchGroup(self.handler, self.window_s, self.max_batch,
+                                  size_fn=self.size_fn, max_size=self.max_size)
                 self._groups[k] = grp
         return await grp.submit(payload)

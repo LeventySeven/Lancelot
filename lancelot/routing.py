@@ -48,6 +48,15 @@ class Route:
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
     sse_keepalive: float = 15.0  # Tier-A.A5: SSE keepalive comment interval (s)
     timeout: float | None = None  # Tier-B.B5: per-route deadline → 504
+    # M15 T6 (#1): extend the C2 client-disconnect→cancel machinery (shipped
+    # only on @app.stream) to UNARY handlers. When True (or the App-level
+    # default), an async / timeout='d handler's in-flight `await` is CANCELLED
+    # the moment the client hard-closes — so the user stops paying for an
+    # upstream LLM call nobody is watching. yield-dep teardown still runs
+    # (B4 semantics). None = inherit the App default (default False). OFF by
+    # default so the tiny one-shot fast path pays NOTHING (no receive()-poll
+    # watcher armed unless the route opts in).
+    cancel_on_disconnect: bool | None = None
     # FastAPI 0.110+ feature: reject JSON-body routes when the request's
     # Content-Type isn't JSON. None = inherit (router → app → True default).
     strict_content_type: bool | None = None
@@ -63,6 +72,10 @@ class Route:
     response_class: Any = None
     responses: dict | None = None
     operation_id: str | None = None
+    # M15 T2 (#11): a dict shallow-merged into THIS route's OpenAPI
+    # path-operation object (after the generated keys, so it can override).
+    # FastAPI-named; build-time only (the schema is memoized) → zero hot path.
+    openapi_extra: dict | None = None
     summary: str | None = None
     description: str | None = None
     tags: list | None = None
@@ -694,3 +707,35 @@ class Router:
             if params is not None:
                 return r, params
         return None, 404
+
+    def remove(self, path: str, method: str | None = None) -> int:
+        """M15 T12: live-remove route(s) from EVERY tier. Returns the count
+        removed. `method=None` removes every method on that path (incl. WS).
+
+        This is the byte-path correctness guarantee: dropping a route from
+        `self.routes` alone would leave a stale O(1) `_const` hit (or a live
+        `_dyn` regex entry) still serving the dead path. We evict from
+        `_const`, `_const_paths`, `_dyn`, AND `routes` atomically.
+
+        Cold path (live mutation, not per-request) — straightforward filters,
+        no impact on `match()`/`match_ws()` happy-path cost."""
+        want = None if method is None else method.upper()
+
+        def _hit(r) -> bool:
+            return r.path == path and (want is None or r.method == want)
+
+        removed = [r for r in self.routes if _hit(r)]
+        if not removed:
+            return 0
+        # routes (the canonical list) + the two derived tiers.
+        self.routes = [r for r in self.routes if not _hit(r)]
+        self._const = {
+            k: r for k, r in self._const.items() if not _hit(r)
+        }
+        self._dyn = [r for r in self._dyn if not _hit(r)]
+        # _const_paths is method-agnostic: only drop the path once NO const
+        # route (under any remaining method) still uses it — otherwise a
+        # surviving sibling method's 405 detection would break.
+        if not any(r.path == path for r in self._const.values()):
+            self._const_paths.discard(path)
+        return len(removed)

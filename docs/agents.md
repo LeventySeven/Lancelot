@@ -149,6 +149,14 @@ async def upstream():
 ```
 (Or use `TransportPool` for LLM upstreams; it manages this for you.)
 
+> **Deploy caveat:** `@app.on_event`/`lifespan=` (and `@app.lifetime_task`) run
+> only under an ASGI server (`uvicorn yourmod:app`). The native `app.run()`
+> server does **not** drive the ASGI lifespan protocol, so this startup hook
+> never fires there and `app.state.client` stays unset → first request raises
+> `AttributeError`. Deploy under uvicorn if you rely on startup/shutdown hooks
+> (see `docs/deploy.md`). `TransportPool` lazily initializes on first use, so it
+> works on both paths.
+
 ### ❌ `BaseHTTPMiddleware` for streaming-sensitive paths
 Lancelot's `BaseHTTPMiddleware` adapter does not replicate Starlette's anyio-task-group streaming model (one of the four documented divergences). If your middleware needs to observe `call_next` *while* the inner handler is still streaming, don't use `BaseHTTPMiddleware` — use a plain `@app.middleware("http")` decorator on a sync-capture function.
 

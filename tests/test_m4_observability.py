@@ -23,7 +23,8 @@ pytest.importorskip("opentelemetry.sdk.metrics")
 
 def _counter_points(reader, name):
     pts = []
-    for rm in (reader.get_metrics_data().resource_metrics or []):
+    _data = reader.get_metrics_data()  # None until the first metric is emitted this process
+    for rm in ((_data.resource_metrics if _data else None) or []):
         for sm in rm.scope_metrics:
             for m in sm.metrics:
                 if m.name == name:
@@ -35,41 +36,83 @@ _READER = None
 
 
 def _install_reader():
-    """One process-wide InMemoryMetricReader + MeterProvider (set_meter_provider
-    is once-per-process), memoized so every metric test reads the same reader."""
+    """One process-wide InMemoryMetricReader. `set_meter_provider` is
+    once-per-process: a second provider is silently rejected, leaving its
+    reader orphaned (get_metrics_data() → None). Because other test files
+    (e.g. test_m15_metric_cardinality) also install a reader and are loaded as
+    separate top-level modules under pytest's default import mode, we recover
+    the reader from whatever MeterProvider is ACTUALLY active — creating one
+    only if no SDK provider is set yet — so collection order can't orphan us."""
     global _READER
     if _READER is None:
         from opentelemetry import metrics as om
         from opentelemetry.sdk.metrics import MeterProvider
         from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-        _READER = InMemoryMetricReader()
-        try:
-            om.set_meter_provider(MeterProvider(metric_readers=[_READER]))
-        except Exception:  # noqa: BLE001 — provider already set this process
-            pass
-        from lancelot import metrics as lmetrics
-        lmetrics.reset_for_tests()  # rebind lancelot's cached meter to our provider
+        provider = om.get_meter_provider()
+        readers = getattr(getattr(provider, "_sdk_config", None),
+                          "metric_readers", None)
+        if readers:
+            for r in readers:
+                if isinstance(r, InMemoryMetricReader):
+                    _READER = r
+                    break
+        if _READER is None:
+            _READER = InMemoryMetricReader()
+            try:
+                om.set_meter_provider(MeterProvider(metric_readers=[_READER]))
+            except Exception:  # noqa: BLE001 — provider already set this process
+                pass
+    from lancelot import metrics as lmetrics
+    lmetrics.reset_for_tests()  # rebind lancelot's cached meter to the provider
     return _READER
+
+
+def _scoped(reader, name, routes):
+    return [p for p in _counter_points(reader, name)
+            if p.attributes.get("http.route") in routes]
 
 
 def test_v3_1_red_metrics_exact_under_concurrent_load():
     reader = _install_reader()
 
+    # Unique routes so collisions with other files' `/ok`/`/boom` can't leak
+    # in; we still snapshot-then-delta because the InMemoryMetricReader is
+    # process-wide + cumulative (other test files emit into the same reader),
+    # so an absolute total would be order-dependent. The delta keeps the
+    # exactly-once-per-request property assertable regardless of collection
+    # order (pytest runs this test atomically — prior emits are in the
+    # baseline, later emits happen after the asserts).
     app = lancelot.App()
 
-    @app.get("/ok")
+    @app.get("/v31_ok")
     async def ok():
         return {"ok": True}
 
-    @app.get("/boom")
+    @app.get("/v31_boom")
     async def boom():
         raise RuntimeError("boom")  # → 500
 
+    _mine = {"/v31_ok", "/v31_boom"}
+
+    def _counts():
+        pts = _scoped(reader, "lancelot.http.requests", _mine)
+        total = sum(p.value for p in pts)
+        err = sum(p.value for p in pts
+                  if p.attributes.get("http.status_class") == "5xx")
+        ok_ct = sum(p.value for p in pts
+                    if p.attributes.get("http.status_class") == "2xx")
+        dur_count = sum(
+            p.count for p in
+            _scoped(reader, "lancelot.http.request.duration", _mine))
+        return total, err, ok_ct, dur_count
+
+    base = _counts()
+
     N = 200
     # Deterministic mix: 1 in 4 errors.
-    paths = ["/boom" if i % 4 == 0 else "/ok" for i in range(N)]
-    n_err = sum(p == "/boom" for p in paths)
+    paths = ["/v31_boom" if i % 4 == 0 else "/v31_ok" for i in range(N)]
+    n_err = sum(p == "/v31_boom" for p in paths)
 
     with TestClient(app, raise_server_exceptions=False) as c:
         def hit(p):
@@ -81,14 +124,7 @@ def test_v3_1_red_metrics_exact_under_concurrent_load():
     assert sum(c == 200 for c in codes) == N - n_err
     assert sum(c == 500 for c in codes) == n_err
 
-    pts = _counter_points(reader, "lancelot.http.requests")
-    total = sum(p.value for p in pts)
-    err = sum(p.value for p in pts
-              if p.attributes.get("http.status_class") == "5xx")
-    ok_ct = sum(p.value for p in pts
-                if p.attributes.get("http.status_class") == "2xx")
-    dur = _counter_points(reader, "lancelot.http.request.duration")
-    dur_count = sum(p.count for p in dur)
+    total, err, ok_ct, dur_count = (a - b for a, b in zip(_counts(), base))
 
     # Exactly once per request — no double-count, no lost errors.
     assert total == N, f"counter {total} != {N} requests"

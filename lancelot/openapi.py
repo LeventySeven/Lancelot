@@ -271,13 +271,26 @@ def components_schemas(app) -> dict:
     return {k: defs[k] for k in sorted(defs)}  # MUST-17 lexicographic
 
 
+def _resolve_operation_id(app, r) -> str:
+    # M15 T2 (#11) precedence: explicit per-route operation_id (verbatim) >
+    # the app-level generate_unique_id_function factory > the built-in
+    # MUST-32 formula. The first two were dead code before this milestone.
+    explicit = getattr(r, "operation_id", None)
+    if explicit:
+        return explicit
+    factory = getattr(app, "_generate_unique_id_function", None)
+    if factory is not None:
+        return factory(r)
+    return operation_id(r)
+
+
 def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
     paths: dict = {}
     sec_schemes: dict = {}  # route-iteration order, NOT sorted (deep/03 §3.1.8)
     for r in app.routes:
         if not getattr(r, "include_in_schema", True):
             continue  # FastAPI: /docs /redoc /openapi.json are not self-documented
-        op = {"summary": summary(r), "operationId": operation_id(r)}
+        op = {"summary": summary(r), "operationId": _resolve_operation_id(app, r)}
         ps = parameters_for(r)
         if ps:
             op["parameters"] = ps
@@ -292,6 +305,12 @@ def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
             ]  # MUST-14: first-seen order, NOT sorted
             for scheme, _ in sec:
                 sec_schemes.setdefault(scheme.scheme_name, scheme.model)
+        # M15 T2 (#11): shallow-merge the user's openapi_extra LAST so it can
+        # override any generated key (operationId, summary, …) or add vendor
+        # extensions (x-speakeasy-*, x-codeSamples). FastAPI-shape.
+        extra = getattr(r, "openapi_extra", None)
+        if extra:
+            op.update(extra)
         paths.setdefault(r.path, {})[r.method.lower()] = op
     doc = {  # MUST-28: wire key order = pydantic OpenAPI model field order
         "openapi": "3.1.0",

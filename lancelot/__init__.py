@@ -17,6 +17,7 @@ __all__ = [
     "Body", "Query", "Path", "Header", "Cookie", "Form", "File",
     "UploadFile",
     "HTTPException", "RequestValidationError",
+    "ProblemDetail", "retry_taxonomy",
     "WebSocketException", "WebSocketDisconnect", "WebSocket",
     "Response", "BackgroundTasks", "background",
     "StaticFiles",
@@ -42,6 +43,8 @@ _FASTAPI_COMPAT = {
     # Exceptions.
     "HTTPException":           ("lancelot.exceptions", "HTTPException"),
     "RequestValidationError":  ("lancelot.exceptions", "RequestValidationError"),
+    "ProblemDetail":           ("lancelot.exceptions", "ProblemDetail"),
+    "retry_taxonomy":          ("lancelot.exceptions", "retry_taxonomy"),
     "WebSocketException":      ("lancelot.exceptions", "WebSocketRequestValidationError"),
     # Responses.
     "Response":         ("lancelot.responses", "Response"),

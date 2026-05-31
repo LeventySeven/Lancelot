@@ -166,8 +166,10 @@ def test_v2_1_batch_multikey_fairness_keys_run_in_parallel():
 
 def test_v2_1_batch_max_keys_cap_under_key_flood():
     # A key-flood (many DISTINCT keys) must be bounded by max_keys — over-cap
-    # keys get a clean error, NOT an OOM. With max_keys=4 and 20 distinct keys,
-    # exactly 4 groups are created (4×200) and the rest are rejected (500s).
+    # keys get a clean SHED, NOT an OOM. With max_keys=4 and 20 distinct keys,
+    # exactly 4 groups are created (4×200) and the rest are shed with 503 +
+    # Retry-After (M15 T9 changed this from 500 — a transient back-pressure
+    # signal the client can retry, not a server bug).
     proc, port = _spawn_file(_BATCH_BENCH, {
         "LC_MAX_KEYS": "4", "LC_UPSTREAM_CAP": "1000", "LC_UPSTREAM_MS": "50",
         "LC_BATCH_WINDOW_MS": "30", "LC_MAX_BATCH": "100"})
@@ -176,13 +178,18 @@ def test_v2_1_batch_max_keys_cap_under_key_flood():
         keys = [f"k{i}" for i in range(20)]  # 20 distinct keys, 1 request each
 
         with cf.ThreadPoolExecutor(max_workers=20) as ex:
-            codes = list(ex.map(lambda k: _post(base, "/batch", {"k": k, "n": 1}).status_code, keys))
+            resps = list(ex.map(lambda k: _post(base, "/batch", {"k": k, "n": 1}), keys))
+        codes = [r.status_code for r in resps]
 
         n200 = sum(c == 200 for c in codes)
-        n500 = sum(c == 500 for c in codes)
-        # Cap enforced: only max_keys=4 groups created; the rest rejected.
+        n503 = sum(c == 503 for c in codes)
+        # Cap enforced: only max_keys=4 groups created; the rest shed (503).
         assert n200 == 4, f"max_keys not enforced: {n200} succeeded\n{codes}"
-        assert n500 == 16, codes
+        assert n503 == 16, codes
+        # The shed responses carry Retry-After (a sheddable load signal).
+        for r in resps:
+            if r.status_code == 503:
+                assert "retry-after" in {k.lower() for k in r.headers}
         # Server survived the key-flood and still serves.
         assert proc.poll() is None
         assert httpx.get(f"{base}/stats").status_code == 200

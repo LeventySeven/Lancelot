@@ -31,6 +31,7 @@ class App:
                  strict_content_type: bool = True,
                  dependencies: list | None = None,
                  json_max_depth: int = 128,
+                 cancel_on_disconnect: bool = False,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -50,7 +51,21 @@ class App:
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
+        # M15 T5 (#6-core): app-lifetime supervised daemons. Factories are
+        # registered via `app.lifetime_task(coro_fn)`; the lifespan-startup
+        # seam starts one task per factory and STRONG-refs it here (so it
+        # isn't GC'd mid-run); drain()/lifespan-shutdown cancels + awaits each
+        # bounded by the drain deadline.
+        self._lifetime_task_factories: list = []
+        self._lifetime_tasks: list = []
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
+        # M15 T2 (#11): FastAPI's per-app operationId factory. Was swallowed
+        # into _extra_kwargs and ignored; now consumed by build_openapi as the
+        # fallback when a route has no explicit operation_id. None = use the
+        # built-in MUST-32 formula. (kwargs is the same dict stored above, so
+        # popping here also removes it from _extra_kwargs.)
+        self._generate_unique_id_function = kwargs.pop(
+            "generate_unique_id_function", None)
         self._tools: dict = {}  # M2-P5: name → ToolSpec
         self._user_http_middleware: list = []  # @app.middleware("http") fns
         # @app.on_event("startup"/"shutdown") deprecated decorator handlers.
@@ -70,6 +85,11 @@ class App:
         # Same semantics as `APIRouter(dependencies=[])`: validation /
         # auth runs before the handler; the return value is discarded.
         self.dependencies: list = list(dependencies or [])
+        # M15 T6 (#1): App-wide default for client-disconnect→cancel on UNARY
+        # handlers. A route's own `cancel_on_disconnect=` (None=inherit) wins;
+        # this is the fallback. Default False — opting in is per-route or here,
+        # so the tiny fast path is never armed implicitly.
+        self.cancel_on_disconnect: bool = cancel_on_disconnect
         # Graceful-shutdown flag — flipped by lifespan_shutdown,
         # `app.initiate_shutdown()`, or `app.install_signal_handlers()`.
         # /readyz returns 503 + Retry-After while True so the LB stops
@@ -106,12 +126,90 @@ class App:
         self._mounts.append((prefix.rstrip("/"), app))
         self._asgi = None
 
+    def lifetime_task(self, coro_fn):
+        """M15 T5 (#6-core): register a coroutine FACTORY to run for the
+        lifetime of the app — a supervised background daemon (metrics flusher,
+        cache warmer, queue poller, heartbeat). `coro_fn` is called with no
+        args at lifespan startup; the resulting task is strong-referenced (so
+        it isn't GC'd) and, on graceful drain / lifespan shutdown, CANCELLED
+        and awaited bounded by the drain deadline (LANCELOT_DRAIN_SECS, else
+        `drain_timeout`), suppressing CancelledError — no orphan, no
+        "Task was destroyed" warning.
+
+        Lancelot owns the bounded-cancel-on-drain plumbing; the coroutine body
+        (what the daemon DOES) is the user's — positioning lock. Usable as a
+        decorator or a direct call:
+
+            @app.lifetime_task
+            async def flush_metrics():
+                while True:
+                    await push(); await asyncio.sleep(5)
+
+        Returns `coro_fn` unchanged so it composes as a decorator."""
+        if not callable(coro_fn):
+            raise TypeError(
+                "app.lifetime_task expects a zero-arg coroutine FUNCTION "
+                f"(called at startup), got {coro_fn!r}")
+        self._lifetime_task_factories.append(coro_fn)
+        return coro_fn
+
+    def _start_lifetime_tasks(self) -> None:
+        """Start one asyncio task per registered factory (called from the
+        lifespan-startup seam). Idempotent: re-entry won't double-start while
+        tasks are already live."""
+        import asyncio
+
+        if self._lifetime_tasks:
+            return
+        for fn in self._lifetime_task_factories:
+            self._lifetime_tasks.append(asyncio.ensure_future(fn()))
+
+    async def _drain_lifetime_tasks(self, timeout: float | None = None) -> None:
+        """Cancel every running lifetime task and await it, bounded by the
+        drain deadline so a daemon ignoring CancelledError can't wedge
+        shutdown. CancelledError is suppressed (expected); any other exception
+        from the daemon's teardown is swallowed (we're already shutting down).
+        Mirrors the graceful-teardown discipline in `serve()`."""
+        import asyncio
+
+        tasks = [t for t in self._lifetime_tasks if not t.done()]
+        # Also surface (and discard) results of already-finished tasks so a
+        # crashed daemon doesn't leave an un-retrieved exception warning.
+        for t in self._lifetime_tasks:
+            if t.done() and not t.cancelled():
+                try:
+                    t.exception()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._lifetime_tasks = []
+        if not tasks:
+            return
+        for t in tasks:
+            t.cancel()
+        deadline = (timeout if timeout is not None
+                    else _resolve_drain_secs(self._drain_timeout))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=max(deadline, 0.0))
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            # Bound exceeded (a daemon swallowing CancelledError) — proceed;
+            # the loop teardown / process exit reclaims it. Don't wedge.
+            pass
+
     def run(self, host: str | None = None, port: int | None = None) -> None:
         """Serve on the native Rust server. host/port default from env
         (LANCELOT_HOST, PORT/LANCELOT_PORT) so `CMD ["python","app.py"]` with
         a trailing `app.run()` deploys cleanly on any PaaS — set
         LANCELOT_HOST=0.0.0.0 in the container. For the FastAPI-parity path
-        (works on every ASGI platform) run `uvicorn yourmod:app` instead."""
+        (works on every ASGI platform) run `uvicorn yourmod:app` instead.
+
+        LIFECYCLE CAVEAT: the native server runs route handlers and drains
+        in-flight connections on SIGTERM, but does NOT drive the ASGI lifespan
+        protocol. `lifespan=`, `@app.on_event`, `@app.lifetime_task`, and
+        mounted sub-app lifespans run ONLY under an ASGI server (uvicorn /
+        hypercorn). If you need startup/shutdown hooks or supervised daemons,
+        deploy under uvicorn."""
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
@@ -278,13 +376,29 @@ class App:
 
     def batch(self, path: str, *, batch_window_ms: int = 50,
               max_batch: int = 16, max_keys: int = 1024,
-              key=None, **route_kwargs):
+              key=None, size_fn=None, max_size: int = 0,
+              **route_kwargs):
         """Tier-C.C5 (marquee): prefix-aware request grouping for AI
         workloads. The HTTP route accepts ONE payload per request; the
         wrapped handler receives a `list[Payload]` containing every
         request that arrived during `batch_window_ms` (or up to
         `max_batch`, whichever fires first). The framework fans the
         handler's `list[Result]` back to each waiter by index.
+
+        M15 T9 budget knobs:
+          - `size_fn(items: list) -> int` + `max_size`: when set, the
+            flush trigger is a byte/token BUDGET — a batch fires when
+            `size_fn(pending) >= max_size`, in ADDITION to the `max_batch`
+            COUNT trigger (so you can cap an upstream call by total bytes
+            or tokens, not just request count). An item that would push a
+            non-empty batch over `max_size` is DEFERRED to the next batch
+            (the current pending flushes first); a lone item that exceeds
+            the budget is still processed by itself. `size_fn` is your
+            callable — Lancelot ships no tokenizer (AI logic stays
+            user-side). Leave both unset for pure count-based batching.
+          - `max_keys` hit (too many distinct key-values) now sheds with
+            503 + Retry-After (a transient back-pressure signal the client
+            can retry), not a 500.
 
         Surface:
             @app.batch("/chat", batch_window_ms=50, max_batch=10,
@@ -327,7 +441,8 @@ class App:
             item_T = _typing.get_args(list_ann)[0]
 
             registry = _BatchRegistry(fn, window_s, max_batch, key,
-                                      max_keys=max_keys)
+                                      max_keys=max_keys, size_fn=size_fn,
+                                      max_size=max_size)
 
             # Synthesize an HTTP-level handler with one-payload signature.
             # The body name `item` becomes the JSON-body field; matches
@@ -357,7 +472,8 @@ class App:
         return deco
 
     def stream(self, path: str, *, stream_interval: int = 1,
-               sse_keepalive: float = 15.0, **kwargs):
+               sse_keepalive: float = 15.0, sse: bool = False,
+               done_sentinel: str | None = "[DONE]", **kwargs):
         """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
         an async generator yielding `lancelot.stream.Event` items; the
         framework owns SSE framing + cancellation propagation.
@@ -368,7 +484,19 @@ class App:
 
         `sse_keepalive` (default 15.0 s): emit an SSE comment line on idle
         so CDNs / nginx / browsers don't time out during slow LLM streams.
-        Set to None or 0 to disable (not recommended)."""
+        Set to None or 0 to disable (not recommended).
+
+        M15 T7: `sse=True` turns on SSE-of-models framing — a yielded
+        Pydantic model / dict is framed as one `data: <pydantic-core
+        json>\\n\\n` frame (an EventSource client parses this; a bare JSON
+        line it does not), and on clean exhaustion a terminal
+        `data: <done_sentinel>\\n\\n` is auto-emitted (default `[DONE]`,
+        the OpenAI-streaming convention; pass `done_sentinel=None` to
+        disable). `Event`/`bytes`/`str` yields stay BYTE-IDENTICAL — only
+        the bare-model path and the EOF sentinel change. The framing is
+        done by `lancelot.stream.sse_adapter` (a Python wrapper that emits
+        already-framed bytes), so the uvicorn ASGI seam AND the native R3
+        pump produce identical bytes with the R3 pump untouched."""
         import dataclasses as _dc
 
         known = {f.name for f in _dc.fields(Route)}
@@ -378,7 +506,23 @@ class App:
         kw["sse_keepalive"] = sse_keepalive
 
         def deco(fn):
-            self.router.add(Route("GET", path, fn, **kw))
+            handler = fn
+            if sse:
+                # Wrap the user async generator so each call returns an
+                # SSE-of-models stream (model -> data:<json>\n\n, plus the
+                # [DONE] sentinel on clean exhaustion). The wrapper is the
+                # registered handler, so BOTH transports (uvicorn ASGI seam +
+                # native _native.run, which passes r.handler straight through)
+                # get the same framed bytes. functools.wraps preserves the
+                # async-gen identity the seams introspect.
+                import functools as _ft
+                from lancelot.stream import sse_adapter
+
+                @_ft.wraps(fn)
+                def handler(*a, _fn=fn, **kw2):  # noqa: ANN001
+                    return sse_adapter(_fn(*a, **kw2), done_sentinel=done_sentinel)
+
+            self.router.add(Route("GET", path, handler, **kw))
             return fn
 
         return deco
@@ -419,6 +563,43 @@ class App:
         kw = {k: v for k, v in kwargs.items() if k in known}
         for m in (methods or ["GET"]):
             self.router.add(Route(m.upper(), path, endpoint, **kw))
+
+    # --- M15 T12: live route add/remove (Python/uvicorn ASGI tier) ---------
+    #
+    # NOTE ON SCOPE (binding decision): live route mutation applies to the
+    # Python/dynamic (uvicorn) serving path ONLY. The native `_native.run`
+    # server (`lancelot.run` / `App.run`) builds its Rust router + prebaked
+    # const tier ONCE at startup from `app.routes` and owns them for the
+    # process lifetime — there is no post-startup FFI handle to mutate that
+    # router or the prebaked `service::Prebaked` set, and that server is a
+    # fixed-route multiprocess deploy by design (Batches 2 & 4 confirmed it
+    # doesn't even run lifespan/DI). So a route added/removed AFTER the
+    # native server has started is NOT reflected on it. Mutate the app BEFORE
+    # `run()`, or deploy under uvicorn (`app.asgi()`) where these take effect
+    # immediately. (The Rust `Router::remove` exists + is unit-tested for
+    # completeness, but is not wired to a running-server mutation path.)
+    def add_route_live(self, path: str, endpoint, *, methods=None, **kwargs):
+        """Register a route at runtime (uvicorn/ASGI tier) and invalidate the
+        memoized OpenAPI schema so `/openapi.json` reflects it. Same kwargs as
+        `add_api_route`; default methods=['GET']. See the scope note above —
+        this does NOT affect an already-running native `run()` server."""
+        self.add_api_route(path, endpoint, methods=methods, **kwargs)
+        self._openapi_cache = None  # rebuild on next /openapi.json access
+
+    def remove_route(self, path: str, method: str | None = None) -> int:
+        """Remove route(s) at runtime from EVERY routing tier (the O(1) const
+        tier, the regex tier, and `app.routes`) and invalidate the memoized
+        OpenAPI schema. Returns the number of routes removed. `method=None`
+        removes every method (incl. WebSocket) registered on `path`.
+
+        Evicting from all tiers is the correctness point: dropping only from
+        `app.routes` would leave a stale const-tier hit serving a dead route.
+        See the scope note above — this does NOT affect an already-running
+        native `run()` server (its router is built once at startup)."""
+        n = self.router.remove(path, method)
+        if n:
+            self._openapi_cache = None  # rebuild on next /openapi.json access
+        return n
 
     def get(self, p, **kw): return self._add("GET", p, **kw)
     def post(self, p, **kw): return self._add("POST", p, **kw)
@@ -584,19 +765,27 @@ class App:
 
     async def drain(self, timeout: float | None = None) -> bool:
         """Wait until all in-flight requests have completed (or `timeout`
-        seconds, whichever is first). Returns True if the drain succeeded
-        in time. Caller is responsible for `initiate_shutdown()` first."""
+        seconds, whichever is first), THEN cancel + await app-lifetime
+        daemons (M15 T5) bounded by the same deadline. Returns True if the
+        in-flight drain succeeded in time. Caller is responsible for
+        `initiate_shutdown()` first."""
         import asyncio
 
         deadline = (timeout if timeout is not None else self._drain_timeout)
         _loop = asyncio.get_running_loop()  # async ctx → always present (no deprecation)
         end = _loop.time() + max(deadline, 0.0)
+        ok = True
         while self._active_requests > 0:
             remaining = end - _loop.time()
             if remaining <= 0:
-                return False
+                ok = False
+                break
             await asyncio.sleep(min(0.05, remaining))
-        return True
+        # M15 T5: stop app-owned daemons (cancel + bounded await). Use the
+        # remaining budget so the whole drain stays inside `deadline`.
+        remaining = max(end - _loop.time(), 0.0)
+        await self._drain_lifetime_tasks(timeout=remaining)
+        return ok
 
     def install_signal_handlers(self) -> bool:
         """Best-effort SIGTERM / SIGINT wiring on the running event loop.
@@ -640,6 +829,23 @@ class App:
 
 # M0 compatibility: `lancelot.Lancelot` + `lancelot.run` keep working.
 Lancelot = App
+
+
+def _resolve_drain_secs(fallback: float) -> float:
+    """M15 T5: graceful-drain deadline for app-lifetime daemons. Honors the
+    SAME `LANCELOT_DRAIN_SECS` env knob the Rust server reads (one knob, one
+    meaning across the deployable paths); falls back to the app's
+    `drain_timeout`. Invalid/negative → fallback."""
+    import os
+
+    raw = os.environ.get("LANCELOT_DRAIN_SECS")
+    if raw is None:
+        return fallback
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return v if v >= 0 else fallback
 
 
 def _resolve_bind(host, port):

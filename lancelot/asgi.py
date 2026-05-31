@@ -84,6 +84,13 @@ def build_asgi(app):
                     sub_scope = dict(scope)
                     sub_scope["path"] = sub_path
                     sub_scope["raw_path"] = sub_path.encode()
+                    # M15 T4 (#3): propagate root_path = the stripped mount
+                    # prefix (ASGI spec) so the sub-app emits correct ABSOLUTE
+                    # URLs — its /openapi.json `servers` URL + url_path_for
+                    # reflect where it's actually mounted. Nested mounts
+                    # ACCUMULATE: a sub-app mounted under a sub-app sees the
+                    # full prefix chain (Starlette/FastAPI parity).
+                    sub_scope["root_path"] = scope.get("root_path", "") + mp
                     sub_scope.setdefault("app", _AppProxy(app))
                     await sub(sub_scope, receive, send)
                     return
@@ -98,7 +105,96 @@ def build_asgi(app):
     return asgi
 
 
+def _sub_lifespan_cm(sub):
+    """M15 T4 (#3): an `@asynccontextmanager` that runs a mounted sub-app's
+    lifespan. We drive the ASGI `lifespan` protocol against the sub-app
+    callable directly (via an in-memory channel) — this is the ONE shape that
+    works for any ASGI-compliant sub-app: a Lancelot `App` (its `__call__`
+    handles a `lifespan` scope), Starlette/FastAPI (their router runs
+    `lifespan_context`), or a hand-rolled ASGI app. `__aenter__` raises if the
+    sub-app reports `lifespan.startup.failed`, so an `AsyncExitStack` unwinds
+    only the sub-apps already entered (partial-startup safety)."""
+    import contextlib as _cl
+
+    @_cl.asynccontextmanager
+    async def _runner():
+        import asyncio as _aio
+
+        to_app: _aio.Queue = _aio.Queue()    # events the SERVER sends the app
+        from_app: _aio.Queue = _aio.Queue()  # events the APP sends the server
+
+        async def _recv():
+            return await to_app.get()
+
+        async def _send(msg):
+            await from_app.put(msg)
+
+        scope = {"type": "lifespan", "asgi": {"version": "3.0"}}
+        task = _aio.ensure_future(sub(scope, _recv, _send))
+
+        async def _drive(kind):
+            # Send one lifespan.<kind> and await the matching complete/failed.
+            # An app that doesn't speak lifespan returns (or raises) out of its
+            # callable WITHOUT acking — per the ASGI spec, a lifespan-aware app
+            # ALWAYS reports failure via a `lifespan.<kind>.failed` MESSAGE, so
+            # a raw exception out of the callable means "lifespan unsupported"
+            # and is benign (this is exactly uvicorn's behavior). A genuine
+            # sub-app startup failure therefore arrives as the `.failed` ack
+            # below and IS surfaced (→ partial-startup unwind).
+            if task.done():
+                return  # already exited (e.g. unsupported on a prior drive)
+            await to_app.put({"type": f"lifespan.{kind}"})
+            getter = _aio.ensure_future(from_app.get())
+            done, _ = await _aio.wait(
+                {getter, task}, return_when=_aio.FIRST_COMPLETED)
+            if getter in done:
+                ack = getter.result()
+                if ack.get("type") == f"lifespan.{kind}.failed":
+                    raise RuntimeError(
+                        "mounted sub-app lifespan."
+                        f"{kind} failed: {ack.get('message', '')[:2000]}")
+                return
+            # The task returned without acking → lifespan unsupported; swallow
+            # any exception (the app simply doesn't implement the protocol).
+            getter.cancel()
+            try:
+                task.result()
+            except Exception:  # noqa: BLE001 - unsupported-lifespan signal
+                pass
+
+        await _drive("startup")
+        try:
+            yield
+        finally:
+            # Best-effort graceful shutdown of the sub-app, then make sure its
+            # driver task is finalized (no orphan / "Task was destroyed").
+            try:
+                if not task.done():
+                    await _drive("shutdown")
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (_aio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+
+    return _runner()
+
+
+async def _enter_mounts(app, stack):
+    """Enter every mounted sub-app's lifespan onto `stack` (LIFO teardown).
+    A sub-app exposes a lifespan via the ASGI `lifespan` protocol (driven by
+    `_sub_lifespan_cm`). Apps without lifespan support are harmless no-ops.
+    On a sub-app startup failure the exception propagates; `stack` (an
+    AsyncExitStack) then unwinds only the sub-apps already entered."""
+    for _mp, _sub in getattr(app, "_mounts", ()):
+        await stack.enter_async_context(_sub_lifespan_cm(_sub))
+
+
 async def _lifespan(app, receive, send):
+    import contextlib as _cl_ls
+
     async def _run_on_event(kind):
         # FastAPI on_event decorator handlers — startup runs all at
         # startup-complete time; shutdown at shutdown-complete time.
@@ -111,23 +207,52 @@ async def _lifespan(app, receive, send):
                 await r
 
     if app._lifespan is None:
+        # M15 T4: even with no root lifespan, mounted sub-apps may have one —
+        # drive them on a stack so startup/shutdown still run + tear down LIFO.
+        _mount_stack = _cl_ls.AsyncExitStack()
         # Still honor the protocol (Starlette TestClient drives it).
         while True:
             msg = await receive()
             if msg["type"] == "lifespan.startup":
-                await _run_on_event("startup")
+                try:
+                    await _run_on_event("startup")
+                    await _enter_mounts(app, _mount_stack)
+                    app._start_lifetime_tasks()  # M15 T5
+                except BaseException:  # noqa: BLE001 - report per ASGI spec
+                    import traceback
+                    await app._drain_lifetime_tasks()
+                    await _mount_stack.aclose()  # unwind any entered sub-apps
+                    await send({"type": "lifespan.startup.failed",
+                                "message": traceback.format_exc()})
+                    return
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
-                await _run_on_event("shutdown")
+                try:
+                    # M15 T5: stop app-owned daemons FIRST (cancel + bounded
+                    # await), then tear down sub-apps (LIFO), then on_event.
+                    await app._drain_lifetime_tasks()
+                    await _mount_stack.aclose()  # sub-apps tear down (LIFO)
+                    await _run_on_event("shutdown")
+                except BaseException:  # noqa: BLE001
+                    import traceback
+                    await send({"type": "lifespan.shutdown.failed",
+                                "message": traceback.format_exc()})
+                    return
                 # Same rationale as above: do not auto-flip on lifespan.
                 await send({"type": "lifespan.shutdown.complete"})
                 return
     cm = app._lifespan(app)
+    # M15 T4: mounted sub-app lifespans enter AFTER the root app's lifespan
+    # (so the root's resources exist when a sub-app starts) and tear down
+    # BEFORE it (LIFO) — the AsyncExitStack guarantees both.
+    _mount_stack = _cl_ls.AsyncExitStack()
     while True:
         msg = await receive()
         if msg["type"] == "lifespan.startup":
             try:
                 await cm.__aenter__()
+                await _enter_mounts(app, _mount_stack)
+                app._start_lifetime_tasks()  # M15 T5
             except BaseException:  # noqa: BLE001 - report per ASGI spec
                 # OPS1: send the FULL traceback (not repr) so the ASGI server
                 # logs a real stack and the operator can diagnose the crash —
@@ -136,6 +261,11 @@ async def _lifespan(app, receive, send):
                 # test_startup_exception_is_failfast_not_swallowed) — the
                 # traceback rides in the protocol message, which uvicorn logs.
                 import traceback
+                # Unwind any sub-apps that DID enter before re-reporting; the
+                # root cm only unwinds if its OWN __aenter__ completed (a
+                # raising __aenter__ leaves nothing to exit).
+                await app._drain_lifetime_tasks()
+                await _mount_stack.aclose()
                 await send({"type": "lifespan.startup.failed",
                             "message": traceback.format_exc()})
                 return
@@ -149,6 +279,11 @@ async def _lifespan(app, receive, send):
             # or `app.install_signal_handlers()`. The lifespan hook just
             # invokes user shutdown code.
             try:
+                # M15 T5 + T4 teardown order: stop app-owned daemons FIRST
+                # (cancel + bounded await), then mounted sub-apps (LIFO — they
+                # started after the root), then the root app's lifespan.
+                await app._drain_lifetime_tasks()
+                await _mount_stack.aclose()
                 await cm.__aexit__(None, None, None)
             except BaseException:  # noqa: BLE001
                 import traceback
@@ -213,28 +348,9 @@ async def _http(app, scope, receive, send):
     # else a fresh internal UUID4. traceparent: a valid W3C header exposes its
     # trace-id via context.trace_id and is forwarded by TransportPool onto
     # outbound LLM calls (the AI request joins the same distributed trace).
-    from lancelot.context import (request_id as _rid_var, new_request_id,
-                                  trace_id as _tid_var, trace_parent as _tp_var,
-                                  parse_traceparent)
-
-    _rid = None
-    _rid_from_client = False
-    _tp_raw = None
-    for _hk, _hv in scope.get("headers", []):
-        if _rid is None and _hk in (b"x-request-id", b"x-correlation-id"):
-            # SECURITY: we echo this back — strip CR/LF/NUL (response-header
-            # smuggling) and bound the length so a tiny client can't cost a
-            # huge header.
-            _cleaned = (_hv.decode("ascii", "ignore").replace("\r", "")
-                        .replace("\n", "").replace("\x00", ""))[:128]
-            if _cleaned:
-                _rid = _cleaned
-                _rid_from_client = True
-        elif _tp_raw is None and _hk == b"traceparent":
-            _tp_raw = _hv.decode("ascii", "ignore")
-    if not _rid:
-        _rid = new_request_id()
-    _tid = parse_traceparent(_tp_raw) if _tp_raw else None
+    # M15 T10: the scan + set/reset are factored into shared helpers so the
+    # WebSocket seam uses the EXACT same logic (no drift).
+    _rid, _rid_from_client, _tp_raw, _tid = _scan_request_context(scope)
 
     # Tier-B.B1+B4+B2: in-flight counter + RED in-flight gauge + duration clock.
     import time as _time
@@ -281,10 +397,8 @@ async def _http(app, scope, receive, send):
     try:
         app._active_requests += 1
         in_flight_delta(1)
-        _rid_token = _rid_var.set(_rid)
-        if _tid:
-            _tid_token = _tid_var.set(_tid)
-            _tp_token = _tp_var.set(_tp_raw.strip().lower())
+        _rid_token, _tid_token, _tp_token = _set_request_context(
+            _rid, _tid, _tp_raw)
         await _http_dispatch(app, scope, receive, send_with_rid)
     finally:
         app._active_requests -= 1
@@ -307,21 +421,86 @@ async def _http(app, scope, receive, send):
             except Exception:  # noqa: BLE001
                 _cost, _tenant, _qw = 0.0, "-", 0.0
 
-            record_request(path, method, _final_status_holder[0],
+            # M15 T1 (#2): the metric label is the route TEMPLATE (stashed by
+            # _http_dispatch at the match site) or a bounded sentinel for the
+            # 404/405 no-match paths — never the concrete URL `path` (which
+            # would blow up cardinality for parameterized + sprayed routes).
+            # `__unmatched__` is a belt-and-suspenders default for any exit
+            # path that didn't reach the match site (e.g. the draining 503).
+            _route_label = scope.get("_lancelot_route") or "__unmatched__"
+            record_request(_route_label, method, _final_status_holder[0],
                            _time.perf_counter() - _t0,
                            tenant=_tenant, cost_usd=_cost,
                            queue_wait_ms=_qw)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            if _rid_token is not None:
-                _rid_var.reset(_rid_token)
-            if _tid_token is not None:
-                _tid_var.reset(_tid_token)
-            if _tp_token is not None:
-                _tp_var.reset(_tp_token)
-        except Exception:  # noqa: BLE001
-            pass
+        _reset_request_context((_rid_token, _tid_token, _tp_token))
+
+
+def _scan_request_context(scope):
+    """Scan an ASGI scope's headers ONCE for the request-correlation inputs
+    Lancelot threads through ContextVars: the request-id (from
+    `X-Request-ID` / `X-Correlation-ID`, CR/LF/NUL-scrubbed + length-bounded
+    because we echo it) and the W3C `traceparent`. Mints a fresh request-id
+    when the client sent none. Returns `(rid, rid_from_client, tp_raw, tid)`.
+
+    Factored out of `_http` (M15 T10) so the WebSocket seam can share the
+    EXACT same scan — a WS connection then gets the same request-id echo +
+    traceparent propagation the HTTP path already has, with no drift."""
+    from lancelot.context import new_request_id, parse_traceparent
+
+    rid = None
+    rid_from_client = False
+    tp_raw = None
+    for hk, hv in scope.get("headers", []):
+        if rid is None and hk in (b"x-request-id", b"x-correlation-id"):
+            cleaned = (hv.decode("ascii", "ignore").replace("\r", "")
+                       .replace("\n", "").replace("\x00", ""))[:128]
+            if cleaned:
+                rid = cleaned
+                rid_from_client = True
+        elif tp_raw is None and hk == b"traceparent":
+            tp_raw = hv.decode("ascii", "ignore")
+    if not rid:
+        rid = new_request_id()
+    tid = parse_traceparent(tp_raw) if tp_raw else None
+    return rid, rid_from_client, tp_raw, tid
+
+
+def _set_request_context(rid, tid, tp_raw):
+    """Set the request-correlation ContextVars and return the reset tokens
+    `(rid_token, tid_token, tp_token)` (the latter two `None` when there's
+    no valid trace context). Caller MUST pass these to
+    `_reset_request_context` in a `finally` so nothing leaks across requests
+    / connections (M15 T10). Mirrors the set in `_http`."""
+    from lancelot.context import (request_id as _rid_var,
+                                  trace_id as _tid_var,
+                                  trace_parent as _tp_var)
+    rid_token = _rid_var.set(rid)
+    tid_token = tp_token = None
+    if tid:
+        tid_token = _tid_var.set(tid)
+        tp_token = _tp_var.set(tp_raw.strip().lower())
+    return rid_token, tid_token, tp_token
+
+
+def _reset_request_context(tokens):
+    """Reset the ContextVars set by `_set_request_context`. Token-based reset
+    (not blanket re-set to the default) so nested contexts restore correctly.
+    Fail-safe: a bad token never escapes the seam."""
+    from lancelot.context import (request_id as _rid_var,
+                                  trace_id as _tid_var,
+                                  trace_parent as _tp_var)
+    rid_token, tid_token, tp_token = tokens
+    try:
+        if rid_token is not None:
+            _rid_var.reset(rid_token)
+        if tid_token is not None:
+            _tid_var.reset(tid_token)
+        if tp_token is not None:
+            _tp_var.reset(tp_token)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stream_chunk_bytes(ev):
@@ -343,6 +522,70 @@ def _stream_chunk_bytes(ev):
     return (_json.dumps(ev, separators=(",", ":"), default=str) + "\n").encode("utf-8")
 
 
+async def _watch_disconnect(receive, cancel_event):
+    """C2 (validated under load — M4): poll receive() for `http.disconnect`
+    and set `cancel_event` the moment the client leaves.
+
+    Factored out of the `@app.stream` branch (M15 T6) so BOTH the streaming
+    path and the new UNARY cancel-on-disconnect path share ONE watcher. The
+    body has already been fully drained by the seam before either path arms
+    this, so the only event this ever sees is `http.disconnect` (there are no
+    more body chunks to steal).
+
+    Catches BaseException (incl. CancelledError AND any server-adapter
+    receive() error): stop watching CLEANLY, never leave an unretrieved task
+    exception (audit MED-1). The task then completes normally so a later
+    `.cancel()` is a harmless no-op.
+    """
+    try:
+        while True:
+            m = await receive()
+            if m.get("type") == "http.disconnect":
+                cancel_event.set()
+                return
+    except BaseException:  # noqa: BLE001
+        return
+
+
+async def _race_handler_vs_disconnect(coro, cancel_event):
+    """Await `coro` (the unary handler call), but if `cancel_event` fires
+    first (the client disconnected), CANCEL the handler task and raise
+    asyncio.CancelledError — which propagates out of the `async with
+    solve_async(...)` body so the yield-dependency AsyncExitStack tears down
+    with the real exc_info (DB-rollback / file-close still runs — B4).
+
+    This is the same FIRST_COMPLETED dual-task shape as
+    `TransportPool._await_cancellable` (lancelot/llm.py), re-implemented as a
+    free function HERE so the UNARY hot path never imports `lancelot.llm`
+    (which pulls httpx — cardinal rule #3: a non-LLM unary route must not drag
+    in the HTTP client just to be cancellable).
+    """
+    import asyncio as _aio
+
+    task = _aio.ensure_future(coro)
+    wait_event = _aio.ensure_future(cancel_event.wait())
+    try:
+        done, _pending = await _aio.wait(
+            {task, wait_event}, return_when=_aio.FIRST_COMPLETED)
+        if task in done:
+            # Handler finished first — drop the waiter, return its result
+            # (or re-raise the handler's exception).
+            wait_event.cancel()
+            return task.result()
+        # Disconnect fired first — cancel the handler and propagate.
+        task.cancel()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 - swallow; we re-raise Cancelled below
+            pass
+        raise _aio.CancelledError("client disconnected; handler cancelled")
+    finally:
+        if not task.done():
+            task.cancel()
+        if not wait_event.done():
+            wait_event.cancel()
+
+
 async def _http_dispatch(app, scope, receive, send):
     """The original `_http` body, factored out so the wrapper above can
     own the per-request lifecycle (counter, request-id, RED metrics)
@@ -355,8 +598,18 @@ async def _http_dispatch(app, scope, receive, send):
     scope.setdefault("app", _AppProxy(app))
 
     route, info = app.router.match(method, path)
+    # M15 T1 (#2): record the route TEMPLATE (e.g. `/items/{id}`), NOT the
+    # concrete URL (`/items/42`), as the `http.route` metric label — else a
+    # path-parameterized route explodes metric cardinality (one time-series
+    # per id). The `_http` finally reads this back; bounded sentinels are
+    # stashed on the no-match (404/405) paths below so a URL-spraying scanner
+    # can't blow up cardinality on the not-found path either.
+    if route is not None:
+        scope["_lancelot_route"] = route.path
     if route is None:
         status = info  # 404 or 405
+        scope["_lancelot_route"] = (
+            "__not_found__" if status == 404 else "__method_not_allowed__")
         # FastAPI redirect_slashes (default True): on 404, if the toggled-
         # slash path matches a route, return 307 to that path. Disabling
         # via `FastAPI(redirect_slashes=False)` keeps the 404.
@@ -406,6 +659,7 @@ async def _http_dispatch(app, scope, receive, send):
 
     from urllib.parse import parse_qs
 
+    from lancelot.batch import BatchOverloadError
     from lancelot.di import solve_async
     from lancelot.exceptions import HTTPException
     from lancelot.pool import PoolFull, get_pool
@@ -668,21 +922,10 @@ async def _http_dispatch(app, scope, receive, send):
                 # disconnect during the handler await, so it was only noticed
                 # when a send failed — i.e. AFTER the upstream had already
                 # completed (the user paid for tokens nobody was watching).
-                async def _watch_disconnect():
-                    # Catch BaseException (incl. CancelledError AND any server-
-                    # adapter receive() error): stop watching CLEANLY, never
-                    # leave an unretrieved task exception (audit MED-1). The task
-                    # then completes normally so the `finally` cancel is a no-op.
-                    try:
-                        while True:
-                            m = await receive()
-                            if m.get("type") == "http.disconnect":
-                                lreq._cancel_event.set()
-                                return
-                    except BaseException:  # noqa: BLE001
-                        return
-
-                _disc_watch = _asyncio.ensure_future(_watch_disconnect())
+                # M15 T6: the watcher is now the shared module-level helper
+                # (also used by the unary cancel_on_disconnect path).
+                _disc_watch = _asyncio.ensure_future(
+                    _watch_disconnect(receive, lreq._cancel_event))
                 gen = route.handler(**kwargs)
                 await send({"type": "http.response.start", "status": 200,
                             "headers": [
@@ -746,8 +989,13 @@ async def _http_dispatch(app, scope, receive, send):
                                 from lancelot.metrics import record_stream_ttft
                                 _st = scope.get("_lancelot_t0")
                                 if _st is not None:
+                                    # M15 T1 (#2): TTFT twin — same cardinality
+                                    # fix as record_request. Use the route
+                                    # TEMPLATE (a streaming route is always
+                                    # matched, so the stash is set), not `path`.
                                     record_stream_ttft(
-                                        path, method,
+                                        scope.get("_lancelot_route") or path,
+                                        method,
                                         _time.perf_counter() - _st)
                             except Exception:  # noqa: BLE001
                                 pass
@@ -847,35 +1095,83 @@ async def _http_dispatch(app, scope, receive, send):
             import asyncio as _asyncio_timeout
             _to = route.timeout
 
-            if _isp_local.isasyncgenfunction(route.handler) or \
-                    _isp_local.isgeneratorfunction(route.handler):
-                result = route.handler(**kwargs)
-            elif route.plan.is_async:
-                if _to is not None:
-                    try:
-                        result = await _asyncio_timeout.wait_for(
+            # M15 T6 (#1): UNARY client-disconnect→cancel. Resolve the
+            # effective flag: the route's own `cancel_on_disconnect`
+            # (None=inherit) wins over the App-level default. Resolved HERE
+            # (not at registration) so it's correct for EVERY registration
+            # path (decorators, api_route, add_api_route, include_router,
+            # raw Route(...)). FAST-PATH GUARANTEE: when the flag is False
+            # (the default) NOTHING below runs — no _cancel_event, no
+            # receive()-polling watcher, no extra task — so the tiny one-shot
+            # handler path pays zero (the shape closest to Starlette+uvloop).
+            _cancel_on_disc = route.cancel_on_disconnect
+            if _cancel_on_disc is None:
+                _cancel_on_disc = getattr(app, "cancel_on_disconnect", False)
+            # Only async / timeout='d handlers can be meaningfully cancelled
+            # mid-await; a plain sync handler with no timeout runs to
+            # completion on the offload pool regardless (a CancelledError on
+            # the future can't interrupt the OS thread — same limit the
+            # timeout path has). Arm the watcher only when there's an await to
+            # race against.
+            _arm_disc = bool(_cancel_on_disc) and (
+                route.plan.is_async or _to is not None) and not (
+                _isp_local.isasyncgenfunction(route.handler)
+                or _isp_local.isgeneratorfunction(route.handler))
+
+            _disc_watch_unary = None
+            if _arm_disc:
+                lreq._cancel_event = _asyncio_timeout.Event()
+                _disc_watch_unary = _asyncio_timeout.ensure_future(
+                    _watch_disconnect(receive, lreq._cancel_event))
+
+            async def _call_handler():
+                # Build the inner awaitable (async direct, or sync→offload),
+                # honoring per-route timeout=. A TimeoutError here is mapped
+                # to 504 by the caller; otherwise the (possibly cancelled)
+                # result/exception propagates.
+                if route.plan.is_async:
+                    if _to is not None:
+                        return await _asyncio_timeout.wait_for(
                             route.handler(**kwargs), timeout=_to)
-                    except _asyncio_timeout.TimeoutError:
-                        await _send_json(send, 504,
-                                         b'{"detail":"Request timeout"}')
-                        sent = True
-                        return
-                else:
-                    result = await route.handler(**kwargs)
-            else:
+                    return await route.handler(**kwargs)
                 if _to is not None:
-                    try:
-                        result = await _asyncio_timeout.wait_for(
-                            get_pool().offload(route.handler, **kwargs),
-                            timeout=_to)
-                    except _asyncio_timeout.TimeoutError:
-                        await _send_json(send, 504,
-                                         b'{"detail":"Request timeout"}')
-                        sent = True
-                        return
+                    return await _asyncio_timeout.wait_for(
+                        get_pool().offload(route.handler, **kwargs),
+                        timeout=_to)
+                return await get_pool().offload(route.handler, **kwargs)
+
+            try:
+                if _isp_local.isasyncgenfunction(route.handler) or \
+                        _isp_local.isgeneratorfunction(route.handler):
+                    # Async/sync-generator handler: returned un-awaited (the
+                    # StreamingResponse auto-wrap below owns its iteration +
+                    # per-chunk cancellation via request.cancelled). Never
+                    # raced here — there's no in-line await to cancel.
+                    result = route.handler(**kwargs)
+                elif _arm_disc:
+                    # Race the handler against the client disconnect. On a
+                    # hard close the handler task is cancelled and
+                    # CancelledError propagates OUT of `async with
+                    # solve_async(...)` → its `except BaseException` feeds the
+                    # real exc_info into every yield-dep's __aexit__ (DB
+                    # rollback / file-close STILL runs — B4 preserved, exactly
+                    # like the timeout path).
+                    result = await _race_handler_vs_disconnect(
+                        _call_handler(), lreq._cancel_event)
                 else:
-                    result = await get_pool().offload(
-                        route.handler, **kwargs)
+                    result = await _call_handler()
+            except _asyncio_timeout.TimeoutError:
+                await _send_json(send, 504,
+                                 b'{"detail":"Request timeout"}')
+                sent = True
+                return
+            finally:
+                # Stop the unary disconnect watcher (no-op if it already
+                # returned on disconnect; cancel cleanly otherwise so no
+                # orphan task / unretrieved-exception warning).
+                if _disc_watch_unary is not None \
+                        and not _disc_watch_unary.done():
+                    _disc_watch_unary.cancel()
             # Tear down scope="function" yield-deps NOW (between handler
             # return and response emit) — FastAPI parity. Request-scope
             # deps stay on the inner solve_async stack and close after
@@ -1182,7 +1478,18 @@ async def _http_dispatch(app, scope, receive, send):
                     h, lreq, exc, scope, receive, send)
                 sent = True
                 return
-            ebody = _wire_json({"detail": exc.detail})
+            # M15 T11 (opt-in): a raised ProblemDetail emits RFC 9457
+            # `application/problem+json` (the RFC body, not `{"detail"}`).
+            # A PLAIN HTTPException is untouched below — the default error
+            # bytes stay byte-identical (conformance gate).
+            from lancelot.exceptions import (
+                ProblemDetail as _PD, PROBLEM_JSON_MEDIA_TYPE as _PJMT)
+            if isinstance(exc, _PD):
+                ebody = _wire_json(exc.problem_dict())
+                ctype = _PJMT.encode()
+            else:
+                ebody = _wire_json({"detail": exc.detail})
+                ctype = b"application/json"
             # Starlette JSONResponse(headers=exc.headers) wire order:
             # the exception's explicit headers FIRST (names lower-cased,
             # as Starlette init_headers does), then content-length, then
@@ -1190,7 +1497,7 @@ async def _http_dispatch(app, scope, receive, send):
             hdrs = [(str(k).lower().encode(), str(v).encode())
                     for k, v in exc.headers.items()]
             hdrs.append((b"content-length", str(len(ebody)).encode()))
-            hdrs.append((b"content-type", b"application/json"))
+            hdrs.append((b"content-type", ctype))
             await send({"type": "http.response.start",
                         "status": exc.status_code, "headers": hdrs})
             await send({"type": "http.response.body", "body": ebody})
@@ -1199,6 +1506,16 @@ async def _http_dispatch(app, scope, receive, send):
             pbody = b'{"detail":"Service Unavailable"}'
             await send({"type": "http.response.start", "status": 503,
                         "headers": [(b"retry-after", b"1"),
+                                    (b"content-length",
+                                     str(len(pbody)).encode()),
+                                    (b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": pbody})
+    except BatchOverloadError as _bo:  # T9: @app.batch max_keys → sheddable 503
+        if not sent:
+            pbody = b'{"detail":"Service Unavailable"}'
+            _ra = str(int(getattr(_bo, "retry_after", 1))).encode("ascii")
+            await send({"type": "http.response.start", "status": 503,
+                        "headers": [(b"retry-after", _ra),
                                     (b"content-length",
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
@@ -1291,6 +1608,15 @@ async def _ws(app, scope, receive, send):
     lreq.query_params_multi = dict(qs)
     lreq.headers_multi = headers_multi
     lreq._ws = ws
+    # M15 T10: set the request-correlation ContextVars from the handshake
+    # headers (same scan as the HTTP seam), so a WS handler gets request-id
+    # echo semantics AND — critically — `TransportPool` calls made from
+    # inside the handler forward the socket's `traceparent` to the upstream
+    # (the AI call joins the same distributed trace). RESET in `finally` so
+    # nothing leaks across connections sharing this loop.
+    _ws_rid, _ws_rid_from_client, _ws_tp_raw, _ws_tid = \
+        _scan_request_context(scope)
+    _ws_ctx_tokens = _set_request_context(_ws_rid, _ws_tid, _ws_tp_raw)
     try:
         async with solve_async(route.plan, lreq) as res:
             if res.errors:  # MUST-7: validation failure → close 1008
@@ -1318,6 +1644,10 @@ async def _ws(app, scope, receive, send):
             await ws.close(code=1011)
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        # RESET on disconnect/return so the next connection on this loop
+        # doesn't inherit this socket's request_id / trace context.
+        _reset_request_context(_ws_ctx_tokens)
 
 
 def _find_exc_handler(app, exc):

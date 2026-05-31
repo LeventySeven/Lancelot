@@ -7,6 +7,22 @@ meter on the first call and emit a counter + histogram from then on; if
 it's NOT installed (typical for the small-startup default), every call is
 a single cheap None-check and returns.
 
+`route_path` (the `http.route` attribute, here and on `record_stream_ttft`)
+is the route TEMPLATE — e.g. `/items/{id}`, NOT the concrete URL
+`/items/42` (M15 T1 #2: recording the concrete URL would emit one metric
+time-series per distinct id → unbounded cardinality). For requests that
+match no route the ASGI seam passes a BOUNDED sentinel instead of the
+sprayed URL: `"__not_found__"` (404), `"__method_not_allowed__"` (405), or
+`"__unmatched__"` (any other no-match exit, e.g. the draining 503).
+
+SCOPE (M15 T1 investigation): these metrics fire ONLY on the Python ASGI
+seam (lancelot/asgi.py). The Rust `_native.run` server (src/service.rs,
+src/dispatch.rs) emits NO OTel metrics at all — `grep -rI 'opentelemetry\\|
+record_request\\|histogram' src/` is empty. So RED/TTFT observability is a
+property of running via the ASGI app (uvicorn/hypercorn/`App.__call__`),
+NOT the prebaked-bytes Rust server tier. Operators who deploy on the native
+const tier for raw throughput get no RED metrics from it by design.
+
 Cardinal rule: opentelemetry is NEVER a runtime dep of Lancelot. Pydantic
 only. Users opt-in by installing `opentelemetry-api` themselves.
 """
@@ -123,6 +139,9 @@ def record_request(route_path: str, method: str, status: int,
                    duration_s: float, tenant: str = "-",
                    cost_usd: float = 0.0,
                    queue_wait_ms: float = 0.0) -> None:
+    # `route_path` is the route TEMPLATE or a bounded 404/405/unmatched
+    # sentinel (cardinality bound — see module docstring). Called ONLY from
+    # the Python ASGI seam; the Rust `_native` server emits no metrics.
     inst = _maybe_bind()
     if inst is None:
         return
@@ -162,7 +181,9 @@ def record_request(route_path: str, method: str, status: int,
 
 def record_stream_ttft(route_path: str, method: str, ttft_s: float) -> None:
     """Record time-to-first-chunk for a streaming response (the AI-streaming
-    UX metric). Cheap None-check when OTel isn't installed."""
+    UX metric). Cheap None-check when OTel isn't installed. `route_path` is
+    the route TEMPLATE (M15 T1 #2 — same cardinality bound as record_request);
+    a streaming route is always matched, so there's no sentinel case here."""
     inst = _maybe_bind()
     if inst is None:
         return
