@@ -543,19 +543,21 @@ class TransportPool:
         of the inference reverse-proxy archetype (BentoML/r2r/langserve all
         hand-roll open+forward+cleanup).
 
-        An async-context-manager yielding a self-contained async-iterator of
-        the upstream's chunks. The iterator owns the upstream lifecycle (its own
-        `async with pool.stream(...)` acloses the upstream when iteration
-        ends/cancels), so BOTH usage shapes are safe:
+        An async-context-manager yielding an async-iterator of the upstream's
+        chunks; it `aclose()`s the upstream when the `async with` block exits.
+        Use it INSIDE an `@app.stream` async-gen handler so iteration happens
+        within the block:
 
-            # inside an @app.stream async-gen handler (the common shape):
-            async with pool.relay("POST", url, request=request) as upstream:
-                async for chunk in upstream:
-                    yield chunk
+            @app.stream("/proxy")
+            async def proxy(request):
+                async with pool.relay("POST", url, request=request) as upstream:
+                    async for chunk in upstream:
+                        yield chunk
 
-            # or returning a StreamingResponse from a plain handler:
-            async with pool.relay("POST", url, request=request) as upstream:
-                return StreamingResponse(upstream)
+        Do NOT `return StreamingResponse(upstream)` from inside the `async with`:
+        the block exits on `return` and acloses the upstream BEFORE the response
+        iterates. For a StreamingResponse, drive `pool.stream(..., request=request)`
+        from within your own async-gen instead.
 
         Pass `request=request` so a client disconnect cancels the upstream (the
         whole point). Pure Python — NO Rust pump variant (Tier-D)."""
