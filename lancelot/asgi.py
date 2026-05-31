@@ -217,8 +217,10 @@ async def _lifespan(app, receive, send):
                 try:
                     await _run_on_event("startup")
                     await _enter_mounts(app, _mount_stack)
+                    app._start_lifetime_tasks()  # M15 T5
                 except BaseException:  # noqa: BLE001 - report per ASGI spec
                     import traceback
+                    await app._drain_lifetime_tasks()
                     await _mount_stack.aclose()  # unwind any entered sub-apps
                     await send({"type": "lifespan.startup.failed",
                                 "message": traceback.format_exc()})
@@ -226,6 +228,9 @@ async def _lifespan(app, receive, send):
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
                 try:
+                    # M15 T5: stop app-owned daemons FIRST (cancel + bounded
+                    # await), then tear down sub-apps (LIFO), then on_event.
+                    await app._drain_lifetime_tasks()
                     await _mount_stack.aclose()  # sub-apps tear down (LIFO)
                     await _run_on_event("shutdown")
                 except BaseException:  # noqa: BLE001
@@ -247,6 +252,7 @@ async def _lifespan(app, receive, send):
             try:
                 await cm.__aenter__()
                 await _enter_mounts(app, _mount_stack)
+                app._start_lifetime_tasks()  # M15 T5
             except BaseException:  # noqa: BLE001 - report per ASGI spec
                 # OPS1: send the FULL traceback (not repr) so the ASGI server
                 # logs a real stack and the operator can diagnose the crash —
@@ -258,6 +264,7 @@ async def _lifespan(app, receive, send):
                 # Unwind any sub-apps that DID enter before re-reporting; the
                 # root cm only unwinds if its OWN __aenter__ completed (a
                 # raising __aenter__ leaves nothing to exit).
+                await app._drain_lifetime_tasks()
                 await _mount_stack.aclose()
                 await send({"type": "lifespan.startup.failed",
                             "message": traceback.format_exc()})
@@ -272,8 +279,10 @@ async def _lifespan(app, receive, send):
             # or `app.install_signal_handlers()`. The lifespan hook just
             # invokes user shutdown code.
             try:
-                # M15 T4: tear down mounted sub-apps FIRST (LIFO — they
+                # M15 T5 + T4 teardown order: stop app-owned daemons FIRST
+                # (cancel + bounded await), then mounted sub-apps (LIFO — they
                 # started after the root), then the root app's lifespan.
+                await app._drain_lifetime_tasks()
                 await _mount_stack.aclose()
                 await cm.__aexit__(None, None, None)
             except BaseException:  # noqa: BLE001

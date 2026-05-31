@@ -50,6 +50,13 @@ class App:
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
+        # M15 T5 (#6-core): app-lifetime supervised daemons. Factories are
+        # registered via `app.lifetime_task(coro_fn)`; the lifespan-startup
+        # seam starts one task per factory and STRONG-refs it here (so it
+        # isn't GC'd mid-run); drain()/lifespan-shutdown cancels + awaits each
+        # bounded by the drain deadline.
+        self._lifetime_task_factories: list = []
+        self._lifetime_tasks: list = []
         self._extra_kwargs = kwargs  # accept-and-store; ledgered behavior
         # M15 T2 (#11): FastAPI's per-app operationId factory. Was swallowed
         # into _extra_kwargs and ignored; now consumed by build_openapi as the
@@ -112,6 +119,77 @@ class App:
         scope['path'] before delegating."""
         self._mounts.append((prefix.rstrip("/"), app))
         self._asgi = None
+
+    def lifetime_task(self, coro_fn):
+        """M15 T5 (#6-core): register a coroutine FACTORY to run for the
+        lifetime of the app — a supervised background daemon (metrics flusher,
+        cache warmer, queue poller, heartbeat). `coro_fn` is called with no
+        args at lifespan startup; the resulting task is strong-referenced (so
+        it isn't GC'd) and, on graceful drain / lifespan shutdown, CANCELLED
+        and awaited bounded by the drain deadline (LANCELOT_DRAIN_SECS, else
+        `drain_timeout`), suppressing CancelledError — no orphan, no
+        "Task was destroyed" warning.
+
+        Lancelot owns the bounded-cancel-on-drain plumbing; the coroutine body
+        (what the daemon DOES) is the user's — positioning lock. Usable as a
+        decorator or a direct call:
+
+            @app.lifetime_task
+            async def flush_metrics():
+                while True:
+                    await push(); await asyncio.sleep(5)
+
+        Returns `coro_fn` unchanged so it composes as a decorator."""
+        if not callable(coro_fn):
+            raise TypeError(
+                "app.lifetime_task expects a zero-arg coroutine FUNCTION "
+                f"(called at startup), got {coro_fn!r}")
+        self._lifetime_task_factories.append(coro_fn)
+        return coro_fn
+
+    def _start_lifetime_tasks(self) -> None:
+        """Start one asyncio task per registered factory (called from the
+        lifespan-startup seam). Idempotent: re-entry won't double-start while
+        tasks are already live."""
+        import asyncio
+
+        if self._lifetime_tasks:
+            return
+        for fn in self._lifetime_task_factories:
+            self._lifetime_tasks.append(asyncio.ensure_future(fn()))
+
+    async def _drain_lifetime_tasks(self, timeout: float | None = None) -> None:
+        """Cancel every running lifetime task and await it, bounded by the
+        drain deadline so a daemon ignoring CancelledError can't wedge
+        shutdown. CancelledError is suppressed (expected); any other exception
+        from the daemon's teardown is swallowed (we're already shutting down).
+        Mirrors the graceful-teardown discipline in `serve()`."""
+        import asyncio
+
+        tasks = [t for t in self._lifetime_tasks if not t.done()]
+        # Also surface (and discard) results of already-finished tasks so a
+        # crashed daemon doesn't leave an un-retrieved exception warning.
+        for t in self._lifetime_tasks:
+            if t.done() and not t.cancelled():
+                try:
+                    t.exception()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._lifetime_tasks = []
+        if not tasks:
+            return
+        for t in tasks:
+            t.cancel()
+        deadline = (timeout if timeout is not None
+                    else _resolve_drain_secs(self._drain_timeout))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=max(deadline, 0.0))
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            # Bound exceeded (a daemon swallowing CancelledError) — proceed;
+            # the loop teardown / process exit reclaims it. Don't wedge.
+            pass
 
     def run(self, host: str | None = None, port: int | None = None) -> None:
         """Serve on the native Rust server. host/port default from env
@@ -591,19 +669,27 @@ class App:
 
     async def drain(self, timeout: float | None = None) -> bool:
         """Wait until all in-flight requests have completed (or `timeout`
-        seconds, whichever is first). Returns True if the drain succeeded
-        in time. Caller is responsible for `initiate_shutdown()` first."""
+        seconds, whichever is first), THEN cancel + await app-lifetime
+        daemons (M15 T5) bounded by the same deadline. Returns True if the
+        in-flight drain succeeded in time. Caller is responsible for
+        `initiate_shutdown()` first."""
         import asyncio
 
         deadline = (timeout if timeout is not None else self._drain_timeout)
         _loop = asyncio.get_running_loop()  # async ctx → always present (no deprecation)
         end = _loop.time() + max(deadline, 0.0)
+        ok = True
         while self._active_requests > 0:
             remaining = end - _loop.time()
             if remaining <= 0:
-                return False
+                ok = False
+                break
             await asyncio.sleep(min(0.05, remaining))
-        return True
+        # M15 T5: stop app-owned daemons (cancel + bounded await). Use the
+        # remaining budget so the whole drain stays inside `deadline`.
+        remaining = max(end - _loop.time(), 0.0)
+        await self._drain_lifetime_tasks(timeout=remaining)
+        return ok
 
     def install_signal_handlers(self) -> bool:
         """Best-effort SIGTERM / SIGINT wiring on the running event loop.
@@ -647,6 +733,23 @@ class App:
 
 # M0 compatibility: `lancelot.Lancelot` + `lancelot.run` keep working.
 Lancelot = App
+
+
+def _resolve_drain_secs(fallback: float) -> float:
+    """M15 T5: graceful-drain deadline for app-lifetime daemons. Honors the
+    SAME `LANCELOT_DRAIN_SECS` env knob the Rust server reads (one knob, one
+    meaning across the deployable paths); falls back to the app's
+    `drain_timeout`. Invalid/negative → fallback."""
+    import os
+
+    raw = os.environ.get("LANCELOT_DRAIN_SECS")
+    if raw is None:
+        return fallback
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return v if v >= 0 else fallback
 
 
 def _resolve_bind(host, port):
