@@ -21,6 +21,9 @@ __all__ = [
     "WebSocketException", "WebSocketDisconnect", "WebSocket",
     "Response", "BackgroundTasks", "background",
     "StaticFiles",
+    # M17 P9-cap: safe pagination/sort DEPENDENCIES (DoS-cap + sort-allowlist;
+    # NO Page[T] envelope — see lancelot/pagination.py).
+    "PageParams", "SortParam",
 ]
 __version__ = "0.1.0"
 
@@ -92,6 +95,13 @@ def __getattr__(name):
         import importlib
 
         return importlib.import_module("lancelot.context")
+    if name in ("PageParams", "SortParam"):
+        # M17 P9-cap: stdlib-only DoS-cap pagination/sort dependencies. Lazy
+        # for surface symmetry (the module pulls only stdlib + already-loaded
+        # lancelot.exceptions/requests, so it stays runtime-dep-light).
+        from lancelot import pagination
+
+        return getattr(pagination, name)
     # FastAPI-compat lazy re-exports (M5 drop-in adoption).
     if name in _FASTAPI_COMPAT:
         mod_name, attr_name = _FASTAPI_COMPAT[name]
