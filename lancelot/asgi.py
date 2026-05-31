@@ -84,6 +84,13 @@ def build_asgi(app):
                     sub_scope = dict(scope)
                     sub_scope["path"] = sub_path
                     sub_scope["raw_path"] = sub_path.encode()
+                    # M15 T4 (#3): propagate root_path = the stripped mount
+                    # prefix (ASGI spec) so the sub-app emits correct ABSOLUTE
+                    # URLs — its /openapi.json `servers` URL + url_path_for
+                    # reflect where it's actually mounted. Nested mounts
+                    # ACCUMULATE: a sub-app mounted under a sub-app sees the
+                    # full prefix chain (Starlette/FastAPI parity).
+                    sub_scope["root_path"] = scope.get("root_path", "") + mp
                     sub_scope.setdefault("app", _AppProxy(app))
                     await sub(sub_scope, receive, send)
                     return
@@ -98,7 +105,96 @@ def build_asgi(app):
     return asgi
 
 
+def _sub_lifespan_cm(sub):
+    """M15 T4 (#3): an `@asynccontextmanager` that runs a mounted sub-app's
+    lifespan. We drive the ASGI `lifespan` protocol against the sub-app
+    callable directly (via an in-memory channel) — this is the ONE shape that
+    works for any ASGI-compliant sub-app: a Lancelot `App` (its `__call__`
+    handles a `lifespan` scope), Starlette/FastAPI (their router runs
+    `lifespan_context`), or a hand-rolled ASGI app. `__aenter__` raises if the
+    sub-app reports `lifespan.startup.failed`, so an `AsyncExitStack` unwinds
+    only the sub-apps already entered (partial-startup safety)."""
+    import contextlib as _cl
+
+    @_cl.asynccontextmanager
+    async def _runner():
+        import asyncio as _aio
+
+        to_app: _aio.Queue = _aio.Queue()    # events the SERVER sends the app
+        from_app: _aio.Queue = _aio.Queue()  # events the APP sends the server
+
+        async def _recv():
+            return await to_app.get()
+
+        async def _send(msg):
+            await from_app.put(msg)
+
+        scope = {"type": "lifespan", "asgi": {"version": "3.0"}}
+        task = _aio.ensure_future(sub(scope, _recv, _send))
+
+        async def _drive(kind):
+            # Send one lifespan.<kind> and await the matching complete/failed.
+            # An app that doesn't speak lifespan returns (or raises) out of its
+            # callable WITHOUT acking — per the ASGI spec, a lifespan-aware app
+            # ALWAYS reports failure via a `lifespan.<kind>.failed` MESSAGE, so
+            # a raw exception out of the callable means "lifespan unsupported"
+            # and is benign (this is exactly uvicorn's behavior). A genuine
+            # sub-app startup failure therefore arrives as the `.failed` ack
+            # below and IS surfaced (→ partial-startup unwind).
+            if task.done():
+                return  # already exited (e.g. unsupported on a prior drive)
+            await to_app.put({"type": f"lifespan.{kind}"})
+            getter = _aio.ensure_future(from_app.get())
+            done, _ = await _aio.wait(
+                {getter, task}, return_when=_aio.FIRST_COMPLETED)
+            if getter in done:
+                ack = getter.result()
+                if ack.get("type") == f"lifespan.{kind}.failed":
+                    raise RuntimeError(
+                        "mounted sub-app lifespan."
+                        f"{kind} failed: {ack.get('message', '')[:2000]}")
+                return
+            # The task returned without acking → lifespan unsupported; swallow
+            # any exception (the app simply doesn't implement the protocol).
+            getter.cancel()
+            try:
+                task.result()
+            except Exception:  # noqa: BLE001 - unsupported-lifespan signal
+                pass
+
+        await _drive("startup")
+        try:
+            yield
+        finally:
+            # Best-effort graceful shutdown of the sub-app, then make sure its
+            # driver task is finalized (no orphan / "Task was destroyed").
+            try:
+                if not task.done():
+                    await _drive("shutdown")
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (_aio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+
+    return _runner()
+
+
+async def _enter_mounts(app, stack):
+    """Enter every mounted sub-app's lifespan onto `stack` (LIFO teardown).
+    A sub-app exposes a lifespan via the ASGI `lifespan` protocol (driven by
+    `_sub_lifespan_cm`). Apps without lifespan support are harmless no-ops.
+    On a sub-app startup failure the exception propagates; `stack` (an
+    AsyncExitStack) then unwinds only the sub-apps already entered."""
+    for _mp, _sub in getattr(app, "_mounts", ()):
+        await stack.enter_async_context(_sub_lifespan_cm(_sub))
+
+
 async def _lifespan(app, receive, send):
+    import contextlib as _cl_ls
+
     async def _run_on_event(kind):
         # FastAPI on_event decorator handlers — startup runs all at
         # startup-complete time; shutdown at shutdown-complete time.
@@ -111,23 +207,46 @@ async def _lifespan(app, receive, send):
                 await r
 
     if app._lifespan is None:
+        # M15 T4: even with no root lifespan, mounted sub-apps may have one —
+        # drive them on a stack so startup/shutdown still run + tear down LIFO.
+        _mount_stack = _cl_ls.AsyncExitStack()
         # Still honor the protocol (Starlette TestClient drives it).
         while True:
             msg = await receive()
             if msg["type"] == "lifespan.startup":
-                await _run_on_event("startup")
+                try:
+                    await _run_on_event("startup")
+                    await _enter_mounts(app, _mount_stack)
+                except BaseException:  # noqa: BLE001 - report per ASGI spec
+                    import traceback
+                    await _mount_stack.aclose()  # unwind any entered sub-apps
+                    await send({"type": "lifespan.startup.failed",
+                                "message": traceback.format_exc()})
+                    return
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
-                await _run_on_event("shutdown")
+                try:
+                    await _mount_stack.aclose()  # sub-apps tear down (LIFO)
+                    await _run_on_event("shutdown")
+                except BaseException:  # noqa: BLE001
+                    import traceback
+                    await send({"type": "lifespan.shutdown.failed",
+                                "message": traceback.format_exc()})
+                    return
                 # Same rationale as above: do not auto-flip on lifespan.
                 await send({"type": "lifespan.shutdown.complete"})
                 return
     cm = app._lifespan(app)
+    # M15 T4: mounted sub-app lifespans enter AFTER the root app's lifespan
+    # (so the root's resources exist when a sub-app starts) and tear down
+    # BEFORE it (LIFO) — the AsyncExitStack guarantees both.
+    _mount_stack = _cl_ls.AsyncExitStack()
     while True:
         msg = await receive()
         if msg["type"] == "lifespan.startup":
             try:
                 await cm.__aenter__()
+                await _enter_mounts(app, _mount_stack)
             except BaseException:  # noqa: BLE001 - report per ASGI spec
                 # OPS1: send the FULL traceback (not repr) so the ASGI server
                 # logs a real stack and the operator can diagnose the crash —
@@ -136,6 +255,10 @@ async def _lifespan(app, receive, send):
                 # test_startup_exception_is_failfast_not_swallowed) — the
                 # traceback rides in the protocol message, which uvicorn logs.
                 import traceback
+                # Unwind any sub-apps that DID enter before re-reporting; the
+                # root cm only unwinds if its OWN __aenter__ completed (a
+                # raising __aenter__ leaves nothing to exit).
+                await _mount_stack.aclose()
                 await send({"type": "lifespan.startup.failed",
                             "message": traceback.format_exc()})
                 return
@@ -149,6 +272,9 @@ async def _lifespan(app, receive, send):
             # or `app.install_signal_handlers()`. The lifespan hook just
             # invokes user shutdown code.
             try:
+                # M15 T4: tear down mounted sub-apps FIRST (LIFO — they
+                # started after the root), then the root app's lifespan.
+                await _mount_stack.aclose()
                 await cm.__aexit__(None, None, None)
             except BaseException:  # noqa: BLE001
                 import traceback
