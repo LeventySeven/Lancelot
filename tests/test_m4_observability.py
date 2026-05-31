@@ -23,7 +23,8 @@ pytest.importorskip("opentelemetry.sdk.metrics")
 
 def _counter_points(reader, name):
     pts = []
-    for rm in (reader.get_metrics_data().resource_metrics or []):
+    _data = reader.get_metrics_data()  # None until the first metric is emitted this process
+    for rm in ((_data.resource_metrics if _data else None) or []):
         for sm in rm.scope_metrics:
             for m in sm.metrics:
                 if m.name == name:
