@@ -22,13 +22,21 @@ Two deployable surfaces:
 > connection drain and is bounded by `LANCELOT_DRAIN_SECS` (a hung user shutdown
 > can't wedge process exit). Disable with `LANCELOT_LIFESPAN=0`.
 >
+> **Both `async def` and sync `def` handlers are served.** A sync handler runs
+> **INLINE on the event loop** — its return value is serialized in the same GIL
+> scope, no threadpool — so it must not do blocking I/O (that stalls every other
+> request on the worker). For blocking work use `async def` + an offload
+> (`run_in_executor` / a thread), or deploy under uvicorn (surface #1), which
+> threadpools sync handlers.
+>
 > **What the native server still does NOT do: dependency injection and
-> request-body parsing.** This is lifespan-only — handlers under `app.run()`
-> receive a raw `lancelot.Request`, not FastAPI-style injected dependencies or a
-> parsed/validated body. For full FastAPI parity (DI + body parsing + validation
-> error responses), deploy under uvicorn (surface #1). Also unavoidable: SIGKILL
-> (not SIGTERM) skips shutdown, and a single `app.run()` is one process (scale
-> multiprocess — see below).
+> request-body parsing.** Handlers under `app.run()` receive a raw
+> `lancelot.Request` positionally — a body-declaring parameter is NOT injected.
+> Read the body yourself with `await request.json()` in an `async def` handler.
+> For full FastAPI parity (DI + body parsing + validation error responses),
+> deploy under uvicorn (surface #1). Also unavoidable: SIGKILL (not SIGTERM)
+> skips shutdown, and a single `app.run()` is one process (scale multiprocess —
+> see below).
 
 ## Containers & PaaS — bind address ($PORT, 0.0.0.0)
 

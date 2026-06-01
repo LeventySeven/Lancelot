@@ -270,6 +270,10 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         _ => return plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
     };
     match dispatched {
+        // SYNC handler: its body already ran inside `build_result` (GIL scope)
+        // and its result is already serialized — no await, just emit the bytes.
+        // Mirrors the `Dispatched::Value` success branch (`json_ok(json)`).
+        Dispatched::Ready(json) => json_ok(json),
         // R3: async-gen → chunked streaming body (no per-chunk thread/GIL).
         Dispatched::Stream(gen, content_type) => {
             let body = crate::stream::stream_body(app.locals.clone(), gen, app.shutdown.clone());
