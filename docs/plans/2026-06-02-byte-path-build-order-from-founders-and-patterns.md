@@ -43,7 +43,19 @@ compat gaps below.
 - [x] **T1 #4 bytes-in-flight admission** — DONE (safe variant). `LANCELOT_MAX_INFLIGHT_BYTES` (default 0=off) in `src/service.rs`: aggregate in-flight request-body budget, charged at admission (Content-Length capped at `max_body`), **load-sheds with 503+Retry-After** (deadlock-free) rather than LanceDB's queue-and-wait min-in-flight admission; forward-progress guarantee (always admit when nothing in flight). RAII `InflightGuard`. **Design note:** the full min-in-flight *waiting* admission was deliberately NOT built — reject/shed is the correct HTTP-edge behavior and avoids the deadlock subtlety; default-off so the hot path is byte-identical. TDD; real-server adversarial test `tests/test_m19_inflight_bytes.py` (2 tests). Gates: clippy clean, cargo test 17, conformance 978, **full suite 594 passed**.
 
 **TIER 1 COMPLETE** (4/4). All gated green: full suite 594 passed / 3 skipped, conformance 978/987, clippy -D warnings clean, cargo test 17. Wheel rebuilt (maturin --release). Not yet committed (on `main`).
-- [ ] T2 #5 runtime conformance matrix
+- [x] **T2 #5 runtime/dynamic-surface conformance matrix** — DONE. Probed the 5 highest-coupling dynamic surfaces empirically, then pinned each with a characterization test (`tests/test_m19_runtime_surface_matrix.py`, 5 tests). 4 PROVEN, 1 documented divergence (below). No router change made — fixing the divergence would risk the const-tier hot path + live-replace semantics for a narrow edge case (no-bullshit rule), so it is documented, not patched.
+
+### Runtime/dynamic-surface conformance matrix
+
+| # | Surface (named by) | Result | Note |
+|---|---|---|---|
+| 1 | custom `APIRoute.get_route_handler` + `route_class` (Polar 8-mixin) | **PROVEN** | custom handler is invoked; `openapi_extra` mutation in `__init__` works |
+| 2 | runtime route registration `add_route_live` (Hayhooks) | **PROVEN** | route added after first serve is dispatched with full DI plan (raw `router.add` is NOT the supported path — it skips plan compilation → 422) |
+| 3 | dynamic `pydantic.create_model` body annotation (LitServe) | **PROVEN** | resolved + validated at registration (valid→200, invalid→422) |
+| 4 | duplicate same-path/method resolution (LangServe first-wins) | **DIVERGENT** | Lancelot static routes are **last-registered-wins** (const-tier dict overwrite); FastAPI is **first-wins**. Dynamic `/param/` routes DO iterate first-wins. Workaround: distinct paths or parameterized routes. Documented, not patched. |
+| 5 | mounted sub-app lifespan (Hayhooks) | **PROVEN** | startup AND shutdown run (M15 fix confirmed) |
+
+**TIER 2 COMPLETE** (#5 matrix + #6 BaseHTTPMiddleware). Full suite + conformance green.
 - [x] **T2 #6 BaseHTTPMiddleware compat** — DONE.
   - **#6a (the real founder blocker — already worked, now official):** empirically verified `add_middleware(BaseHTTPMiddleware-subclass)` already streams + injects headers + propagates `request.state`→`scope['state']` to the Lancelot handler (the dishka/tenant/CSRF per-request-scoping pattern). Removed the misleading "NEVER BaseHTTPMiddleware" docstrings; documented; regression tests `tests/test_m19_basehttp_middleware.py` (3).
   - **#6b (full streaming adapter — your pick):** rewrote `HTTPMiddlewareAdapter` from synchronous full-buffer capture to a **pure-asyncio streaming task-group model** (no anyio dep). Fixes the real bug it had: a corrupted DUPLICATED content-type (`text/event-stream, text/plain` / `application/json, text/plain`) on every response + full-buffering of streams. Lazy inner-task start preserves short-circuit semantics; **exception transparency** (Starlette `app_exc` parity) re-raises inner exceptions after the response. TDD; `tests/test_m19_http_middleware_streaming.py` (4). The rewrite first regressed 10 yield-dep conformance tests (the exact risk the ceiling note warned of) — root-caused to swallowed re-raise, fixed, conformance back to 978. `test_background_tasks` remains the documented ceiling failure (streaming alone doesn't flip it).
