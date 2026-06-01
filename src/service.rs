@@ -65,6 +65,41 @@ fn max_connections() -> usize {
     })
 }
 
+/// T1#4 (LanceDB two-budget): aggregate cap on the SUM of in-flight request-body
+/// bytes across ALL connections. The count cap (`max_connections`) × per-request
+/// `max_body` bounds memory only as their PRODUCT (1024 × 16 MiB ≈ 16 GiB) — this
+/// is the missing second axis. Default 0 = OFF (byte-identical hot path, no
+/// charge, no atomic traffic). When set (>0), each matched request charges its
+/// claim (Content-Length capped at `max_body`; pessimistic `max_body` when the
+/// length is absent/chunked) and is SHED with 503 + Retry-After if admitting it
+/// would exceed the budget — UNLESS nothing is in flight (forward-progress
+/// guarantee). Load-shedding (reject), NOT queue-and-wait, is the correct
+/// HTTP-edge behavior and is deadlock-free (no waiting → no min-in-flight
+/// admission subtlety). Tunable via `LANCELOT_MAX_INFLIGHT_BYTES`.
+fn max_inflight_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LANCELOT_MAX_INFLIGHT_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Process-wide running total of in-flight request-body bytes (T1#4). Only
+/// touched when `max_inflight_bytes() > 0`, so the default path pays nothing.
+static INFLIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RAII charge against `INFLIGHT_BYTES`: the claim is released the moment the
+/// guard drops (end of `handle()` — i.e. after the body has been buffered and
+/// the handler dispatched, the window where the request body pins memory).
+struct InflightGuard(u64);
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        INFLIGHT_BYTES.fetch_sub(self.0, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Graceful-drain deadline (B1): on SIGTERM we stop accepting, then wait up to
 /// this long for in-flight connections to finish before closing — drain, not
 /// Robyn-style hard-kill. Default 10 s; tunable via `LANCELOT_DRAIN_SECS`
@@ -164,6 +199,22 @@ fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
         .unwrap()
 }
 
+/// T1#4: 503 load-shed response when the in-flight-bytes budget is exceeded.
+/// Carries `Retry-After: 1` so a well-behaved client/proxy backs off (mirrors
+/// the Python seam's retryable-status discipline).
+fn overloaded_503() -> HResp<RespBody> {
+    HResp::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("retry-after", "1")
+        .header("content-type", "text/plain")
+        .body(
+            Full::new(Bytes::from_static(b"server overloaded (in-flight byte budget)"))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 /// M7 T4.10: owned-bytes plain response for dynamically-built bodies
 /// (e.g. the "did you mean?" 404 suggestion). Same shape as `plain`,
 /// just `Bytes::from(Vec)` instead of `from_static`.
@@ -245,6 +296,34 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         let val: String = v.as_bytes().iter().map(|&b| b as char).collect();
         headers.push((k.as_str().to_ascii_lowercase(), val));
     }
+    // T1#4: aggregate in-flight body-bytes admission. Charge this request's
+    // claim against the process-wide budget BEFORE buffering the body, so the
+    // allocation it protects against never happens. `_inflight_guard` releases
+    // the claim on drop (end of handle()). Default 0 = OFF → `None`, no atomic
+    // traffic, byte-identical hot path. Forward-progress: a request is always
+    // admitted when nothing is in flight (prev == 0), even if it alone exceeds
+    // the budget, so a body larger than the whole budget can still be served.
+    let _inflight_guard = {
+        let budget = max_inflight_bytes();
+        if budget == 0 {
+            None
+        } else {
+            let claim = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|cl| cl.min(max_body() as u64))
+                .unwrap_or(max_body() as u64);
+            use std::sync::atomic::Ordering::AcqRel;
+            let prev = INFLIGHT_BYTES.fetch_add(claim, AcqRel);
+            if prev != 0 && prev.saturating_add(claim) > budget {
+                INFLIGHT_BYTES.fetch_sub(claim, AcqRel); // back out the charge
+                return overloaded_503();
+            }
+            Some(InflightGuard(claim))
+        }
+    };
     // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
     // allocation per connection (remote memory-DoS). A truncated/aborted
     // body is a 400, NOT a silent empty-body 200.

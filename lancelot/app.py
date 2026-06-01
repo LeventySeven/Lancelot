@@ -233,9 +233,22 @@ class App:
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
-        """U20 escape hatch: an unmodified pure-ASGI middleware wrapping the
-        app callable. NEVER BaseHTTPMiddleware/call_next. Last-added is the
-        outermost wrapper."""
+        """Wrap the app callable with an ASGI middleware: `app = mw_cls(app,
+        **opts)`. Last-added is the outermost wrapper (FastAPI/Starlette order).
+
+        This hosts BOTH a plain pure-ASGI middleware AND a Starlette
+        `BaseHTTPMiddleware` subclass (T2#6a, 2026-06-02): the latter is itself
+        an ASGI app, so it wraps correctly and uses Starlette's own streaming
+        `call_next` implementation. Verified (tests/test_m19_basehttp_middleware):
+        response-header mutation, streaming pass-through, AND `request.state`
+        (→ ASGI `scope['state']`) reaching the Lancelot handler via
+        `request.scope_state` — the per-request-scoping pattern (dishka / tenant
+        / CSRF) that gates real FastAPI migrations.
+
+        Note: `@app.middleware("http")` (Lancelot's own decorator) is the
+        function-shaped equivalent for the common case; use `add_middleware`
+        with a `BaseHTTPMiddleware` subclass when porting an existing one
+        unchanged."""
         self._middleware.append((mw_cls, opts))
         self._asgi = None  # rebuild the wrapped callable
 
@@ -495,7 +508,8 @@ class App:
                sse_keepalive: float = 15.0, sse: bool = False,
                done_sentinel: str | None = "[DONE]",
                defer_status: bool = False,
-               max_stream_silence: float | None = None, **kwargs):
+               max_stream_silence: float | None = None,
+               max_stream_lifetime: float | None = None, **kwargs):
         """M2-P4 + Tier-A.A5/A6: typed event-stream sugar. The handler is
         an async generator yielding `lancelot.stream.Event` items; the
         framework owns SSE framing + cancellation propagation.
@@ -539,6 +553,16 @@ class App:
         otherwise never be detected). Symmetric with the upstream
         `idle_guarded_chunks` concept; ASGI-seam (uvicorn) only.
 
+        M19 T1#1 `max_stream_lifetime` (default None = off): an ABSOLUTE
+        wall-clock cap (seconds) measured from stream start. Distinct from
+        `max_stream_silence` — a stream that keeps trickling one chunk every
+        `(silence-1)s` never trips the idle watchdog yet pins its bounded mpsc +
+        upstream client + ContextVars open forever. On breach the seam cancels
+        the generator (its `finally`/`aclose` runs), emits a terminal
+        `event: reconnect\\ndata: {"reason":"max_stream_lifetime"}\\n\\n` frame so
+        the client re-establishes, and closes (the Polar 10-min-cap pattern).
+        ASGI-seam (uvicorn) only.
+
         M17 P6 `error_frame` (default False -> byte-identical to today; pairs
         with `sse=True`): make the seam crash/cancel-aware. When True, the seam
         (a) routes a mid-stream raise through a SCRUBBED RFC-9457 ProblemDetail
@@ -559,6 +583,10 @@ class App:
         kw["sse_keepalive"] = sse_keepalive
         kw["defer_status"] = defer_status
         kw["max_stream_silence"] = max_stream_silence
+        # M19 T1#1: absolute wall-clock cap (None=off). Caps a stream that keeps
+        # trickling data (which silence-abort never catches) at a hard deadline,
+        # emitting a terminal `event: reconnect` frame before close.
+        kw["max_stream_lifetime"] = max_stream_lifetime
         # M17 P6: the seam reads `done_sentinel` to GUARANTEE the terminal
         # sentinel on its error/abort finalize paths (clean exhaustion already
         # emits it via sse_adapter). It only matters under `error_frame=True`.
@@ -1056,6 +1084,48 @@ def _make_lifespan_callbacks(app: "App"):
     return _on_startup, _on_shutdown
 
 
+class ConstRouteAuthBypassWarning(UserWarning):
+    """A `const_route` is served prebaked from Rust under `App.run()` and so
+    bypasses the ENTIRE ASGI middleware stack (including any auth/allowlist) —
+    a prebaked health/static path can silently strip an auth check. Surfaced as
+    a warning (or, under `LANCELOT_CONST_STRICT`, a hard error) so the bypass is
+    never silent. T1#2 (2026-06-02 founder workflow: Prefect/Letta /health)."""
+
+
+def _audit_const_route_middleware_bypass(app: "App", *, strict: bool = False):
+    """Guardrail: const routes are served zero-GIL from Rust BEFORE the ASGI
+    middleware stack, so every const path bypasses ALL middleware (auth included)
+    on the native server. If the app has BOTH const routes AND middleware, warn
+    (default) or raise (strict) naming the shadowed paths + middleware. Returns
+    the list of `(method, path)` const routes that bypass middleware (empty when
+    there are no const routes or no middleware — nothing to bypass)."""
+    const = list(getattr(app, "_const_routes", ()) or ())
+    if not const:
+        return []
+    mw = [getattr(c, "__name__", repr(c))
+          for c, _opts in getattr(app, "_middleware", ())]
+    mw += ["@app.middleware:" + getattr(f, "__name__", repr(f))
+           for f in getattr(app, "_user_http_middleware", ())]
+    if not mw:
+        return []  # no middleware installed → nothing is bypassed
+    shadowed = [(m, p) for (m, p, *_rest) in const]
+    paths = ", ".join(f"{m} {p}" for m, p in shadowed)
+    msg = (
+        f"const_route(s) [{paths}] are served prebaked from Rust under "
+        f"App.run() and BYPASS the middleware stack [{', '.join(mw)}], including "
+        f"any auth/allowlist — these paths will NOT be authenticated on the "
+        f"native server. Fix: serve the path via a normal @app.get so it goes "
+        f"through middleware, or drop the const_route. (Set LANCELOT_CONST_STRICT"
+        f"=1 to make this a hard startup error instead of a warning.)")
+    if strict:
+        raise RuntimeError("Lancelot const-route auth bypass: " + msg)
+    import warnings as _warnings
+    _warnings.warn(msg, ConstRouteAuthBypassWarning, stacklevel=2)
+    import logging as _logging
+    _logging.getLogger("lancelot").warning(msg)
+    return shadowed
+
+
 def run(app: "App", host: str | None = None, port: int | None = None):
     """Serve `app` on the native Rust server, binding from env when host/port
     are omitted (`LANCELOT_HOST`, `PORT`/`LANCELOT_PORT`) so it deploys cleanly
@@ -1069,6 +1139,14 @@ def run(app: "App", host: str | None = None, port: int | None = None):
     # `_native.run(const_routes=...)` call. Empty list -> the const tier is a
     # no-op (all router slots are handler routes), unchanged hot path.
     const_routes = list(getattr(app, "_const_routes", ()))
+    # T1#2 guardrail: const routes bypass the middleware stack (auth included).
+    # Warn (or, under LANCELOT_CONST_STRICT, refuse to serve) so a prebaked path
+    # can't silently strip an auth check. Runs here because both const routes and
+    # middleware are only fully known at serve time.
+    import os as _os_cs
+    _const_strict = _os_cs.environ.get(
+        "LANCELOT_CONST_STRICT", "").strip().lower() in ("1", "true", "yes", "on")
+    _audit_const_route_middleware_bypass(app, strict=_const_strict)
     # A const route OVERRIDES a handler route on the same (method, path): drop
     # the shadowed handler so the Rust router doesn't see a duplicate insert
     # (the builtin /livez,/readyz are handler routes — `const_route('GET',

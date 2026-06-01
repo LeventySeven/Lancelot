@@ -1,6 +1,10 @@
-"""Two-tier middleware (U20/U21). `app.add_middleware(cls, **opts)` is the
-pure-ASGI escape hatch — an unmodified ASGI middleware wrapping the app
-callable, NEVER BaseHTTPMiddleware/call_next.
+"""Two-tier middleware (U20/U21). `app.add_middleware(cls, **opts)` wraps the
+app callable with an ASGI middleware — a plain pure-ASGI middleware OR a
+Starlette `BaseHTTPMiddleware` subclass (it is itself an ASGI app; T2#6a
+verified it streams + propagates `scope['state']` to the handler). The
+`@app.middleware("http")` decorator is adapted by `HTTPMiddlewareAdapter`
+below using a pure-asyncio streaming task-group model (T2#6b) so it streams
+the inner response instead of buffering it.
 
 CORSMiddleware — byte-faithful to Starlette's CORSMiddleware (the one
 FastAPI re-exports) for the covered config, verified by
@@ -34,10 +38,18 @@ class Middleware:
 
 
 class HTTPMiddlewareAdapter:
-    """Adapter for `@app.middleware("http")` user fns. The wrapped fn has
-    Starlette's `async def mw(request, call_next)` shape and returns a
-    Response; we adapt it to a pure-ASGI wrapper. Lifespan/websocket
-    scopes pass through untouched."""
+    """Adapter for `@app.middleware("http")` user fns (Starlette's
+    `async def mw(request, call_next)` shape). T2#6b: a pure-asyncio STREAMING
+    task-group model (no anyio dependency — cardinal rule #3 keeps the runtime
+    pydantic-only). The inner app runs as a task whose ASGI messages flow
+    through a queue; `call_next` returns a `StreamingResponse` the moment the
+    response START arrives (carrying the inner status + headers, content-length
+    dropped), and the body STREAMS through chunk-by-chunk instead of being
+    buffered. This fixes the old sync-capture bugs: a corrupted DUPLICATED
+    content-type (`text/event-stream, text/plain`) and full-body buffering of
+    streaming endpoints. The inner task is started lazily inside `call_next`, so
+    a middleware that short-circuits (never calls call_next) does NOT run the
+    inner handler. Lifespan/websocket scopes pass through untouched."""
 
     def __init__(self, app, fn):
         self.app = app
@@ -47,18 +59,17 @@ class HTTPMiddlewareAdapter:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        from lancelot.requests import Request
-        from lancelot.responses import Response
-
-        # Build a Request from the scope so user middleware can inspect
-        # headers/method/path. Body is left empty (the inner app gets the
-        # real receive() — this Request is for inspection only).
-        hdrs = {k.decode().lower(): v.decode()
-                for k, v in scope.get("headers", [])}
-        qs = scope.get("query_string", b"").decode()
+        import asyncio
         import urllib.parse as _up
 
-        qp = dict(_up.parse_qsl(qs))
+        from lancelot.requests import Request
+        from lancelot.responses import StreamingResponse
+
+        # Inspection Request from the scope (body empty — the inner app gets the
+        # real receive(); this is for header/method/path inspection only).
+        hdrs = {k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])}
+        qp = dict(_up.parse_qsl(scope.get("query_string", b"").decode()))
         req = Request(
             method=scope.get("method", "GET"),
             path=scope.get("path", "/"),
@@ -70,41 +81,128 @@ class HTTPMiddlewareAdapter:
             app=None,
         )
 
+        queue: asyncio.Queue = asyncio.Queue()
+        state = {"task": None, "exc": None}
+
+        async def _inner_send(message):
+            await queue.put(message)
+
+        async def _run_inner():
+            try:
+                await self.app(scope, receive, _inner_send)
+            except Exception as e:  # noqa: BLE001 - surfaced via call_next
+                state["exc"] = e
+            finally:
+                await queue.put(None)  # sentinel: inner finished
+
         async def call_next(_request):
-            # Capture the inner app's response by intercepting send().
-            captured: dict = {"status": 200, "headers": [], "body": b""}
+            # Lazily start the inner app on first call_next so a short-circuit
+            # (no call_next) never runs the inner handler (old semantics).
+            if state["task"] is None:
+                state["task"] = asyncio.ensure_future(_run_inner())
+            message = await queue.get()
+            if message is None:  # inner ended before emitting a response
+                if state["exc"] is not None:
+                    raise state["exc"]
+                raise RuntimeError("inner app returned no response")
+            # message is http.response.start
+            status = message.get("status", 200)
+            resp_headers = {}
+            for k, v in message.get("headers", []):
+                resp_headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+            resp_headers.pop("content-length", None)  # re-streamed; len unknown
 
-            async def _send(msg):
-                t = msg["type"]
-                if t == "http.response.start":
-                    captured["status"] = msg["status"]
-                    captured["headers"] = msg.get("headers", [])
-                elif t == "http.response.body":
-                    captured["body"] += msg.get("body", b"")
+            async def _body():
+                while True:
+                    m = await queue.get()
+                    if m is None:
+                        if state["exc"] is not None:
+                            raise state["exc"]
+                        return
+                    if m.get("type") == "http.response.body":
+                        chunk = m.get("body", b"")
+                        if chunk:
+                            yield chunk
+                        if not m.get("more_body", False):
+                            return
 
-            await self.app(scope, receive, _send)
-            r = Response(captured["body"], status_code=captured["status"])
-            r.headers = {k.decode(): v.decode() for k, v in
-                         captured["headers"]}
-            return r
+            resp = StreamingResponse(_body(), status_code=status)
+            resp.headers = resp_headers  # carries the inner content-type
+            return resp
 
-        response = await self.fn(req, call_next)
-        # Emit the (possibly user-replaced) Response.
-        hdrs = []
-        for k, v in (response.headers or {}).items():
-            kb = str(k).lower().encode()
-            if isinstance(v, list):
-                for vv in v:
-                    hdrs.append((kb, str(vv).encode()))
-            else:
-                hdrs.append((kb, str(v).encode()))
-        body = response.body if isinstance(response.body, (bytes, bytearray)) \
-            else str(response.body).encode()
-        hdrs.append((b"content-length", str(len(body)).encode()))
-        hdrs.append((b"content-type", response.media_type.encode()))
+        try:
+            response = await self.fn(req, call_next)
+            await _emit_middleware_response(response, send)
+        finally:
+            # Let the inner app finish (teardown) if it was started; if the user
+            # short-circuited without call_next, there is no task to await.
+            t = state["task"]
+            if t is not None and not t.done():
+                try:
+                    await t
+                except Exception:  # noqa: BLE001
+                    pass
+        # Transparency to inner exceptions (Starlette BaseHTTPMiddleware app_exc
+        # parity): the inner app may SEND a 500 response AND re-raise (the
+        # ServerErrorMiddleware pattern) so the ASGI server logs / the test
+        # client re-raises. If the inner task raised after fully emitting its
+        # response (so `_body` returned on more_body=False without surfacing it),
+        # propagate it now. If it raised BEFORE sending a start, call_next already
+        # re-raised it above and we never reach here.
+        if state["exc"] is not None:
+            raise state["exc"]
+
+
+async def _emit_middleware_response(response, send):
+    """Serialize a Response / StreamingResponse returned from an
+    `@app.middleware("http")` fn to ASGI send() events, WITHOUT duplicating
+    content-type/content-length (the old adapter's bug). A streaming response
+    (has `body_iterator`) is emitted chunked; anything else is one-shot."""
+    out_hdrs = []
+    have_ct = have_cl = False
+    for k, v in (getattr(response, "headers", None) or {}).items():
+        kb = str(k).lower().encode("latin-1")
+        if kb == b"content-type":
+            have_ct = True
+        elif kb == b"content-length":
+            have_cl = True
+        if isinstance(v, list):
+            for vv in v:
+                out_hdrs.append((kb, str(vv).encode("latin-1")))
+        else:
+            out_hdrs.append((kb, str(v).encode("latin-1")))
+    media_type = getattr(response, "media_type", None) or "text/plain"
+    status = getattr(response, "status_code", 200)
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is not None:
+        if not have_ct:
+            out_hdrs.append((b"content-type", media_type.encode("latin-1")))
         await send({"type": "http.response.start",
-                    "status": response.status_code, "headers": hdrs})
-        await send({"type": "http.response.body", "body": body})
+                    "status": status, "headers": out_hdrs})
+        import inspect as _isp
+        if _isp.isasyncgen(iterator) or hasattr(iterator, "__aiter__"):
+            async for chunk in iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                await send({"type": "http.response.body",
+                            "body": chunk, "more_body": True})
+        else:
+            for chunk in iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                await send({"type": "http.response.body",
+                            "body": chunk, "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        return
+    body = getattr(response, "body", b"")
+    body = body if isinstance(body, (bytes, bytearray)) else str(body).encode()
+    if not have_cl:
+        out_hdrs.append((b"content-length", str(len(body)).encode()))
+    if not have_ct:
+        out_hdrs.append((b"content-type", media_type.encode("latin-1")))
+    await send({"type": "http.response.start",
+                "status": status, "headers": out_hdrs})
+    await send({"type": "http.response.body", "body": body})
 
 
 _SAFELISTED = ["Accept", "Accept-Language", "Content-Language", "Content-Type"]
