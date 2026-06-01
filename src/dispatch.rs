@@ -45,11 +45,26 @@ pub async fn call_async(
     // (`call_soon_threadsafe`) is synchronous — no `.await` in this GIL scope.
     // R2: the REAL method/path/query/headers are moved into the Request here
     // (was hardcoded "POST"/"/echo" in M0).
-    let fut = crate::gil::with_gil(|py| -> PyResult<_> {
+    //
+    // A SYNC handler (`def h(request): return ...`) returns a non-awaitable
+    // value whose body ALREADY ran during `call1`; serialize it here (GIL held)
+    // and short-circuit — same `Ready` reasoning as `build_result`, mirrored so
+    // the `_drive` test path also accepts sync handlers. `Ok` carries the
+    // finished bytes; `Err` carries the future to bridge+await.
+    let bridged = crate::gil::with_gil(|py| -> PyResult<Result<Bytes, _>> {
         let req = build_request(py, parts)?;
-        let coro = handler.bind(py).call1((req,))?;
-        pyo3_async_runtimes::into_future_with_locals(&locals, coro)
+        let result = handler.bind(py).call1((req,))?;
+        if !result.hasattr(pyo3::intern!(py, "__await__"))? {
+            return Ok(Ok(to_json_bytes(py, &result)?));
+        }
+        Ok(Err(pyo3_async_runtimes::into_future_with_locals(
+            &locals, result,
+        )?))
     })?;
+    let fut = match bridged {
+        Ok(bytes) => return Ok(bytes), // sync handler: already serialized
+        Err(fut) => fut,
+    };
 
     // GIL is NOT held here. The asyncio loop runs the coroutine; other tasks run.
     let result: Py<PyAny> = fut.await?;
@@ -76,20 +91,31 @@ fn build_request<'py>(py: Python<'py>, parts: ReqParts) -> PyResult<Bound<'py, R
 pub type ResultFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
-/// What a handler call produced: a streaming async-gen (R3) or a regular
-/// coroutine future. Detection happens in ONE GIL scope (build_result) so the
-/// hot path branches without a second introspection.
+/// What a handler call produced: a streaming async-gen (R3), a regular
+/// coroutine future, or an already-serialized SYNC result. Detection happens in
+/// ONE GIL scope (build_result) so the hot path branches without a second
+/// introspection.
 pub enum Dispatched {
     /// `async def gen(): yield ...` — the async-iterator object to pump, plus
     /// the response content-type (SSE vs JSON-lines; audit #4).
     Stream(Py<PyAny>, String),
-    /// A regular awaitable; await it (GIL dropped) then serialize.
+    /// A regular awaitable (`async def` handler's coroutine); await it (GIL
+    /// dropped) then serialize.
     Value(ResultFuture),
+    /// A SYNC handler (`def h(request): return ...`) — its body already ran
+    /// INLINE during `call1`, so the return value is NOT awaitable. Serialize
+    /// it RIGHT THERE in the GIL scope (no bridge, no `ensure_future`, no
+    /// `.await`) and carry the finished bytes. The old code fed this value to
+    /// `into_future_with_locals` → `asyncio.ensure_future(<value>)` → TypeError
+    /// → 500. No threadpool is needed: the handler already completed.
+    Ready(Bytes),
 }
 
 /// Scope 1 (GIL held): build the Request, call the handler, and classify the
 /// result. An async-gen result short-circuits to streaming WITHOUT bridging a
-/// coroutine future; a regular awaitable is bridged to a Send `ResultFuture`.
+/// coroutine future; a SYNC handler's (non-awaitable) return value is serialized
+/// in-scope to `Ready(Bytes)`; a regular `async def` coroutine is bridged to a
+/// Send `ResultFuture`.
 pub fn build_result(
     py: Python<'_>,
     locals: &TaskLocals,
@@ -101,6 +127,18 @@ pub fn build_result(
     if let Some(gen) = crate::stream::as_async_iter(&result) {
         let ct = crate::stream::stream_media_type(&result);
         return Ok(Dispatched::Stream(gen, ct));
+    }
+    // Hot-path discipline: ONE cheap interned-attr check, in the EXISTING GIL
+    // scope (Scope 1) — no new GIL acquire, no `.await`. A coroutine (`async
+    // def`) defines `__await__`; a sync handler's plain return value (dict /
+    // list / model / …) does not. Branch on that:
+    //  - awaitable → keep the proven bridge (into_future → await GIL-dropped).
+    //  - NOT awaitable → the sync body ALREADY ran during `call1`; serialize
+    //    its result here (GIL held; `to_json_bytes` maps Err→PyErr, no panic
+    //    crosses the FFI seam) and skip the bridge entirely.
+    if !result.hasattr(pyo3::intern!(py, "__await__"))? {
+        let json = to_json_bytes(py, &result)?;
+        return Ok(Dispatched::Ready(json));
     }
     let fut = pyo3_async_runtimes::into_future_with_locals(locals, result)?;
     Ok(Dispatched::Value(Box::pin(fut)))

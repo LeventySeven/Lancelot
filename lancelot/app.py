@@ -218,11 +218,18 @@ class App:
         socket binds (a raising startup refuses to serve — the process exits
         non-zero without binding); shutdown runs AFTER the SIGTERM connection
         drain, bounded by `LANCELOT_DRAIN_SECS`. Disable with `LANCELOT_LIFESPAN=0`.
-        SCOPE: lifespan ONLY — the native server still does NOT run dependency
-        injection or request-body parsing (handlers receive a raw `Request`).
-        For full FastAPI-style DI/body-parsing, deploy under uvicorn. SIGKILL
-        (not SIGTERM) still skips shutdown, and a free-standing `app.run()` is
-        single-process (scale multiprocess; see docs/deploy.md)."""
+        HANDLERS: both `async def` and plain `def` (sync) handlers are served.
+        A SYNC handler runs INLINE on the event loop (its return value is
+        serialized in-scope, no threadpool) — so do NOT do blocking I/O in a
+        native sync handler (it stalls every other request on that worker); use
+        `async def` + offload, or deploy under uvicorn (which threadpools sync
+        handlers). Handlers receive the raw `Request` positionally.
+        SCOPE: lifespan + sync/async handlers — but the native server still does
+        NOT run dependency injection or request-body parsing. A body-declaring
+        param is NOT injected; read `await request.json()` in an `async def`
+        handler. For full FastAPI-style DI/body-parsing, deploy under uvicorn.
+        SIGKILL (not SIGTERM) still skips shutdown, and a free-standing
+        `app.run()` is single-process (scale multiprocess; see docs/deploy.md)."""
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
