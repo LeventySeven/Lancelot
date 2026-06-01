@@ -2,6 +2,15 @@ class FastAPIError(Exception):
     """Framework-level errors (FastAPI parity name)."""
 
 
+class FastAPIDeprecationWarning(DeprecationWarning):
+    """Parity-named warning emitted by deprecated surfaces (e.g. `@app.on_event`,
+    `schema_extra` examples). Previously only monkey-patched on by the
+    conformance conftest, which meant `@app.on_event` raised ImportError for a
+    real `app.run()` user — surfaced by M18 Task#7 (native server now drives the
+    lifespan, so `@app.on_event` runs there). Defining it here makes the
+    decorator work out of the box; the conftest's hasattr-guard is now a no-op."""
+
+
 class PydanticV1NotSupportedError(FastAPIError):
     """FastAPI 0.115+ refuses Pydantic v1 BaseModel anywhere in route
     annotations (param, response_model, return type, responses[*]['model']).

@@ -35,6 +35,10 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 socket2 = { version = "0.5", features = ["all"] }
 matchit = "0.8"
 bytes = "1"
+# M18 R1: GIL-releasing gzip codec (libdeflate bindings). Rust-side dep only —
+# never enters `import lancelot`'s Python runtime (cardinal rule 3 clean).
+# Single-shot gzip_compress + gzip_compress_bound = one pre-sized alloc.
+libdeflater = "1.25"
 dhat = { version = "0.3", optional = true }
 
 # Tier-A.A1/A2: TCP_QUICKACK + TCP_FASTOPEN setsockopt on Linux. socket2

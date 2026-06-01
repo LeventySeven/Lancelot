@@ -142,6 +142,15 @@ pub struct App {
     // Notified on graceful shutdown (SIGTERM) so in-flight R3 stream pumps
     // stop pulling before the event loop closes (audit #2).
     pub shutdown: std::sync::Arc<tokio::sync::Notify>,
+    // M18 Task#7: zero-arg Python callables returning a coroutine that drives
+    // the ASGI lifespan protocol (built in `app.py::_make_lifespan_callbacks`,
+    // reusing the existing `asgi._lifespan` machinery). `on_startup` runs on
+    // the server's OWN loop BEFORE binding (a raise -> refuse to serve);
+    // `on_shutdown` runs AFTER the connection drain, bounded by drain_timeout().
+    // None -> lifespan-less app (zero cost; the hot path is untouched either way
+    // — these are bind-time + drain-time only). NOT touched by `handle()`.
+    pub on_startup: Option<Py<PyAny>>,
+    pub on_shutdown: Option<Py<PyAny>>,
 }
 
 fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
@@ -289,11 +298,46 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| PyOSError::new_err(format!("bad bind addr: {e}")))?;
-    let std_listener =
-        crate::socket::bind_reuseport(addr).map_err(|e| PyOSError::new_err(e.to_string()))?;
-    std_listener.set_nonblocking(true).ok();
     let event_loop = app.locals.event_loop(py);
+
+    // M18 Task#7: drive ASGI lifespan STARTUP on the server's own loop BEFORE
+    // we bind the listener. The startup coroutine runs to completion here —
+    // `@app.on_event`/root `lifespan=`/mounted sub-apps/`@app.lifetime_task`
+    // daemons all init on THIS loop (the loop-identity invariant: a daemon
+    // started via `asyncio.ensure_future` inside startup binds to `event_loop`,
+    // which the accept loop below re-runs, so it lives for the process). If
+    // startup RAISES we REFUSE TO SERVE: close the loop, propagate the PyErr,
+    // and return WITHOUT binding a socket — never accept traffic on a
+    // half-initialized app (uvicorn `startup.failed` parity). This is the SAME
+    // proven `event_loop.run_until_complete(coro)` bridge `graceful_loop_teardown`
+    // uses (no GIL-across-await: run_until_complete drives the loop and returns).
+    if let Some(cb) = app.on_startup.as_ref() {
+        if let Err(e) = run_lifespan_phase(py, &event_loop, cb, None) {
+            graceful_loop_teardown(py, &event_loop);
+            event_loop.call_method0("close").ok();
+            return Err(e);
+        }
+    }
+
+    let std_listener = match crate::socket::bind_reuseport(addr) {
+        Ok(l) => l,
+        Err(e) => {
+            // Bind failed AFTER startup ran — tear startup back down (run
+            // shutdown best-effort) so a port clash doesn't leak resources.
+            if let Some(cb) = app.on_shutdown.as_ref() {
+                let _ = run_lifespan_phase(py, &event_loop, cb, Some(drain_timeout()));
+            }
+            graceful_loop_teardown(py, &event_loop);
+            event_loop.call_method0("close").ok();
+            return Err(PyOSError::new_err(e.to_string()));
+        }
+    };
+    std_listener.set_nonblocking(true).ok();
     let app = Arc::new(app);
+    // Keep an Arc handle for the post-drain lifespan-shutdown call below: the
+    // `server` future moves `app` in (`async move`), so we clone the (cheap,
+    // refcount-bump) Arc here to reach `on_startup`/`on_shutdown` afterward.
+    let app_for_shutdown = app.clone();
 
     // Bounded concurrent connections (domain-web). Acquire a permit BEFORE
     // accepting → backpressure lands in the kernel listen backlog, not in an
@@ -402,7 +446,26 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
     };
 
     // Drives the asyncio loop + tokio hyper server together until SIGTERM.
+    // Returns AFTER the `graceful_break!` connection drain completes (or the
+    // loop errors), so by here in-flight requests have finished.
     let run = pyo3_async_runtimes::tokio::run_until_complete(event_loop.clone(), server);
+    // M18 Task#7: drive ASGI lifespan SHUTDOWN AFTER the connection drain and
+    // BEFORE the generic loop teardown. Bounded by `drain_timeout()` /
+    // LANCELOT_DRAIN_SECS (via `asyncio.wait_for`) so a wedged user shutdown
+    // (e.g. a DB pool-close that hangs) can't block process exit — worse than
+    // the old no-op. This sends `lifespan.shutdown` to the long-lived
+    // `_lifespan` task, which cancels `@app.lifetime_task` daemons (their
+    // `finally` runs), tears down mounted sub-apps (LIFO), then exits the root
+    // `lifespan=` CM — so the `_lifespan` task is DONE before
+    // graceful_loop_teardown runs (no "Task was destroyed but pending"). The
+    // loop is still live here (we haven't closed it), so run_until_complete
+    // works. Best-effort: a shutdown error is logged via the failure message
+    // and swallowed (we're already exiting). Skipped if startup never ran.
+    if app_for_shutdown.on_startup.is_some() {
+        if let Some(cb) = app_for_shutdown.on_shutdown.as_ref() {
+            let _ = run_lifespan_phase(py, &event_loop, cb, Some(drain_timeout()));
+        }
+    }
     // Graceful asyncio teardown before close (audit HIGH-2): cancel lingering
     // tasks — chiefly in-flight stream `_drain` coros, which `into_future`
     // bridging does NOT cancel — and finalize async generators, so user
@@ -411,6 +474,41 @@ pub fn serve(py: Python<'_>, app: App, host: &str, port: u16) -> PyResult<()> {
     graceful_loop_teardown(py, &event_loop);
     event_loop.call_method0("close").ok();
     run
+}
+
+/// M18 Task#7: drive one ASGI lifespan phase (startup or shutdown) on the
+/// server's OWN asyncio loop. `callback` is a zero-arg Python callable that
+/// returns a coroutine (built in `app.py::_make_lifespan_callbacks`). When
+/// `bounded` is `Some(d)` (shutdown), the coroutine is wrapped in
+/// `asyncio.wait_for(coro, d.as_secs_f64())` so a wedged user shutdown can't
+/// block process exit; startup passes `None` (no bound — a hung startup never
+/// becomes ready, the operator's problem to fix, same as uvicorn).
+///
+/// This reuses the proven `event_loop.run_until_complete(coro)` bridge that
+/// `graceful_loop_teardown` already uses: `run_until_complete` is a synchronous
+/// Python call that drives the loop until the coroutine resolves and returns
+/// its result — there is NO Rust `.await` here, so the GIL is never held across
+/// an await (the `await_holding_lock` invariant is trivially satisfied). A
+/// startup failure surfaces as a `PyErr` (the coroutine raises) and is returned
+/// to the caller, which refuses to serve.
+fn run_lifespan_phase(
+    py: Python<'_>,
+    event_loop: &Bound<'_, PyAny>,
+    callback: &Py<PyAny>,
+    bounded: Option<std::time::Duration>,
+) -> PyResult<()> {
+    // Build the coroutine: callback() -> coroutine object.
+    let coro = callback.bind(py).call0()?;
+    let driver = match bounded {
+        Some(d) => {
+            // asyncio.wait_for(coro, timeout) — a coroutine itself.
+            let asyncio = py.import("asyncio")?;
+            asyncio.call_method1("wait_for", (coro, d.as_secs_f64()))?
+        }
+        None => coro,
+    };
+    event_loop.call_method1("run_until_complete", (driver,))?;
+    Ok(())
 }
 
 /// Cancel pending tasks + run their cancellation (and async-gen `aclose`) to

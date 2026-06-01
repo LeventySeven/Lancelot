@@ -51,6 +51,14 @@ class App:
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
+        # Prebaked const-bytes tier (Robyn-style ConstRouter): (method, path,
+        # body, content_type, status). Served straight from Rust with zero
+        # GIL / Request alloc / handler call — the ~183k req/s health-probe /
+        # static path. NATIVE `App.run()` ONLY (it's a Rust `_native.run`
+        # const_routes entry); under uvicorn these are ordinary routes, so
+        # register the equivalent `@app.get` there. Populated by
+        # `app.const_route(...)`; forwarded by `run()`.
+        self._const_routes: list = []
         # M15 T5 (#6-core): app-lifetime supervised daemons. Factories are
         # registered via `app.lifetime_task(coro_fn)`; the lifespan-startup
         # seam starts one task per factory and STRONG-refs it here (so it
@@ -204,12 +212,17 @@ class App:
         LANCELOT_HOST=0.0.0.0 in the container. For the FastAPI-parity path
         (works on every ASGI platform) run `uvicorn yourmod:app` instead.
 
-        LIFECYCLE CAVEAT: the native server runs route handlers and drains
-        in-flight connections on SIGTERM, but does NOT drive the ASGI lifespan
-        protocol. `lifespan=`, `@app.on_event`, `@app.lifetime_task`, and
-        mounted sub-app lifespans run ONLY under an ASGI server (uvicorn /
-        hypercorn). If you need startup/shutdown hooks or supervised daemons,
-        deploy under uvicorn."""
+        LIFECYCLE: the native server DRIVES the ASGI lifespan protocol (M18) —
+        `lifespan=`, `@app.on_event`, `@app.lifetime_task`, and mounted sub-app
+        lifespans all run, on the server's own loop. Startup runs BEFORE the
+        socket binds (a raising startup refuses to serve — the process exits
+        non-zero without binding); shutdown runs AFTER the SIGTERM connection
+        drain, bounded by `LANCELOT_DRAIN_SECS`. Disable with `LANCELOT_LIFESPAN=0`.
+        SCOPE: lifespan ONLY — the native server still does NOT run dependency
+        injection or request-body parsing (handlers receive a raw `Request`).
+        For full FastAPI-style DI/body-parsing, deploy under uvicorn. SIGKILL
+        (not SIGTERM) still skips shutdown, and a free-standing `app.run()` is
+        single-process (scale multiprocess; see docs/deploy.md)."""
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
@@ -611,11 +624,13 @@ class App:
     # const tier ONCE at startup from `app.routes` and owns them for the
     # process lifetime — there is no post-startup FFI handle to mutate that
     # router or the prebaked `service::Prebaked` set, and that server is a
-    # fixed-route multiprocess deploy by design (Batches 2 & 4 confirmed it
-    # doesn't even run lifespan/DI). So a route added/removed AFTER the
-    # native server has started is NOT reflected on it. Mutate the app BEFORE
-    # `run()`, or deploy under uvicorn (`app.asgi()`) where these take effect
-    # immediately. (The Rust `Router::remove` exists + is unit-tested for
+    # fixed-route multiprocess deploy by design. (As of M18 the native server
+    # DOES drive the ASGI lifespan — startup/shutdown/lifetime tasks/mounted
+    # sub-app lifespans — but still NOT DI / body-parsing; route SET is still
+    # fixed at startup.) So a route added/removed AFTER the native server has
+    # started is NOT reflected on it. Mutate the app BEFORE `run()`, or deploy
+    # under uvicorn (`app.asgi()`) where these take effect immediately. (The
+    # Rust `Router::remove` exists + is unit-tested for
     # completeness, but is not wired to a running-server mutation path.)
     def add_route_live(self, path: str, endpoint, *, methods=None, **kwargs):
         """Register a route at runtime (uvicorn/ASGI tier) and invalidate the
@@ -639,6 +654,29 @@ class App:
         if n:
             self._openapi_cache = None  # rebuild on next /openapi.json access
         return n
+
+    def const_route(self, method: str, path: str, body, content_type: str,
+                    status: int = 200) -> None:
+        """Register a PREBAKED const-bytes route for the native `App.run()`
+        server (Robyn-style ConstRouter). The reply is fixed `body` bytes
+        served straight from Rust — ZERO GIL, ZERO Request alloc, ZERO handler
+        call — the ~183k req/s tier that flips tiny one-shot responses
+        (health probes, static/cached JSON) from a loss-vs-uvicorn into a win.
+
+        NATIVE SERVER ONLY: this maps to a `_native.run(const_routes=...)`
+        entry, so it takes effect only under `App.run()`. Under uvicorn the
+        const tier does not exist — register an equivalent `@app.get` for that
+        deploy path. `body` accepts `bytes` or `str` (UTF-8 encoded). Status +
+        content-type are validated in Rust at startup (a bad one fails the
+        process cleanly, no hot-path panic)."""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        elif not isinstance(body, (bytes, bytearray)):
+            raise TypeError(
+                "const_route body must be bytes or str, got "
+                f"{type(body).__name__}")
+        self._const_routes.append(
+            (method.upper(), path, bytes(body), content_type, int(status)))
 
     def get(self, p, **kw): return self._add("GET", p, **kw)
     def post(self, p, **kw): return self._add("POST", p, **kw)
@@ -905,6 +943,112 @@ def _resolve_bind(host, port):
     return host, int(port)
 
 
+def _lifespan_enabled() -> bool:
+    """Default-ON. `LANCELOT_LIFESPAN=0` (the escape hatch) restores the old
+    silent-no-op behavior — a flag, not the default, because just-works is the
+    point (a default-off flag re-creates the footgun this fixes)."""
+    import os
+    return os.environ.get("LANCELOT_LIFESPAN", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _make_lifespan_callbacks(app: "App"):
+    """Build (on_startup, on_shutdown) zero-arg coroutine FACTORIES that drive
+    the EXISTING `lancelot.asgi._lifespan` protocol — we reimplement ZERO
+    lifespan logic. `_lifespan(app, receive, send)` already handles
+    `@app.on_event`, the root `lifespan=` CM, mounted sub-app lifespans (LIFO),
+    `@app.lifetime_task` daemons, partial-startup unwind, and full-traceback
+    failure reporting; we just drive that one coroutine via an in-memory
+    asyncio-queue channel (the proven `_sub_lifespan_cm` shape).
+
+    The native server runs each factory's coroutine on its OWN event loop via
+    `run_until_complete` (see `src/service.rs::serve`), so the single
+    `_lifespan` task — and every `asyncio.ensure_future` daemon it starts at
+    startup — binds to the loop the server pumps for the process lifetime (the
+    loop-identity invariant: a startup-created pool/daemon MUST live on the
+    serving loop, not a throwaway one).
+
+    Returns None when there's nothing to run (no root lifespan, no on_event, no
+    mounts, no lifetime tasks) so the caller can skip the bridge entirely — a
+    truly lifespan-less app pays nothing."""
+    from lancelot.asgi import _lifespan as _asgi_lifespan
+
+    has_work = bool(
+        app._lifespan is not None
+        or app._on_event_handlers.get("startup")
+        or app._on_event_handlers.get("shutdown")
+        or getattr(app, "_mounts", None)
+        or getattr(app, "_lifetime_task_factories", None))
+    if not has_work:
+        return None
+
+    # Shared state lives in this closure: the driver task + the two queues are
+    # created on first startup (on the server's running loop) and reused by
+    # shutdown so the SAME `_lifespan` task — holding the entered root cm,
+    # mount AsyncExitStack, and live daemons — tears them all down.
+    state: dict = {"task": None, "to_app": None, "from_app": None}
+
+    async def _drive(kind: str) -> None:
+        import asyncio as _aio
+
+        if state["task"] is None:
+            # Lazily build the channel + the single long-lived _lifespan task
+            # on the NOW-running server loop (so ensure_future daemons bind
+            # here). `to_app`: events the server sends; `from_app`: acks back.
+            to_app: _aio.Queue = _aio.Queue()
+            from_app: _aio.Queue = _aio.Queue()
+
+            async def _recv():
+                return await to_app.get()
+
+            async def _send(msg):
+                await from_app.put(msg)
+
+            state["to_app"] = to_app
+            state["from_app"] = from_app
+            state["task"] = _aio.ensure_future(
+                _asgi_lifespan(app, _recv, _send))
+
+        task = state["task"]
+        to_app = state["to_app"]
+        from_app = state["from_app"]
+        if task.done():
+            # Already exited (e.g. a prior startup failed + returned). Surface
+            # any stored exception so shutdown is a clean no-op, not a hang.
+            task.result()
+            return
+
+        await to_app.put({"type": f"lifespan.{kind}"})
+        # Await EITHER the matching ack OR the task finishing. `_lifespan`
+        # ALWAYS acks via a `.complete`/`.failed` message (it catches
+        # BaseException and reports per the ASGI spec), so a raw task return
+        # without an ack means the protocol loop exited — re-raise its result.
+        getter = _aio.ensure_future(from_app.get())
+        done, _ = await _aio.wait(
+            {getter, task}, return_when=_aio.FIRST_COMPLETED)
+        if getter in done:
+            ack = getter.result()
+            if ack.get("type") == f"lifespan.{kind}.failed":
+                # Fail-fast: raise so the Rust seam refuses to serve (startup)
+                # or logs the failure (shutdown). The message carries the full
+                # traceback `_lifespan` formatted.
+                raise RuntimeError(
+                    f"lifespan.{kind} failed:\n{ack.get('message', '')}")
+            return
+        # Task finished without acking (shouldn't happen — _lifespan always
+        # acks — but be safe): cancel the pending getter, re-raise the result.
+        getter.cancel()
+        task.result()
+
+    async def _on_startup():
+        await _drive("startup")
+
+    async def _on_shutdown():
+        await _drive("shutdown")
+
+    return _on_startup, _on_shutdown
+
+
 def run(app: "App", host: str | None = None, port: int | None = None):
     """Serve `app` on the native Rust server, binding from env when host/port
     are omitted (`LANCELOT_HOST`, `PORT`/`LANCELOT_PORT`) so it deploys cleanly
@@ -912,5 +1056,32 @@ def run(app: "App", host: str | None = None, port: int | None = None):
     deploy path (works on every ASGI platform) use instead:
         `uvicorn yourmod:app --host 0.0.0.0 --port $PORT --workers N`."""
     host, port = _resolve_bind(host, port)
-    routes = [(r.method, r.path, r.handler) for r in app.routes]
-    _native.run(routes, host, port)
+    # Forward the app's prebaked const-bytes tier (registered via
+    # `app.const_route(...)`) so the ~183k req/s zero-GIL health-probe / static
+    # path is reachable through the public `App.run()` API, not only a direct
+    # `_native.run(const_routes=...)` call. Empty list -> the const tier is a
+    # no-op (all router slots are handler routes), unchanged hot path.
+    const_routes = list(getattr(app, "_const_routes", ()))
+    # A const route OVERRIDES a handler route on the same (method, path): drop
+    # the shadowed handler so the Rust router doesn't see a duplicate insert
+    # (the builtin /livez,/readyz are handler routes — `const_route('GET',
+    # '/livez', ...)` makes the native server serve them prebaked instead). The
+    # const route is the more specific intent for the native deploy; under
+    # uvicorn the handler still serves (const_routes don't exist there).
+    shadowed = {(m, p) for (m, p, *_rest) in const_routes}
+    routes = [(r.method, r.path, r.handler) for r in app.routes
+              if (r.method, r.path) not in shadowed]
+    # Drive the ASGI lifespan protocol on the native server (default-ON; the
+    # `LANCELOT_LIFESPAN=0` escape hatch restores the old no-op). The Rust seam
+    # runs `on_startup`'s coroutine on its own loop BEFORE binding the listener
+    # (a raising startup -> refuse to serve, exit non-zero, never bind a socket
+    # on a half-initialized app) and `on_shutdown`'s AFTER draining in-flight
+    # connections, bounded by LANCELOT_DRAIN_SECS. Lifespan-less apps -> None ->
+    # zero bridge overhead. DI/body-parsing still require uvicorn (lifespan-only).
+    on_startup = on_shutdown = None
+    if _lifespan_enabled():
+        cbs = _make_lifespan_callbacks(app)
+        if cbs is not None:
+            on_startup, on_shutdown = cbs
+    _native.run(routes, host, port, const_routes=const_routes or None,
+                on_startup=on_startup, on_shutdown=on_shutdown)

@@ -1204,6 +1204,31 @@ async def _http_dispatch(app, scope, receive, send):
                         return
 
                 _consume_task = _asyncio.ensure_future(_consume())
+
+                # M18 (Task a): proactively cancel the consume task on CLIENT
+                # DISCONNECT for a PLAIN stream. `_disc_watch` (armed above) sets
+                # `lreq._cancel_event` the moment the client leaves; this ONE-TIME
+                # (per-STREAM, NOT per-chunk) event-driven watcher awaits that
+                # event and cancels the consume task, so the suspended __anext__
+                # raises CancelledError → the user generator's `finally`/`aclose`
+                # runs and we stop pulling chunks nobody is reading. It is the
+                # plain-stream analogue of the relay path's per-chunk
+                # `idle_guarded_chunks` race (lancelot.llm) — but at the TASK
+                # level, so the M6-T1.1 hot path (same-thread async-for, no
+                # per-chunk wait_for) is UNTOUCHED. Crucially it does NOT set
+                # `_silence_hit`, so a disconnect routes to the client-disconnect
+                # arm below (re-raise, NO SSE error frame — the client is gone,
+                # M17 P6), distinct from the watchdog's internal silence-abort.
+                async def _cancel_on_disconnect():
+                    try:
+                        await lreq._cancel_event.wait()
+                    except _asyncio.CancelledError:
+                        return
+                    if not _consume_task.done():
+                        _consume_task.cancel()
+
+                _disc_cancel_task = _asyncio.ensure_future(
+                    _cancel_on_disconnect())
                 _kp_task = (_asyncio.ensure_future(_watchdog_loop())
                             if (_send_lock is not None
                                 or _max_silence is not None) else None)
@@ -1282,6 +1307,12 @@ async def _http_dispatch(app, scope, receive, send):
                         _kp_task.cancel()
                     if not _disc_watch.done():
                         _disc_watch.cancel()
+                    # M18 (Task a): retire the disconnect-cancel watcher. If it
+                    # never fired (clean end / silence-abort) its `wait()` is
+                    # still pending → cancel it so it can't leak or fire late;
+                    # if it DID fire it's already done and this is a no-op.
+                    if not _disc_cancel_task.done():
+                        _disc_cancel_task.cancel()
                     # M16 P2: if the dispatch coroutine itself was cancelled
                     # (graceful drain / outer timeout) while consuming, cancel
                     # the consume task too so its generator's `finally`/`aclose`

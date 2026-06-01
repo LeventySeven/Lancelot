@@ -120,6 +120,63 @@ def lancelot_factory():
     return app.asgi()
 
 
+# ---- M18 R1 compression bench arms -----------------------------------------
+# All three arms share the SAME Starlette base app + routes; they differ ONLY
+# in the compression layer, so the bench isolates the gzip mechanism (held-GIL
+# Starlette zlib vs Lancelot's off-loop GIL-releasing libdeflate). Routes:
+#   GET /big   → the large compressible _PAYLOAD (LC_BENCH_ITEMS≈1000 ≈ 50 KB)
+#   GET /echo  → a tiny fixed body (the co-tenant victim — its p99 under a
+#                concurrent /big flood is the decisive GIL-starvation signal)
+# LC_GZIP_LEVEL (default 9) + LC_GZIP_MIN (default 500) tune both gzip arms.
+_GZIP_LEVEL = int(os.environ.get("LC_GZIP_LEVEL", "9"))
+_GZIP_MIN = int(os.environ.get("LC_GZIP_MIN", "500"))
+_TINY = {"message": "ok", "n": 42}
+
+
+def _compress_base():
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def big(request):
+        return JSONResponse(_PAYLOAD)
+
+    async def echo(request):
+        return JSONResponse(_TINY)
+
+    return Starlette(routes=[Route("/big", big), Route("/echo", echo)])
+
+
+def compress_none_factory():
+    # Arm A — throughput ceiling, no compression.
+    return _compress_base()
+
+
+def compress_starlette_factory():
+    # Arm B — Starlette GZipMiddleware: gzip.GzipFile holds the GIL across the
+    # whole zlib pass on the loop thread.
+    from starlette.middleware.gzip import GZipMiddleware as StarletteGZip
+
+    app = _compress_base()
+    app.add_middleware(StarletteGZip, minimum_size=_GZIP_MIN,
+                       compresslevel=_GZIP_LEVEL)
+    return app
+
+
+def compress_lancelot_factory():
+    # Arm C — lancelot.compress.GZipMiddleware: libdeflate encode off-loop via
+    # run_in_executor (GIL released in Rust). Same Starlette base + routes as
+    # A/B so only the compression layer differs.
+    from lancelot.compress import GZipMiddleware as LancelotGZip
+
+    app = _compress_base()
+    # Starlette's add_middleware(cls, **opts) wraps the app — identical wiring
+    # surface to lancelot.App.add_middleware; the middleware is plain ASGI.
+    app.add_middleware(LancelotGZip, minimum_size=_GZIP_MIN,
+                       compresslevel=_GZIP_LEVEL)
+    return app
+
+
 # ---- single-process entrypoints --------------------------------------------
 def run_rust(port: int) -> None:
     # Lancelot's Rust server (hyper+tokio+pyo3). Worker width comes from
@@ -258,6 +315,10 @@ _VARIANTS = {
     "uvicorn-lancelot": lambda p: _run_uvicorn(lancelot_factory, p),
     "robyn": run_robyn,
     "blazeio": run_blazeio,
+    # M18 R1 compression arms (single-process uvicorn, uvloop+httptools).
+    "compress-none": lambda p: _run_uvicorn(compress_none_factory, p),
+    "compress-starlette": lambda p: _run_uvicorn(compress_starlette_factory, p),
+    "compress-lancelot": lambda p: _run_uvicorn(compress_lancelot_factory, p),
 }
 
 if __name__ == "__main__":

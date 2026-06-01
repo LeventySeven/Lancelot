@@ -13,14 +13,22 @@ Two deployable surfaces:
    serialization** and **streaming** (see `benchmarks/README.md`); for tiny
    one-shot JSON, uvicorn+uvloop is faster. Deploy notes below.
 
-> **Lifecycle hooks run on surface #1 only.** The native server serves route
-> handlers and drains in-flight connections on SIGTERM, but does **not** drive
-> the ASGI lifespan protocol. `lifespan=`, `@app.on_event`,
-> `@app.lifetime_task`, and mounted sub-app lifespans run **only under uvicorn**
-> (surface #1) — under `app.run()` they silently no-op (e.g. an
-> `@app.on_event("startup")` that sets `app.state.client` never fires, so the
-> first request sees an unset attribute). If your app needs startup/shutdown
-> hooks or supervised background daemons, deploy under uvicorn.
+> **Lifecycle hooks run on BOTH surfaces (M18).** The native `app.run()` server
+> now **drives the ASGI lifespan protocol**: `lifespan=`, `@app.on_event`,
+> `@app.lifetime_task`, and mounted sub-app lifespans all run, on the server's
+> own event loop. Startup runs **before the socket binds** — a startup that
+> raises **refuses to serve** (the process exits non-zero without ever binding,
+> matching uvicorn's `startup.failed`). Shutdown runs **after** the SIGTERM
+> connection drain and is bounded by `LANCELOT_DRAIN_SECS` (a hung user shutdown
+> can't wedge process exit). Disable with `LANCELOT_LIFESPAN=0`.
+>
+> **What the native server still does NOT do: dependency injection and
+> request-body parsing.** This is lifespan-only — handlers under `app.run()`
+> receive a raw `lancelot.Request`, not FastAPI-style injected dependencies or a
+> parsed/validated body. For full FastAPI parity (DI + body parsing + validation
+> error responses), deploy under uvicorn (surface #1). Also unavoidable: SIGKILL
+> (not SIGTERM) skips shutdown, and a single `app.run()` is one process (scale
+> multiprocess — see below).
 
 ## Containers & PaaS — bind address ($PORT, 0.0.0.0)
 
@@ -145,17 +153,35 @@ cloud shape). h2/h2c is not served.
 
 ## Compression
 
-Don't reach for a custom encoder. For `lancelot.App` (under uvicorn), add
-Starlette's gzip middleware — identical to FastAPI:
+**If a TLS-terminating proxy/CDN fronts you (nginx `gzip on;`, Cloudflare, an
+ALB), let it compress** — that's the standard cloud shape and the right default;
+don't spend app CPU on what the edge does better. This is also the only option
+for the Rust `_native` server (it has no response-body middleware seam).
+
+**For a single-container PaaS with NO compressing proxy** (the app is the edge),
+Lancelot ships an opt-in gzip middleware (M18):
 
 ```python
-from starlette.middleware.gzip import GZipMiddleware
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+from lancelot.compress import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)  # uvicorn path
 ```
 
-For the Rust `_native` server, let the TLS-terminating proxy in front compress
-(nginx `gzip on;`, Cloudflare, etc.) — that's the standard cloud shape and
-avoids spending app CPU on what the edge does better.
+It compresses one-shot JSON bodies with a Rust `libdeflater` encode run
+**off the event loop** (`run_in_executor`), so the GIL is released while
+compressing — unlike Starlette's `GZipMiddleware`, which runs zlib on the loop
+thread holding the GIL and serializes the worker under load. Measured single
+worker, c=200, level 9, ~45 KB JSON vs Starlette: **~2.2× throughput, ~12×
+better p99, and a co-tenant tiny route ~161× less starved**
+(`benchmarks/results/compress/SUMMARY.md`).
+
+**When NOT to use it (honest envelope):** it adds per-request latency at low
+concurrency (the thread-hop costs more than it saves when there's no GIL
+contention to relieve — it's *slower* than Starlette at c=1), and the win
+shrinks behind multi-worker uvicorn (separate GILs per process) or any
+compressing proxy. So: proxy/CDN if you have one; this middleware for the
+single-worker-no-proxy, concurrency-bound, large-JSON case; Starlette's
+middleware is also still fine for low-concurrency apps. SSE/streaming responses
+pass through uncompressed on all paths.
 
 ## Operator knobs (env)
 
@@ -212,23 +238,25 @@ the two compose (we don't reimplement spans). RED metrics auto-emit when
 ## Health checks
 
 `lancelot.App` auto-registers `/livez` (process alive) and `/readyz` (lifespan
-started + in-flight under threshold) for Kubernetes probes. The "lifespan
-started" gate is meaningful only under uvicorn (surface #1); the native
-`app.run()` server does not run the lifespan, so prebake `/readyz` as a
-const-bytes route there (see below).
+started + in-flight under threshold) for Kubernetes probes. As of M18 the native
+`app.run()` server drives the lifespan, so the "lifespan started" gate is now
+meaningful on BOTH surfaces. For the lowest-overhead probe on the native server
+you can still prebake `/livez`/`/readyz` as const-bytes routes (zero GIL — see
+below); a prebaked route OVERRIDES the auto-registered handler on `app.run()`.
 
 On the Rust `_native` server, serve fixed-response endpoints (health probes,
 static config, cached payloads) via the **const-bytes tier** — prebaked bytes
 returned straight from Rust with zero GIL / Request alloc / handler call
-(~183k req/s per-core vs ~66k for uvicorn+uvloop on the same payload):
+(~183k req/s per-core vs ~66k for uvicorn+uvloop on the same payload). Register
+them on the `App` with `app.const_route(...)` (forwarded by `App.run()`):
 
 ```python
-lancelot._native.run(
-    routes,                       # your handler routes
-    host="127.0.0.1", port=8000,
-    const_routes=[                # (method, path, body, content_type, status)
-        ("GET", "/livez",  b'{"status":"ok"}', "application/json", 200),
-        ("GET", "/readyz", b'{"status":"ok"}', "application/json", 200),
-    ],
-)
+app.const_route("GET", "/livez",  b'{"status":"ok"}', "application/json", 200)
+app.const_route("GET", "/readyz", b'{"status":"ok"}', "application/json", 200)
+app.run(host="0.0.0.0", port=8000)   # const routes ride through to the server
 ```
+
+The low-level form (`lancelot._native.run(routes, host, port, const_routes=...)`,
+where each entry is `(method, path, body, content_type, status)`) is still
+available if you drive the native server directly. A const route OVERRIDES a
+handler route on the same `(method, path)` for the native deploy.

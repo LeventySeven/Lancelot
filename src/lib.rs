@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 // consistent version path without taking a direct pyo3 dependency.
 pub use pyo3;
 
+pub mod compress;
 pub mod cpu;
 pub mod dispatch;
 pub mod ffi;
@@ -44,10 +45,15 @@ fn make_event_loop(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 /// `routes`: list of (method, path, handler). `const_routes` (optional, trailing
 /// keyword for back-compat): list of (method, path, body, content_type, status)
 /// served as prebaked bytes straight from Rust — zero GIL/Request/handler (the
-/// const-bytes tier; ideal for health probes + static responses). Builds the
+/// const-bytes tier; ideal for health probes + static responses). `on_startup` /
+/// `on_shutdown` (optional): zero-arg Python callables returning a coroutine;
+/// the server drives `on_startup`'s coroutine on its own loop BEFORE binding
+/// (a raising startup -> refuse to serve) and `on_shutdown`'s AFTER draining,
+/// so `App.run()` runs the ASGI lifespan protocol (M18 Task#7). Builds the
 /// router + a long-lived asyncio loop/TaskLocals and serves until SIGTERM.
 #[pyfunction]
-#[pyo3(signature = (routes, host="127.0.0.1", port=8000, const_routes=None))]
+#[pyo3(signature = (routes, host="127.0.0.1", port=8000, const_routes=None,
+                    on_startup=None, on_shutdown=None))]
 // The const_routes tuple shape (method, path, body, content_type, status) is a
 // thin FFI DTO from Python — a named struct would just add ceremony at the seam.
 #[allow(clippy::type_complexity)]
@@ -57,6 +63,8 @@ fn run(
     host: &str,
     port: u16,
     const_routes: Option<Vec<(String, String, Vec<u8>, String, u16)>>,
+    on_startup: Option<Py<PyAny>>,
+    on_shutdown: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     let event_loop = make_event_loop(py)?;
     let locals = pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)?;
@@ -108,6 +116,8 @@ fn run(
             const_bodies,
             locals,
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            on_startup,
+            on_shutdown,
         },
         host,
         port,
@@ -134,6 +144,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(crate::serialize::_to_json, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::compress::gzip_encode, m)?)?;
     m.add_function(wrap_pyfunction!(crate::dispatch::_drive, m)?)?;
     m.add_function(wrap_pyfunction!(crate::stream::_drive_stream, m)?)?;
     Ok(())
