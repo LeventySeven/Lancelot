@@ -63,6 +63,13 @@ class Route:
     # change). ASGI-seam (uvicorn) only — symmetric with the upstream
     # idle_guarded_chunks concept.
     max_stream_silence: float | None = None
+    # M19 T1#1: absolute wall-clock lifetime cap (seconds, None=off). Distinct
+    # from max_stream_silence: a stream that keeps TRICKLING data never trips the
+    # idle (silence) watchdog yet pins its bounded mpsc + upstream client +
+    # ContextVars open forever. On breach the seam cancels the generator (its
+    # `finally`/`aclose` runs), emits a terminal `event: reconnect` frame so the
+    # client re-establishes, and closes. ASGI-seam (uvicorn) only.
+    max_stream_lifetime: float | None = None
     # M17 P6: opt-in crash/cancel-aware SSE finalization. When True, the seam
     # (a) routes the mid-stream error frame through a scrubbed RFC-9457
     # ProblemDetail shape instead of the hardcoded {"error":...}; (b) GUARANTEES

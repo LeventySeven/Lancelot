@@ -522,6 +522,55 @@ def _stream_chunk_bytes(ev):
     return (_json.dumps(ev, separators=(",", ":"), default=str) + "\n").encode("utf-8")
 
 
+def _record_ttft_now(scope):
+    """Record time-to-first-framework-byte for a streamed response using the
+    SAME clock + route-template label as the `@app.stream` seam. Fail-safe."""
+    try:
+        _st = scope.get("_lancelot_t0")
+        if _st is None:
+            return
+        import time as _t
+        from lancelot.metrics import record_stream_ttft
+        record_stream_ttft(
+            scope.get("_lancelot_route") or scope.get("path") or "__unmatched__",
+            scope.get("method", "GET"),
+            _t.perf_counter() - _st)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ttft_send_wrapper(send, scope):
+    """T1#3: wrap an ASGI `send` so the FIRST streamed body chunk records TTFT
+    for ANY streaming response that bypasses the `@app.stream` seam — a user
+    `StreamingResponse`, `sse_starlette` `EventSourceResponse`, `FileResponse`,
+    the JSON-lines auto-wrap, etc. "Streaming" = the `http.response.start`
+    content-type is `text/event-stream` OR the first `http.response.body` has
+    `more_body=True` (a unary single-body response never matches, so the metric
+    stays clean). Transparent byte-passthrough — adds no transport behavior.
+
+    HONEST semantics: this measures wall-clock to the first framework byte
+    (including any broker/queue wait), NOT true upstream LLM time-to-first-token
+    (which lives inside the user's generator). It is a complement to, not a
+    replacement for, model-side timing."""
+    state = {"done": False, "sse": False}
+
+    async def _send(msg):
+        _t = msg.get("type")
+        if _t == "http.response.start":
+            for _k, _v in (msg.get("headers") or ()):
+                if _k == b"content-type" and \
+                        b"text/event-stream" in (_v or b"").lower():
+                    state["sse"] = True
+                    break
+        elif _t == "http.response.body" and not state["done"]:
+            if msg.get("body") and (state["sse"] or msg.get("more_body")):
+                state["done"] = True
+                _record_ttft_now(scope)
+        await send(msg)
+
+    return _send
+
+
 async def _watch_disconnect(receive, cancel_event):
     """C2 (validated under load — M4): poll receive() for `http.disconnect`
     and set `cancel_event` the moment the client leaves.
@@ -1041,7 +1090,9 @@ async def _http_dispatch(app, scope, receive, send):
                 _last_data = _now0          # last real-DATA send
                 _last_ping = _now0          # last keepalive-PING send
                 _max_silence = getattr(route, "max_stream_silence", None)
+                _max_lifetime = getattr(route, "max_stream_lifetime", None)
                 _silence_hit = False        # set by the keepalive loop on abort
+                _lifetime_hit = False       # M19: set on absolute-lifetime cap
                 _send_lock = _asyncio.Lock() \
                     if (_ka is not None and _ka > 0) else None
 
@@ -1173,18 +1224,37 @@ async def _http_dispatch(app, scope, receive, send):
                     # is dropped (its gen `finally`/`aclose` runs). Idle is
                     # measured from last-DATA, so a keepalive ping does NOT reset
                     # it (the self-reset fix).
-                    nonlocal _silence_hit
-                    _tick = _ka / 2.0 if (_ka is not None and _ka > 0) else None
-                    if _tick is None and _max_silence is not None:
-                        # No keepalive but a silence cap: poll on a fraction of
-                        # the cap so the abort lands near the deadline.
-                        _tick = max(0.05, _max_silence / 4.0)
-                    if _tick is None:
+                    nonlocal _silence_hit, _lifetime_hit
+                    # Poll on the MIN of every active source's natural tick so a
+                    # ping fires on its window AND each cap lands near its
+                    # deadline. (Pre-M19 this was ka/2, falling back to
+                    # silence/4 only when keepalive was off — min() preserves
+                    # that: ka/2 <= silence/4 in the existing tests, so those are
+                    # unchanged; M19 just adds the lifetime/4 candidate.)
+                    _ticks = []
+                    if _ka is not None and _ka > 0:
+                        _ticks.append(_ka / 2.0)
+                    if _max_silence is not None:
+                        _ticks.append(max(0.05, _max_silence / 4.0))
+                    if _max_lifetime is not None:
+                        _ticks.append(max(0.05, _max_lifetime / 4.0))
+                    if not _ticks:
                         return
+                    _tick = min(_ticks)
                     try:
                         while True:
                             await _asyncio.sleep(_tick)
                             _mono = _time.monotonic()
+                            # M19: absolute wall-clock cap, checked FIRST (it is
+                            # measured from stream start `_now0`, independent of
+                            # data/ping activity, so a steadily-trickling stream
+                            # the silence watchdog can't catch is still bounded).
+                            if _max_lifetime is not None and \
+                                    (_mono - _now0) >= _max_lifetime:
+                                _lifetime_hit = True
+                                if not _consume_task.done():
+                                    _consume_task.cancel()
+                                return
                             if _max_silence is not None and \
                                     (_mono - _last_data) >= _max_silence:
                                 _silence_hit = True
@@ -1231,7 +1301,8 @@ async def _http_dispatch(app, scope, receive, send):
                     _cancel_on_disconnect())
                 _kp_task = (_asyncio.ensure_future(_watchdog_loop())
                             if (_send_lock is not None
-                                or _max_silence is not None) else None)
+                                or _max_silence is not None
+                                or _max_lifetime is not None) else None)
                 try:
                     await _consume_task
                 except _asyncio.CancelledError:
@@ -1267,6 +1338,35 @@ async def _http_dispatch(app, scope, receive, send):
                         _logging_p2.getLogger("lancelot.stream").info(
                             "stream aborted after %ss of data-silence "
                             "(max_stream_silence)", _max_silence)
+                    elif _lifetime_hit:
+                        # M19 T1#1: absolute wall-clock cap reached (client is
+                        # STILL connected). The generator's teardown ran via the
+                        # thrown cancel; belt-and-suspenders aclose() below. Emit
+                        # a terminal `event: reconnect` frame (NOT an error — this
+                        # is a planned recycle, the Polar 10-min pattern) so the
+                        # client re-establishes a fresh stream, then close
+                        # cleanly (the finally sends EOF). Emitted unconditionally
+                        # because the cap is opt-in: you set it precisely to get
+                        # this reconnect signal. Do NOT re-raise.
+                        try:
+                            await _it.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            await _flush_serialized()
+                            await _send_serialized({
+                                "type": "http.response.body",
+                                "body": b'event: reconnect\n'
+                                        b'data: {"reason":"max_stream_lifetime"}'
+                                        b'\n\n',
+                                "more_body": True})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        import logging as _logging_lt
+                        _logging_lt.getLogger("lancelot.stream").info(
+                            "stream closed after %ss wall-clock "
+                            "(max_stream_lifetime); sent reconnect sentinel",
+                            _max_lifetime)
                     else:
                         # A real client disconnect / outer cancellation. NO error
                         # frame / sentinel — the client is gone (M17 P6: the
@@ -1525,7 +1625,10 @@ async def _http_dispatch(app, scope, receive, send):
                 # Some Starlette responses (FileResponse, RedirectResponse)
                 # implement __call__(scope, receive, send); delegate.
                 try:
-                    await result(scope, receive, send)
+                    # T1#3: wrap send so a delegated streaming response
+                    # (sse_starlette EventSourceResponse, etc.) records TTFT.
+                    await result(scope, receive,
+                                 _ttft_send_wrapper(send, scope))
                     sent = True
                     return
                 except TypeError:
@@ -1537,13 +1640,18 @@ async def _http_dispatch(app, scope, receive, send):
                 # transfer). Other Response subclasses: one-shot body.
                 _iterator = getattr(result, "body_iterator", None)
                 if _iterator is not None:
+                    # T1#3: TTFT on the first streamed chunk of a returned
+                    # StreamingResponse (the body_iterator path). A distinct
+                    # local (not rebinding `send`) so the function's error/finally
+                    # paths keep using the raw send.
+                    _ttsend = _ttft_send_wrapper(send, scope)
                     _hdrs = [(str(k).lower().encode(), str(v).encode())
                              for k, v in _user_hdrs.items()]
                     _hdrs.append((b"content-type",
                                   result.media_type.encode()))
-                    await send({"type": "http.response.start",
-                                "status": result.status_code,
-                                "headers": _hdrs})
+                    await _ttsend({"type": "http.response.start",
+                                   "status": result.status_code,
+                                   "headers": _hdrs})
                     # Mark `sent` BEFORE iterating: if the body iterator
                     # raises mid-stream (e.g. ResponseValidationError on
                     # per-item validation), the outer except MUST NOT try
@@ -1558,16 +1666,16 @@ async def _http_dispatch(app, scope, receive, send):
                         async for chunk in _iterator:
                             if isinstance(chunk, str):
                                 chunk = chunk.encode("utf-8")
-                            await send({"type": "http.response.body",
-                                        "body": chunk, "more_body": True})
+                            await _ttsend({"type": "http.response.body",
+                                           "body": chunk, "more_body": True})
                     else:
                         for chunk in _iterator:
                             if isinstance(chunk, str):
                                 chunk = chunk.encode("utf-8")
-                            await send({"type": "http.response.body",
-                                        "body": chunk, "more_body": True})
-                    await send({"type": "http.response.body",
-                                "body": b"", "more_body": False})
+                            await _ttsend({"type": "http.response.body",
+                                           "body": chunk, "more_body": True})
+                    await _ttsend({"type": "http.response.body",
+                                   "body": b"", "more_body": False})
                     if lreq._background._tasks:
                         await lreq._background()
                     # R1: run the response-level background (Starlette parity).
@@ -1986,7 +2094,9 @@ async def _emit_response_object(resp, scope, receive, send, lreq):
     # plain Starlette Response) — body is None / it has __call__.
     _body = getattr(resp, "body", None)
     if _body is None and callable(resp):
-        await resp(scope, receive, send)
+        # T1#3: TTFT for a delegated streaming response (StreamingResponse /
+        # EventSourceResponse) — the send wrapper records first-chunk timing.
+        await resp(scope, receive, _ttft_send_wrapper(send, scope))
         return
     body = _body if isinstance(_body, (bytes, bytearray)) else (
         str(_body).encode() if _body is not None else b"")
