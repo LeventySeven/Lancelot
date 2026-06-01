@@ -51,6 +51,14 @@ class App:
         self._openapi_cache = None
         self._middleware: list = []  # (cls, opts) — pure-ASGI escape hatch (U20)
         self._mounts: list = []  # (prefix, asgi_app) — Starlette-shape Mount
+        # Prebaked const-bytes tier (Robyn-style ConstRouter): (method, path,
+        # body, content_type, status). Served straight from Rust with zero
+        # GIL / Request alloc / handler call — the ~183k req/s health-probe /
+        # static path. NATIVE `App.run()` ONLY (it's a Rust `_native.run`
+        # const_routes entry); under uvicorn these are ordinary routes, so
+        # register the equivalent `@app.get` there. Populated by
+        # `app.const_route(...)`; forwarded by `run()`.
+        self._const_routes: list = []
         # M15 T5 (#6-core): app-lifetime supervised daemons. Factories are
         # registered via `app.lifetime_task(coro_fn)`; the lifespan-startup
         # seam starts one task per factory and STRONG-refs it here (so it
@@ -640,6 +648,29 @@ class App:
             self._openapi_cache = None  # rebuild on next /openapi.json access
         return n
 
+    def const_route(self, method: str, path: str, body, content_type: str,
+                    status: int = 200) -> None:
+        """Register a PREBAKED const-bytes route for the native `App.run()`
+        server (Robyn-style ConstRouter). The reply is fixed `body` bytes
+        served straight from Rust — ZERO GIL, ZERO Request alloc, ZERO handler
+        call — the ~183k req/s tier that flips tiny one-shot responses
+        (health probes, static/cached JSON) from a loss-vs-uvicorn into a win.
+
+        NATIVE SERVER ONLY: this maps to a `_native.run(const_routes=...)`
+        entry, so it takes effect only under `App.run()`. Under uvicorn the
+        const tier does not exist — register an equivalent `@app.get` for that
+        deploy path. `body` accepts `bytes` or `str` (UTF-8 encoded). Status +
+        content-type are validated in Rust at startup (a bad one fails the
+        process cleanly, no hot-path panic)."""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        elif not isinstance(body, (bytes, bytearray)):
+            raise TypeError(
+                "const_route body must be bytes or str, got "
+                f"{type(body).__name__}")
+        self._const_routes.append(
+            (method.upper(), path, bytes(body), content_type, int(status)))
+
     def get(self, p, **kw): return self._add("GET", p, **kw)
     def post(self, p, **kw): return self._add("POST", p, **kw)
     def put(self, p, **kw): return self._add("PUT", p, **kw)
@@ -912,5 +943,19 @@ def run(app: "App", host: str | None = None, port: int | None = None):
     deploy path (works on every ASGI platform) use instead:
         `uvicorn yourmod:app --host 0.0.0.0 --port $PORT --workers N`."""
     host, port = _resolve_bind(host, port)
-    routes = [(r.method, r.path, r.handler) for r in app.routes]
-    _native.run(routes, host, port)
+    # Forward the app's prebaked const-bytes tier (registered via
+    # `app.const_route(...)`) so the ~183k req/s zero-GIL health-probe / static
+    # path is reachable through the public `App.run()` API, not only a direct
+    # `_native.run(const_routes=...)` call. Empty list -> the const tier is a
+    # no-op (all router slots are handler routes), unchanged hot path.
+    const_routes = list(getattr(app, "_const_routes", ()))
+    # A const route OVERRIDES a handler route on the same (method, path): drop
+    # the shadowed handler so the Rust router doesn't see a duplicate insert
+    # (the builtin /livez,/readyz are handler routes — `const_route('GET',
+    # '/livez', ...)` makes the native server serve them prebaked instead). The
+    # const route is the more specific intent for the native deploy; under
+    # uvicorn the handler still serves (const_routes don't exist there).
+    shadowed = {(m, p) for (m, p, *_rest) in const_routes}
+    routes = [(r.method, r.path, r.handler) for r in app.routes
+              if (r.method, r.path) not in shadowed]
+    _native.run(routes, host, port, const_routes=const_routes or None)
