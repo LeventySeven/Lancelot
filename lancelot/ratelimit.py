@@ -204,6 +204,19 @@ class RateLimit:
         backend: a ``TokenBucketBackend`` for a shared/global limit (e.g.
             Redis). Defaults to per-process (see the module docstring caveat).
 
+    Reverse-proxy / load-balancer caveat (companion to the per-process /
+    multiprocess caveat above): with ``key='ip'`` the bucket key is
+    ``scope['client']``, which behind a proxy / LB is the **PROXY's** IP, not
+    the real client's. So every client behind the same proxy shares ONE bucket
+    and is throttled together — a safe **over**-throttle (the limit binds
+    sooner than intended), never a bypass (no client gets MORE than the policy).
+    To limit by the real client IP behind a **TRUSTED** proxy, pass a
+    ``key=callable(scope)->str`` that reads a validated ``X-Forwarded-For`` (or
+    your proxy's equivalent) from ``scope['headers']``. Only trust that header
+    when the proxy is under your control and strips/overwrites any
+    client-supplied value — an attacker can otherwise spoof ``X-Forwarded-For``
+    to dodge or poison the limit.
+
     On shed: emits **429** with ``Retry-After`` (delta-seconds), and the
     ``RateLimit-Limit`` / ``RateLimit-Remaining`` / ``RateLimit-Reset`` headers.
     """
