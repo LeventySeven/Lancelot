@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 // consistent version path without taking a direct pyo3 dependency.
 pub use pyo3;
 
+pub mod compress;
 pub mod cpu;
 pub mod dispatch;
 pub mod ffi;
@@ -143,6 +144,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(crate::serialize::_to_json, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::compress::gzip_encode, m)?)?;
     m.add_function(wrap_pyfunction!(crate::dispatch::_drive, m)?)?;
     m.add_function(wrap_pyfunction!(crate::stream::_drive_stream, m)?)?;
     Ok(())
