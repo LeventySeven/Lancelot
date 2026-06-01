@@ -233,9 +233,22 @@ class App:
         run(self, host, port)
 
     def add_middleware(self, mw_cls, **opts):
-        """U20 escape hatch: an unmodified pure-ASGI middleware wrapping the
-        app callable. NEVER BaseHTTPMiddleware/call_next. Last-added is the
-        outermost wrapper."""
+        """Wrap the app callable with an ASGI middleware: `app = mw_cls(app,
+        **opts)`. Last-added is the outermost wrapper (FastAPI/Starlette order).
+
+        This hosts BOTH a plain pure-ASGI middleware AND a Starlette
+        `BaseHTTPMiddleware` subclass (T2#6a, 2026-06-02): the latter is itself
+        an ASGI app, so it wraps correctly and uses Starlette's own streaming
+        `call_next` implementation. Verified (tests/test_m19_basehttp_middleware):
+        response-header mutation, streaming pass-through, AND `request.state`
+        (→ ASGI `scope['state']`) reaching the Lancelot handler via
+        `request.scope_state` — the per-request-scoping pattern (dishka / tenant
+        / CSRF) that gates real FastAPI migrations.
+
+        Note: `@app.middleware("http")` (Lancelot's own decorator) is the
+        function-shaped equivalent for the common case; use `add_middleware`
+        with a `BaseHTTPMiddleware` subclass when porting an existing one
+        unchanged."""
         self._middleware.append((mw_cls, opts))
         self._asgi = None  # rebuild the wrapped callable
 
