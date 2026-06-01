@@ -153,17 +153,35 @@ cloud shape). h2/h2c is not served.
 
 ## Compression
 
-Don't reach for a custom encoder. For `lancelot.App` (under uvicorn), add
-Starlette's gzip middleware — identical to FastAPI:
+**If a TLS-terminating proxy/CDN fronts you (nginx `gzip on;`, Cloudflare, an
+ALB), let it compress** — that's the standard cloud shape and the right default;
+don't spend app CPU on what the edge does better. This is also the only option
+for the Rust `_native` server (it has no response-body middleware seam).
+
+**For a single-container PaaS with NO compressing proxy** (the app is the edge),
+Lancelot ships an opt-in gzip middleware (M18):
 
 ```python
-from starlette.middleware.gzip import GZipMiddleware
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+from lancelot.compress import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)  # uvicorn path
 ```
 
-For the Rust `_native` server, let the TLS-terminating proxy in front compress
-(nginx `gzip on;`, Cloudflare, etc.) — that's the standard cloud shape and
-avoids spending app CPU on what the edge does better.
+It compresses one-shot JSON bodies with a Rust `libdeflater` encode run
+**off the event loop** (`run_in_executor`), so the GIL is released while
+compressing — unlike Starlette's `GZipMiddleware`, which runs zlib on the loop
+thread holding the GIL and serializes the worker under load. Measured single
+worker, c=200, level 9, ~45 KB JSON vs Starlette: **~2.2× throughput, ~12×
+better p99, and a co-tenant tiny route ~161× less starved**
+(`benchmarks/results/compress/SUMMARY.md`).
+
+**When NOT to use it (honest envelope):** it adds per-request latency at low
+concurrency (the thread-hop costs more than it saves when there's no GIL
+contention to relieve — it's *slower* than Starlette at c=1), and the win
+shrinks behind multi-worker uvicorn (separate GILs per process) or any
+compressing proxy. So: proxy/CDN if you have one; this middleware for the
+single-worker-no-proxy, concurrency-bound, large-JSON case; Starlette's
+middleware is also still fine for low-concurrency apps. SSE/streaming responses
+pass through uncompressed on all paths.
 
 ## Operator knobs (env)
 
