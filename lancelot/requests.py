@@ -60,6 +60,11 @@ class Request:
     def state(self):
         # Honor the incoming scope["state"] (Starlette TestClient / middleware
         # seed it) over app.state — P2-deferred advisory, now implemented.
+        # M19b: wrap the scope dict in State so BOTH request.state.x (FastAPI
+        # attribute idiom) and request.state['x'] (mapping idiom) work; the
+        # wrapper writes through to scope_state. (The raw dict is still on
+        # request.scope_state for code that wants it.)
         if self.scope_state is not None:
-            return self.scope_state
+            from lancelot.app import State
+            return State(self.scope_state)
         return getattr(self.app, "state", None)

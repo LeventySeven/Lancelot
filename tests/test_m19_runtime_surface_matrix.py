@@ -90,14 +90,12 @@ def test_dynamic_create_model_body_validates():
     assert bad.status_code == 422  # dynamic annotation IS validated
 
 
-# 4 — Duplicate same-path/same-method resolution. DOCUMENTED DIVERGENCE:
-# Lancelot resolves a duplicate STATIC path LAST-registered-wins (the const-tier
-# dict overwrites), whereas FastAPI/Starlette is FIRST-registered-wins. (Dynamic
-# /param/ routes DO iterate first-wins.) This test PINS the actual behavior so
-# the divergence is visible and locked, not silently assumed-compatible.
-# Workaround for FastAPI-parity-dependent code (e.g. LangServe): register
-# distinct paths, or rely on parameterized routes (which match first-wins).
-def test_duplicate_static_path_is_last_registered_wins_DIVERGENCE():
+# 4 — Duplicate same-path/same-method resolution. FIXED in M19b: now
+# FIRST-registered-wins (FastAPI/Starlette parity) for STATIC paths too (the
+# const-tier dict was last-wins, which 500'd LangServe's add_routes trick;
+# routing.py now uses setdefault). Dynamic /param/ routes already matched
+# first-wins.
+def test_duplicate_static_path_first_registered_wins():
     app = lancelot.App()
 
     @app.get("/dup")
@@ -110,10 +108,8 @@ def test_duplicate_static_path_is_last_registered_wins_DIVERGENCE():
 
     with TestClient(app) as c:
         body = c.get("/dup").json()
-    # Lancelot: last wins. (FastAPI parity would be {"who": "first"}.)
-    assert body == {"who": "second"}, (
-        "duplicate-static-path resolution changed — update the conformance "
-        "matrix note (Lancelot is last-wins; FastAPI is first-wins)")
+    assert body == {"who": "first"}, (
+        "duplicate-static-path must be first-registered-wins (FastAPI parity)")
 
 
 # 5 — Mounted sub-app lifespan runs startup AND shutdown (M15 fix; Hayhooks

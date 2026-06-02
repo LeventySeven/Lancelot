@@ -186,6 +186,33 @@ def _has_params_or_body(route) -> bool:
     return route.body is not None or _plan_has_field(route.plan)
 
 
+def _collect_security(plan):
+    """M19b: collect (scheme, scopes) requirements TRANSITIVELY through the
+    dependency graph — first-seen order, deduped — mirroring FastAPI's
+    get_flat_dependant security flattening. The bug it fixes: a `Security()`
+    scheme nested inside a `Depends()` compiles into a SubDep whose
+    `plan.security` was never lifted, so a route whose scheme is ONLY ever
+    nested emitted `security: null` AND `components.securitySchemes: null`
+    (the /docs Authorize button vanished; Speakeasy SDK codegen broke).
+    Reading only top-level `plan.security` (the old behavior) missed it."""
+    out, seen = [], set()
+
+    def _walk(p):
+        if p is None:
+            return
+        for item in (p.security or []):
+            scheme, scopes = item
+            key = (scheme.scheme_name, tuple(scopes))
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        for sub in p.dependencies:
+            _walk(sub.plan)
+
+    _walk(plan)
+    return out
+
+
 def responses_for(route) -> dict:
     resp = {"200": {"description": "Successful Response",
                     "content": {"application/json": {"schema": {}}}}}
@@ -298,7 +325,7 @@ def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
         if rb is not None:
             op["requestBody"] = rb
         op["responses"] = responses_for(r)
-        sec = getattr(r.plan, "security", None) or []
+        sec = _collect_security(r.plan)  # M19b: transitive (nested Security too)
         if sec:
             op["security"] = [
                 {scheme.scheme_name: list(scopes)} for scheme, scopes in sec

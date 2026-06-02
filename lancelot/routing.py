@@ -43,6 +43,11 @@ class Route:
     handler: Callable[..., Any]
     name: str = ""
     include_in_schema: bool = True  # FastAPI: doc/openapi routes are False
+    # M19b: framework-provided default route (/livez, /readyz, /openapi.json,
+    # docs, /fleet/status). First-wins dedup keeps an EARLIER user route, but a
+    # user route is allowed to OVERRIDE a builtin (the builtin registers first
+    # in __init__, so without this flag first-wins would pin the builtin).
+    builtin: bool = False
     is_ws: bool = False  # WebSocket route (matched by scope type, not method)
     is_stream: bool = False  # @app.stream: yields lancelot.stream.Event
     stream_interval: int = 1   # Tier-A.A6: batch N events per SSE frame
@@ -739,7 +744,17 @@ class Router:
         # regex (Route.__post_init__ produces a re with named groupindex
         # exactly equal to the {param} count).
         if not route._rx.groupindex:
-            self._const[(route.method, route.path)] = route
+            # M19b: FIRST-registered-wins (FastAPI/Starlette parity) — a
+            # duplicate static (method, path) must NOT overwrite the first
+            # (last-wins 500'd LangServe's add_routes real-handler+docs-stub
+            # trick). EXCEPTION: a user route may override a framework BUILTIN
+            # (/livez, /readyz, ...), which registers first in __init__ — else
+            # first-wins would pin the builtin and break user overrides.
+            # Parameterized routes already iterate first-wins in match();
+            # remove() clears the slot so a genuine remove-then-add re-registers.
+            existing = self._const.get((route.method, route.path))
+            if existing is None or existing.builtin:
+                self._const[(route.method, route.path)] = route
             self._const_paths.add(route.path)
         else:
             self._dyn.append(route)

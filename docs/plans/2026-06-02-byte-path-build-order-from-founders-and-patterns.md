@@ -140,6 +140,44 @@ profile.
 
 ---
 
+## ROUND 2 (2026-06-02, post-M19) — deeper recheck + broader mine
+
+Re-ran both workflows with richer context (M19 state + impl-file pointers), a 14-founder panel (+Dispatch,
+OPAL, BentoML, Full-Stack-Template), a **code-grounded verifier** stage, and 10 mining clusters incl. deep
+second-pass. Scripts: `wf-founder-recheck-v2.mjs`, `wf-pattern-mine-v2.mjs`. Outputs: `tasks/wd78wbkdl.output`,
+`tasks/w1lu0ypr1.output`.
+
+**Founder verdict movement: 0/14** — all still would-not-switch (M19 sound but lands on surfaces incumbents
+can't reach; framework is never their bottleneck). The value is what the code-verifier caught — **3 real
+bugs, all independently reproduced**:
+
+| Bug | Reality | Impact | Fix |
+|---|---|---|---|
+| **OpenAPI nested-Security drop** | a `Security()` nested in a `Depends()` → `op.security=None` AND `securitySchemes=None` (`di.py` collects only direct security; `openapi.py:301` reads top-level only) | `/docs` Authorize button gone; **breaks fastapi-users + Polar Speakeasy SDK** | recurse `sub.plan.security` (template exists at `openapi.py:172-182`) |
+| **Duplicate static path = last-wins** | `routing.py:742` dict overwrite vs FastAPI first-wins; not escaped under uvicorn | **500s LangServe's default `add_routes`**; latent for Prefect | first-wins (insert-if-absent) OR loud startup warning |
+| **`request.state.x` AttributeError** | `request.state` returns a plain dict; `State.__getattr__` is wired only to `app.state` | my M19 "fixed #1 blocker" claim is a **relabel** — only dict-subscript works | return a dict-AND-attribute `State` wrapper |
+
+Plus a doc defect: `lancelot/websockets.py` docstring advertises a Rust `src/ws/mod.rs` that does not exist.
+
+**Audited next-build order (all code-verified, in-mission, Tier-D-safe, toward parity):** (1) OpenAPI security
+flattening; (2) duplicate-static-path first-wins/warning; (3) `request.state` attribute parity.
+
+**New byte-path build candidates from round-2 mining (verified file:lines):**
+- HIGH: inbound **Idempotency-Key replay cache** (only outbound exists today); **outbound gzip on TransportPool
+  request bodies** (only response gzip shipped); **per-request bypass/429-throttle for `LANCELOT_MAX_INFLIGHT_BYTES`**
+  (M19 shipped all-or-nothing shed, no escape hatch).
+- MED: **FD soft-limit raise (`RLIMIT_NOFILE`)** completing the conn-cap story; **`X-Forwarded-Prefix`→root_path**;
+  inbound **transient-exc→503 classifier** (user predicate); **magic-byte MIME sniff** for static; **emit 499**
+  through metrics on a won disconnect race (`metrics.py:149` anticipates it but it's never produced).
+- ADAPT (high leverage, tiny): **honor inbound `x-should-retry`** in the outbound retry classifier (`llm.py:471`);
+  **readiness-callback hook** → `/readyz` 503 (5-project converge); **name the responsible knob** in the 503 shed body.
+
+**Completeness gaps (still un-mined after 2 rounds — next targets):** WebSocket byte-path depth (backpressure,
+ping/pong, close-codes, permessage-deflate), HTTP/2-3 as an evidenced decision, TLS/connection-setup path,
+streaming multipart upload ingest, gRPC/protobuf relay, cookie/CSRF edges, conditional-GET/ETag/304 for dynamic
+responses, TransportPool connection lifecycle, non-Python/Rust corpora (Go/Node/Envoy), the OTel/Prometheus
+export transport.
+
 ## CONFIRMED BULLSHIT / DO-NOT-BUILD (both workflows + Tier-D)
 
 **Non-reasons (don't pitch as switch reasons):** tiny-handler throughput (loses to raw Starlette+uvloop;
