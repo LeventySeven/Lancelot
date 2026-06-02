@@ -7,10 +7,18 @@ class NoMatchFound(Exception):
 
 
 class State:
-    """Mutable attribute bag (FastAPI/Starlette app.state shape)."""
+    """Mutable attribute+item bag (FastAPI/Starlette state shape). When given a
+    backing dict it WRAPS it (writes propagate to that dict — e.g. ASGI
+    scope['state'], so a BaseHTTPMiddleware that set request.state.x is visible
+    to the handler); otherwise it owns a fresh dict (app.state). Supports BOTH
+    attribute access (request.state.x — the FastAPI idiom) AND mapping access
+    (request.state['x'] / .get / 'x' in state — the scope-state dict idiom).
+    M19b: request.state used to return the raw scope dict, so the attribute
+    idiom raised AttributeError; wrapping in State fixes that without breaking
+    the subscript idiom Lancelot-native handlers use."""
 
-    def __init__(self):
-        self.__dict__["_d"] = {}
+    def __init__(self, backing=None):
+        self.__dict__["_d"] = backing if backing is not None else {}
 
     def __getattr__(self, k):
         try:
@@ -20,6 +28,29 @@ class State:
 
     def __setattr__(self, k, v):
         self.__dict__["_d"][k] = v
+
+    def __delattr__(self, k):
+        try:
+            del self.__dict__["_d"][k]
+        except KeyError as e:
+            raise AttributeError(k) from e
+
+    # Mapping idiom — scope['state'] is a dict and Lancelot-native code reads
+    # request.state['x'] / .get('x') / 'x' in request.state.
+    def __getitem__(self, k):
+        return self.__dict__["_d"][k]
+
+    def __setitem__(self, k, v):
+        self.__dict__["_d"][k] = v
+
+    def __contains__(self, k):
+        return k in self.__dict__["_d"]
+
+    def __iter__(self):
+        return iter(self.__dict__["_d"])
+
+    def get(self, k, default=None):
+        return self.__dict__["_d"].get(k, default)
 
 
 class App:
@@ -303,7 +334,8 @@ class App:
                          ("/redoc", _redoc), ("/scalar", _scalar),
                          ("/livez", _livez), ("/readyz", _readyz),
                          ("/fleet/status", _fleet_status)):
-            self.router.add(Route("GET", path, fn, include_in_schema=False))
+            self.router.add(Route("GET", path, fn, include_in_schema=False,
+                                   builtin=True))  # M19b: user routes may override
 
     # --- registration -----------------------------------------------------
     @property

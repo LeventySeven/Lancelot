@@ -1,7 +1,9 @@
 """ASGI WebSocket wrapper — Starlette-shape surface (accept/receive_*/
-send_*/close + WebSocketDisconnect). The Rust tokio-tungstenite path
-(src/ws/mod.rs, WBS U13) is the spec §3-69 unification; this is the
-Python-ASGI-seam realization the conformance/byte oracle exercises."""
+send_*/close + WebSocketDisconnect). WebSockets are served via the
+Python ASGI seam under uvicorn (this module); there is NO native Rust
+WebSocket path today (the M19b round-2 recheck flagged a stale docstring
+that referenced a nonexistent src/ws/mod.rs — a native tokio-tungstenite
+path would be a deliberate future addition, not a shipped feature)."""
 import json
 
 
