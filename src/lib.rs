@@ -82,7 +82,11 @@ fn run(
         router.add(&method, &path, slot).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "route registration failed at {}:{}: {} (method={}, path={})",
-                file!(), line!(), e, method, path
+                file!(),
+                line!(),
+                e,
+                method,
+                path
             ))
         })?;
         handlers.push(h);
@@ -90,18 +94,27 @@ fn run(
         slot += 1;
     }
     for (method, path, body, content_type, status) in const_routes {
-        let pre = crate::service::Prebaked::new(status, &content_type, body)
-            .map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "const-route prebake failed at {}:{}: {} \
+        let pre = crate::service::Prebaked::new(status, &content_type, body).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "const-route prebake failed at {}:{}: {} \
                      (method={}, path={}, content-type={}, status={})",
-                    file!(), line!(), e, method, path, content_type, status
-                ))
-            })?;
+                file!(),
+                line!(),
+                e,
+                method,
+                path,
+                content_type,
+                status
+            ))
+        })?;
         router.add(&method, &path, slot).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "const-route registration failed at {}:{}: {} (method={}, path={})",
-                file!(), line!(), e, method, path
+                file!(),
+                line!(),
+                e,
+                method,
+                path
             ))
         })?;
         handlers.push(py.None()); // placeholder; never called

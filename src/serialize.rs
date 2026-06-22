@@ -70,9 +70,7 @@ pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Bytes
     if let Some(f) = orjson_dumps_fn(py) {
         match f.bind(py).call1((value,)) {
             Ok(out) => {
-                return Ok(Bytes::copy_from_slice(
-                    out.cast::<PyBytes>()?.as_bytes(),
-                ));
+                return Ok(Bytes::copy_from_slice(out.cast::<PyBytes>()?.as_bytes()));
             }
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => {
                 // orjson raised TypeError on a non-serializable input — fall
@@ -102,4 +100,85 @@ pub fn to_json_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Bytes
 pub fn _to_json<'py>(py: Python<'py>, value: Bound<'py, PyAny>) -> PyResult<Py<PyBytes>> {
     let bytes = to_json_bytes(py, &value)?; // Bytes derefs to &[u8] for PyBytes::new
     Ok(PyBytes::new(py, &bytes).unbind())
+}
+
+/// The `lancelot.responses.Response` class, resolved ONCE (same perf/GIL
+/// discipline as `to_json_fn`). Used to cheaply gate the native value path: an
+/// `is_instance` check against this class tells us whether the handler returned
+/// a Response object (carry its status/content-type/headers) vs a plain value
+/// (the hot JSON path). `None` = the class couldn't be imported (should never
+/// happen — lancelot.responses is a sibling module — but fail OPEN to the plain
+/// JSON path rather than 500). MUST use `PyOnceLock`, not `std::sync::OnceLock`:
+/// the init `import`s a Python module which can release the GIL mid-init (see
+/// the `to_json_fn` doc for the deadlock this avoids).
+fn response_cls(py: Python<'_>) -> Option<Py<PyAny>> {
+    static C: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
+    C.get_or_init(py, || {
+        py.import(pyo3::intern!(py, "lancelot.responses"))
+            .and_then(|m| m.getattr(pyo3::intern!(py, "Response")))
+            .map(|c| c.unbind())
+            .ok()
+    })
+    .as_ref()
+    .map(|c| c.clone_ref(py))
+}
+
+/// What the native server emits for a value-returning handler: the body bytes
+/// PLUS the status / content-type / extra headers a returned `Response` carries.
+/// For a plain dict/str/model return it's just `{200, None, [], json_bytes}` —
+/// the existing always-200-application/json contract, unchanged.
+/// The tuple shape `Response._render_native()` returns:
+/// `(status, content_type, headers, body)`. Aliased to keep the `extract()`
+/// call site readable (clippy::type_complexity).
+type RenderTuple = (u16, Option<String>, Vec<(String, String)>, Vec<u8>);
+
+pub struct Rendered {
+    pub status: u16,
+    /// `None` → the server defaults to `application/json` (the plain-value
+    /// contract). `Some(ct)` → a Response's media_type (incl. charset).
+    pub content_type: Option<String>,
+    /// Extra response headers (lowercased keys, one entry per value — set-cookie
+    /// lists already expanded by the Python helper). Empty for plain values.
+    pub headers: Vec<(String, String)>,
+    pub body: Bytes,
+}
+
+/// Render a handler's return value into a `Rendered` (body + status + headers).
+///
+/// Hot path (the common case — dict / str / model): a single cheap
+/// `is_instance` check that says "not a Response", then the EXISTING
+/// orjson/pydantic-core `to_json_bytes` fast path, wrapped as a 200 with no
+/// content-type override and no extra headers. Plain values do NOT touch any
+/// Python helper — byte-identical to the old `to_json_bytes` path.
+///
+/// Response path (probes / docs / openapi / a user `return JSONResponse(...)`):
+/// call the Python `Response._render_native()` helper (keeps Response internals
+/// in Python) and unpack its `(status, content_type, headers, body)` tuple.
+pub fn render_result(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Rendered> {
+    // Cheap gate: is this a lancelot Response? `is_instance` is a C-level
+    // isinstance — fast. If the class import failed (response_cls -> None), fall
+    // through to the plain JSON path (fail-open, never 500 on a probe).
+    if let Some(cls) = response_cls(py) {
+        if value.is_instance(cls.bind(py))? {
+            // Delegate the status/header/body construction to Python (mirrors
+            // the ASGI seam's _emit_response_object so native == ASGI).
+            let rendered = value.call_method0(pyo3::intern!(py, "_render_native"))?;
+            let (status, content_type, headers, body): RenderTuple = rendered.extract()?;
+            return Ok(Rendered {
+                status,
+                content_type,
+                headers,
+                body: Bytes::from(body),
+            });
+        }
+    }
+    // Plain value (hot path): the unchanged JSON fast path, status 200, no
+    // content-type override, no extra headers.
+    let body = to_json_bytes(py, value)?;
+    Ok(Rendered {
+        status: 200,
+        content_type: None,
+        headers: Vec::new(),
+        body,
+    })
 }

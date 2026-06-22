@@ -225,6 +225,12 @@ async def _lifespan(app, receive, send):
                     await send({"type": "lifespan.startup.failed",
                                 "message": traceback.format_exc()})
                     return
+                # T1.2 + T1.8: startup fully succeeded — flip /readyz to ready
+                # and gc.freeze() the startup heap, on the serving loop, BEFORE
+                # we ack complete (so the LB only ever sees ready AFTER it's
+                # true). A raising startup short-circuits above, so we never
+                # mark a half-initialized app ready.
+                app._on_startup_complete()
                 await send({"type": "lifespan.startup.complete"})
             elif msg["type"] == "lifespan.shutdown":
                 try:
@@ -269,6 +275,9 @@ async def _lifespan(app, receive, send):
                 await send({"type": "lifespan.startup.failed",
                             "message": traceback.format_exc()})
                 return
+            # T1.2 + T1.8: see the lifespan-less branch above — flip ready +
+            # freeze the GC heap once the root lifespan + mounts have started.
+            app._on_startup_complete()
             await send({"type": "lifespan.startup.complete"})
         elif msg["type"] == "lifespan.shutdown":
             # NOTE: we do NOT auto-flip `_shutting_down` here. A TestClient
@@ -428,7 +437,16 @@ async def _http(app, scope, receive, send):
             # `__unmatched__` is a belt-and-suspenders default for any exit
             # path that didn't reach the match site (e.g. the draining 503).
             _route_label = scope.get("_lancelot_route") or "__unmatched__"
-            record_request(_route_label, method, _final_status_holder[0],
+            # T1.7: a WON client-disconnect race cancelled the handler before
+            # any status was committed, so `_final_status_holder` is still the
+            # 500 default — but this is a client-closed-request, NOT a server
+            # error. Record 499 (nginx convention) so dashboards don't miscount
+            # client aborts as 5xx. Only override the uncommitted default: if a
+            # real status already went out on the wire, keep it.
+            _status = _final_status_holder[0]
+            if _status == 500 and scope.get("_lancelot_client_disconnected"):
+                _status = 499
+            record_request(_route_label, method, _status,
                            _time.perf_counter() - _t0,
                            tenant=_tenant, cost_usd=_cost,
                            queue_wait_ms=_qw)
@@ -596,7 +614,7 @@ async def _watch_disconnect(receive, cancel_event):
         return
 
 
-async def _race_handler_vs_disconnect(coro, cancel_event):
+async def _race_handler_vs_disconnect(coro, cancel_event, scope=None):
     """Await `coro` (the unary handler call), but if `cancel_event` fires
     first (the client disconnected), CANCEL the handler task and raise
     asyncio.CancelledError — which propagates out of the `async with
@@ -608,6 +626,13 @@ async def _race_handler_vs_disconnect(coro, cancel_event):
     free function HERE so the UNARY hot path never imports `lancelot.llm`
     (which pulls httpx — cardinal rule #3: a non-LLM unary route must not drag
     in the HTTP client just to be cancellable).
+
+    T1.7: when the disconnect WINS, mark `scope["_lancelot_client_disconnected"]`
+    so the `_http` RED-metrics `finally` records status 499 (nginx-convention
+    client-closed-request) instead of the default 500 — a won client-cancel is
+    a terminal client event, not a server error, and dashboards must not
+    miscount it as 5xx (the most important streaming-health signal for an LLM
+    gateway).
     """
     import asyncio as _aio
 
@@ -622,6 +647,8 @@ async def _race_handler_vs_disconnect(coro, cancel_event):
             wait_event.cancel()
             return task.result()
         # Disconnect fired first — cancel the handler and propagate.
+        if scope is not None:
+            scope["_lancelot_client_disconnected"] = True
         task.cancel()
         try:
             await task
@@ -1371,6 +1398,9 @@ async def _http_dispatch(app, scope, receive, send):
                         # A real client disconnect / outer cancellation. NO error
                         # frame / sentinel — the client is gone (M17 P6: the
                         # cancel-arm frame fires ONLY on an internal cancel).
+                        # T1.7: mark the disconnect so the RED-metrics finally
+                        # records 499 (client-closed-request), not 500.
+                        scope["_lancelot_client_disconnected"] = True
                         lreq._cancel_event.set()
                         raise
                 except Exception:  # noqa: BLE001
@@ -1511,7 +1541,7 @@ async def _http_dispatch(app, scope, receive, send):
                     # rollback / file-close STILL runs — B4 preserved, exactly
                     # like the timeout path).
                     result = await _race_handler_vs_disconnect(
-                        _call_handler(), lreq._cancel_event)
+                        _call_handler(), lreq._cancel_event, scope)
                 else:
                     result = await _call_handler()
             except _asyncio_timeout.TimeoutError:
@@ -1880,12 +1910,19 @@ async def _http_dispatch(app, scope, receive, send):
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": pbody})
-    except BatchOverloadError as _bo:  # T9: @app.batch max_keys → sheddable 503
+    except BatchOverloadError as _bo:  # T9/T1.5: @app.batch shed → sheddable 503
         if not sent:
             pbody = b'{"detail":"Service Unavailable"}'
             _ra = str(int(getattr(_bo, "retry_after", 1))).encode("ascii")
+            # T3.4: name WHICH cap fired (`batch-keys` vs `batch-overload`) so
+            # the operator can tell a key-explosion from a compute pile-up
+            # without leaking the internal limit number (info-disclosure).
+            _sr = (str(getattr(_bo, "shed_reason", "batch-overload"))
+                   .replace("\r", "").replace("\n", "")
+                   .encode("ascii", "ignore"))
             await send({"type": "http.response.start", "status": 503,
                         "headers": [(b"retry-after", _ra),
+                                    (b"x-lancelot-shed-reason", _sr),
                                     (b"content-length",
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
@@ -1893,8 +1930,12 @@ async def _http_dispatch(app, scope, receive, send):
     except BatchItemTimeout:  # T1.4: @app.batch item aged out → 504 Gateway Timeout
         if not sent:
             pbody = b'{"detail":"Gateway Timeout"}'
+            # T3.4: name the shed cause on the 504 too (a per-item deadline,
+            # distinct from the 503 compute/key sheds above).
             await send({"type": "http.response.start", "status": 504,
-                        "headers": [(b"content-length",
+                        "headers": [(b"x-lancelot-shed-reason",
+                                     b"batch-timeout"),
+                                    (b"content-length",
                                      str(len(pbody)).encode()),
                                     (b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": pbody})

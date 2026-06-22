@@ -63,6 +63,10 @@ class App:
                  dependencies: list | None = None,
                  json_max_depth: int = 128,
                  cancel_on_disconnect: bool = False,
+                 description: str | None = None,
+                 servers: list | None = None,
+                 openapi_tags: list | None = None,
+                 readyz_check=None,
                  **kwargs):
         """FastAPI-shape constructor: accepts the documented kwargs verbatim.
         Implemented: lifespan, title, version, redirect_slashes. Other
@@ -72,6 +76,11 @@ class App:
         not crash; their behavior is ledgered until needed."""
         self.title = title
         self.version = version
+        # A-T1.2: optional top-level OpenAPI fields (additive; None = omitted
+        # from the spec so existing behaviour is byte-identical when unset).
+        self.description: str | None = description
+        self.servers: list | None = servers
+        self.openapi_tags: list | None = openapi_tags
         self.redirect_slashes = redirect_slashes
         self.router = Router()
         self.state = State()
@@ -135,6 +144,25 @@ class App:
         # sending new traffic; the ASGI seam refuses NEW requests with
         # 503 but lets in-flight ones complete.
         self._shutting_down: bool = False
+        # T1.2 three-state /readyz: False until the ASGI lifespan `startup`
+        # has COMPLETED (set by `_on_startup_complete`, called from the
+        # asgi.py `_lifespan` startup.complete seam AND the native `run()`
+        # path). /readyz returns 503 + Retry-After while False so a LB/k8s
+        # probe does NOT route real traffic to a worker whose DB/LLM client
+        # isn't up yet — the false-ready deploy-and-roll bug. CRITICAL: the
+        # native server drives the lifespan ONLY when there's lifespan work
+        # (LANCELOT_LIFESPAN + `_make_lifespan_callbacks`); a lifespan-less
+        # native deploy would otherwise sit 503 FOREVER, so `run()` flips
+        # this unconditionally. SCOPE: the flag is read only by the Python
+        # ASGI `_readyz` handler; the prebaked const tier bypasses it.
+        self._started: bool = False
+        # T3.6 (additive; default None = today's behavior): an optional
+        # operator-supplied readiness predicate. When set, /readyz is ready
+        # ONLY if startup completed AND `readyz_check()` is truthy (a DB
+        # ping / model-warm probe / feature flag). May be sync OR return an
+        # awaitable. Lancelot owns the startup-gate plumbing; what "ready"
+        # MEANS beyond startup is the user's (positioning lock).
+        self.readyz_check = readyz_check
         # Tier-B.B1 + B4: in-flight request counter + global cap. asyncio
         # is cooperative single-threaded so int += 1 is safe here without
         # a lock. `max_concurrent_requests=None` means unlimited (FastAPI
@@ -202,6 +230,37 @@ class App:
             return
         for fn in self._lifetime_task_factories:
             self._lifetime_tasks.append(asyncio.ensure_future(fn()))
+
+    def _on_startup_complete(self) -> None:
+        """Run AFTER lifespan startup has fully completed — the single hook for
+        the post-startup readiness + GC discipline. Called from the asgi.py
+        `_lifespan` startup.complete seam (both the root-lifespan and the
+        lifespan-less-but-mounted paths) AND from the native `run()` path
+        (unconditionally, because a lifespan-less native deploy never reaches
+        the `_lifespan` seam — without this it would sit /readyz 503 forever).
+        Idempotent.
+
+        - T1.2: flip `_started` so /readyz transitions starting -> ready.
+        - T1.8: `gc.freeze()` ONCE — move all startup allocations (routes,
+          validators, OTel instruments, warmed clients, the import graph) into
+          the permanent generation so they're never re-scanned by a later
+          gen-2 collection. Cuts the GC-pause jitter that shows up as a TTFT
+          hiccup on the latency-sensitive stream path (vLLM
+          `server_utils.py:467` `freeze_gc_heap()` before `yield`).
+          Correctness-neutral (GC still runs; it just skips the frozen gen);
+          opt out with `LANCELOT_NO_GC_FREEZE=1`."""
+        if self._started:
+            return  # idempotent: the flip + gc.freeze() happen exactly once
+        self._started = True
+        import os
+        if os.environ.get("LANCELOT_NO_GC_FREEZE", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            return
+        try:
+            import gc
+            gc.freeze()
+        except Exception:  # noqa: BLE001 — never let GC tuning break startup
+            pass
 
     async def _drain_lifetime_tasks(self, timeout: float | None = None) -> None:
         """Cancel every running lifetime task and await it, bounded by the
@@ -310,14 +369,38 @@ class App:
         def _livez():
             return JSONResponse(b'{"status":"ok"}')
 
-        def _readyz():
-            if self._shutting_down:
+        async def _readyz():
+            # T1.2 three-state readiness:
+            #   draining  -> 503 (graceful shutdown signalled)
+            #   starting  -> 503 (lifespan startup not yet complete)
+            #   ready     -> 200
+            # 503 + Retry-After in both not-ready states tells the LB to
+            # back off (RFC 9110 §15.6.4) instead of routing traffic to a
+            # worker that can't serve it. T3.6: when a `readyz_check`
+            # predicate is configured, it must ALSO be truthy to be ready.
+            def _not_ready(status_word: bytes):
                 from lancelot.responses import Response as _R
 
-                r = _R(b'{"status":"draining"}', status_code=503,
+                r = _R(b'{"status":"' + status_word + b'"}', status_code=503,
                        media_type="application/json")
                 r.headers["retry-after"] = "1"
                 return r
+
+            if self._shutting_down:
+                return _not_ready(b"draining")
+            if not self._started:
+                return _not_ready(b"starting")
+            if self.readyz_check is not None:
+                try:
+                    import inspect as _isp_rc
+
+                    res = self.readyz_check()
+                    if _isp_rc.isawaitable(res):
+                        res = await res
+                    if not res:
+                        return _not_ready(b"not_ready")
+                except Exception:  # noqa: BLE001 — a raising probe = not ready
+                    return _not_ready(b"not_ready")
             return JSONResponse(b'{"status":"ok"}')
 
         # M7 T2.3 (Conductor pattern): /fleet/status surfaces this worker's
@@ -443,6 +526,7 @@ class App:
               max_batch: int = 16, max_keys: int = 1024,
               key=None, size_fn=None, max_size: int = 0,
               request_timeout_ms: int = 0, dedup_key=None,
+              max_concurrent_batches: int = 0,
               **route_kwargs):
         """Tier-C.C5 (marquee): prefix-aware request grouping for AI
         workloads. The HTTP route accepts ONE payload per request; the
@@ -465,6 +549,20 @@ class App:
           - `max_keys` hit (too many distinct key-values) now sheds with
             503 + Retry-After (a transient back-pressure signal the client
             can retry), not a 500.
+
+        T1.3/T1.5 pipeline knobs:
+          - `max_concurrent_batches` (default 0 = UNBOUNDED, today's
+            behavior): cap how many batches may be running their handler
+            (the upstream LLM call) AT ONCE for this route. Set N>=2 to
+            PIPELINE — while batch k is upstream, the next window's batch
+            k+1 accumulates and, on flush, runs concurrently (up to N).
+            This is the throughput win whenever upstream latency > the
+            batch window (Ray Serve `batching.py:439`). When the N slots
+            are full (the pipeline is SATURATED), a NEW arrival sheds with
+            503 + Retry-After + `X-Lancelot-Shed-Reason: batch-overload`
+            (T1.5) — only the new arrival; items already in a pending or
+            in-flight batch keep their slot and complete. Leave 0 to never
+            bound or shed on compute (the default).
 
         Surface:
             @app.batch("/chat", batch_window_ms=50, max_batch=10,
@@ -514,7 +612,9 @@ class App:
                                       max_keys=max_keys, size_fn=size_fn,
                                       max_size=max_size,
                                       request_timeout_s=request_timeout_s,
-                                      dedup_key=dedup_key)
+                                      dedup_key=dedup_key,
+                                      max_concurrent_batches=(
+                                          max_concurrent_batches))
 
             # Synthesize an HTTP-level handler with one-payload signature.
             # The body name `item` becomes the JSON-body field; matches
@@ -865,7 +965,10 @@ class App:
             from lancelot.openapi import build_openapi
 
             self._openapi_cache = build_openapi(
-                self, title=self.title, version=self.version
+                self, title=self.title, version=self.version,
+                description=self.description,
+                servers=self.servers,
+                openapi_tags=self.openapi_tags,
             )
         return self._openapi_cache
 
@@ -1207,5 +1310,23 @@ def run(app: "App", host: str | None = None, port: int | None = None):
         cbs = _make_lifespan_callbacks(app)
         if cbs is not None:
             on_startup, on_shutdown = cbs
+
+    # T1.2 + T1.8: drive the post-startup hook (`_started=True` + gc.freeze)
+    # on the native path too. The native server runs lifespan-less apps with
+    # NO `_lifespan` seam, so a naive `_started` gate would leave /readyz 503
+    # FOREVER under `App.run()`; we therefore ALWAYS pass an `on_startup` that
+    # (a) drives the real lifespan startup if there is one, then (b) flips the
+    # ready flag + freezes the GC heap. It runs on the server's own loop,
+    # AFTER any lifespan startup succeeded and BEFORE the socket binds — the
+    # exact "engine warmed, now accept traffic" point. (A raising lifespan
+    # startup re-raises out of `_lifespan_startup` before we get here, so we
+    # never mark a half-initialized app ready.)
+    _user_on_startup = on_startup
+
+    async def _native_on_startup():
+        if _user_on_startup is not None:
+            await _user_on_startup()
+        app._on_startup_complete()
+
     _native.run(routes, host, port, const_routes=const_routes or None,
-                on_startup=on_startup, on_shutdown=on_shutdown)
+                on_startup=_native_on_startup, on_shutdown=on_shutdown)

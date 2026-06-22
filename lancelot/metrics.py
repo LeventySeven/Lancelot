@@ -95,6 +95,34 @@ def _maybe_bind():
     return _state
 
 
+_excluded_methods_cached: frozenset | None = None
+
+
+def _excluded_methods() -> frozenset:
+    """T2.7 (R2R "log only the methods that matter" instinct): HTTP methods
+    excluded from the request COUNTER + DURATION histogram. CORS preflight
+    `OPTIONS` and `HEAD` probes otherwise double the request rate and pollute
+    the latency histogram with sub-millisecond no-ops, skewing P99 on a
+    CORS-heavy AI frontend. Default `OPTIONS,HEAD`; set
+    `LANCELOT_METRICS_EXCLUDE_METHODS=""` (empty) to count every method, or to
+    a custom comma-separated list. Case-insensitive; whitespace-tolerant.
+
+    SCOPE (deliberate): this gates ONLY the counter + duration (+ the cost /
+    queue-wait histograms that ride the same `record_request` call). The
+    in-flight gauge (`in_flight_delta`, a SEPARATE call from the ASGI seam)
+    keeps counting EVERY method so concurrency/saturation stays accurate.
+    Per-process state, parsed once + memoized."""
+    global _excluded_methods_cached
+    if _excluded_methods_cached is None:
+        import os
+        raw = os.environ.get("LANCELOT_METRICS_EXCLUDE_METHODS")
+        if raw is None:
+            raw = "OPTIONS,HEAD"
+        _excluded_methods_cached = frozenset(
+            m.strip().upper() for m in raw.split(",") if m.strip())
+    return _excluded_methods_cached
+
+
 _tenant_label_max_cached: int | None = None
 
 
@@ -144,6 +172,12 @@ def record_request(route_path: str, method: str, status: int,
     # the Python ASGI seam; the Rust `_native` server emits no metrics.
     inst = _maybe_bind()
     if inst is None:
+        return
+    # T2.7: skip the counter + duration (+ cost/queue-wait) for method-gated
+    # verbs (default OPTIONS/HEAD) so CORS preflights + HEAD probes don't
+    # inflate the rate panel or skew the latency histogram. The in-flight
+    # gauge is recorded separately (in_flight_delta) and still sees them.
+    if method and method.upper() in _excluded_methods():
         return
     # M7 T2.5: include status (not just status_class) on metric attrs so
     # adverse-path filtering (e.g. status=499 for client-disconnect; 504
@@ -208,8 +242,9 @@ def in_flight_delta(delta: int) -> None:
 
 def reset_for_tests() -> None:
     """Force-re-bind on next call. Tests only — exposes nothing to users."""
-    global _state, _tenant_label_max_cached
+    global _state, _tenant_label_max_cached, _excluded_methods_cached
     _state = _NOT_INITIALIZED
     # M7 T2.4: also clear the tenant-label set so each test starts fresh.
     _tenant_label_set.clear()
     _tenant_label_max_cached = None  # re-read the env cap on next call
+    _excluded_methods_cached = None  # T2.7: re-read the method-gate env

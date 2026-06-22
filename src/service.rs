@@ -14,6 +14,7 @@
 //! map to 500 (no `.expect`/panic across the FFI seam).
 use crate::dispatch::{await_and_serialize, build_result, Dispatched, ReqParts};
 use crate::router::Router;
+use crate::serialize::Rendered;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
@@ -132,6 +133,34 @@ fn header_timeout_ms() -> u64 {
     })
 }
 
+/// T2.1 (byte-path mine FINDINGS): TOTAL body-read deadline, in milliseconds.
+/// The slow-loris guard above (`header_timeout_ms`) bounds only how long a
+/// client may take to send the request HEAD — once the headers are complete a
+/// client can dribble (or simply stall) the BODY forever, holding a connection
+/// slot indefinitely and bypassing the header guard entirely (Modal's
+/// `FIRST_MESSAGE_TIMEOUT_SECONDS` closes exactly this axis → synth 408). This
+/// is a TOTAL deadline on the whole `Limited::collect()` of the body, NOT a
+/// per-chunk idle gap: from the moment we start reading the body to the moment
+/// it is fully buffered. On expiry the request gets 408 and the connection slot
+/// is released (the `tokio::time::timeout` future drops the body stream, which
+/// closes the connection → the per-connection permit drops → the slot frees).
+///
+/// Default 0 = OFF so a legitimate slow-but-progressing upload over a thin link
+/// is NEVER killed (the byte-identical hot path: when off we don't even
+/// construct the timeout future). An operator with a known small-body API opts
+/// in. Clamped [0, 600_000] (10 min ceiling). Read once via OnceLock — zero
+/// per-request cost beyond a relaxed atomic load.
+fn body_timeout_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("LANCELOT_BODY_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|n| n.min(600_000))
+            .unwrap_or(0)
+    })
+}
+
 /// A prebaked response (Robyn-style ConstRouter / const-bytes tier): a route
 /// whose reply is FIXED bytes, served straight from Rust with ZERO GIL, ZERO
 /// `Request` allocation, ZERO handler call. The status + content-type are
@@ -199,6 +228,22 @@ fn plain(status: StatusCode, body: &'static [u8]) -> HResp<RespBody> {
         .unwrap()
 }
 
+/// T2.1: 408 Request Timeout when the body-read deadline
+/// (`LANCELOT_BODY_TIMEOUT_MS`) elapses before the body is fully buffered. The
+/// connection is not reused — returning here drops the (timed-out) body stream,
+/// closing the connection and releasing its `max_connections` permit.
+fn request_timeout_408() -> HResp<RespBody> {
+    HResp::builder()
+        .status(StatusCode::REQUEST_TIMEOUT)
+        .header("content-type", "text/plain")
+        .body(
+            Full::new(Bytes::from_static(b"request body read timed out"))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 /// T1#4: 503 load-shed response when the in-flight-bytes budget is exceeded.
 /// Carries `Retry-After: 1` so a well-behaved client/proxy backs off (mirrors
 /// the Python seam's retryable-status discipline).
@@ -208,9 +253,11 @@ fn overloaded_503() -> HResp<RespBody> {
         .header("retry-after", "1")
         .header("content-type", "text/plain")
         .body(
-            Full::new(Bytes::from_static(b"server overloaded (in-flight byte budget)"))
-                .map_err(|e| match e {})
-                .boxed(),
+            Full::new(Bytes::from_static(
+                b"server overloaded (in-flight byte budget)",
+            ))
+            .map_err(|e| match e {})
+            .boxed(),
         )
         .unwrap()
 }
@@ -225,13 +272,41 @@ fn plain_owned(status: StatusCode, body: Vec<u8>) -> HResp<RespBody> {
         .unwrap()
 }
 
-fn json_ok(body: Bytes) -> HResp<RespBody> {
-    HResp::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        // `body` is already `Bytes` (pydantic-core output copied once in
-        // serialize.rs) — no second Vec→Bytes alloc here.
-        .body(Full::new(body).map_err(|e| match e {}).boxed())
+/// Build the value-handler response from a `Rendered` (M20). For a plain
+/// dict/str/model return (`content_type: None`, `headers: []`, `status: 200`)
+/// this is byte-identical to the old `json_ok`: 200, `content-type:
+/// application/json`, the pydantic-core body (content-length added by hyper's
+/// `Full`). For a returned `Response`/`JSONResponse`/`HTMLResponse` it carries
+/// the Response's status, its media_type as content-type, and its extra headers
+/// (set-cookie list already expanded by `Response._render_native`) — mirroring
+/// the ASGI seam so native and ASGI deploys match. The old path 500'd on ANY
+/// Response return because it fed the object straight to `to_json_bytes`.
+fn rendered_response(r: Rendered) -> HResp<RespBody> {
+    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK);
+    let mut builder = HResp::builder().status(status);
+    // Extra user headers FIRST (ASGI wire order: user headers, then
+    // content-type). Keys/values are already CR/LF-sanitized in Python; if a
+    // value still can't become a HeaderValue (shouldn't happen), skip it rather
+    // than panic on the hot path.
+    for (k, v) in &r.headers {
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) {
+            builder = builder.header(name, val);
+        }
+    }
+    // Content-type: the Response's media_type, or application/json for plain
+    // values (the unchanged default). `from_str` is infallible for our values
+    // (sanitized); fall back to application/json if somehow invalid.
+    let ct = r.content_type.as_deref().unwrap_or("application/json");
+    let ct_val = hyper::header::HeaderValue::from_str(ct)
+        .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("application/json"));
+    builder = builder.header(hyper::header::CONTENT_TYPE, ct_val);
+    // `body` is already `Bytes` (pydantic-core output / Response body copied
+    // once) — no second Vec→Bytes alloc here. hyper's `Full` sets content-length.
+    builder
+        .body(Full::new(r.body).map_err(|e| match e {}).boxed())
         .unwrap()
 }
 
@@ -253,9 +328,7 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
         None => {
             let path = req.uri().path();
             let body = match app.router.closest_path(path) {
-                Some(suggestion) => {
-                    format!("not found. did you mean '{suggestion}'?").into_bytes()
-                }
+                Some(suggestion) => format!("not found. did you mean '{suggestion}'?").into_bytes(),
                 None => b"not found".to_vec(),
             };
             return plain_owned(StatusCode::NOT_FOUND, body);
@@ -327,7 +400,23 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     // CRITICAL #1: cap the body (16 MiB) → 413, instead of an unbounded
     // allocation per connection (remote memory-DoS). A truncated/aborted
     // body is a 400, NOT a silent empty-body 200.
-    let body = match Limited::new(req.into_body(), max_body()).collect().await {
+    //
+    // T2.1: wrap the collect in a TOTAL body-read deadline → 408 on a
+    // post-header body stall (the slow-loris axis `header_read_timeout` can't
+    // see). `body_timeout_ms() == 0` (default) keeps the byte-identical hot
+    // path — no timeout future is constructed, just the bare collect. When set,
+    // expiry returns 408 and drops the body stream, which closes the connection
+    // and releases its slot. The collect itself still yields a `Limited` 413 on
+    // an oversized body (the deadline and the size cap are orthogonal guards).
+    let collect = Limited::new(req.into_body(), max_body()).collect();
+    let collected = match body_timeout_ms() {
+        0 => collect.await,
+        ms => match tokio::time::timeout(std::time::Duration::from_millis(ms), collect).await {
+            Ok(c) => c,
+            Err(_) => return request_timeout_408(),
+        },
+    };
+    let body = match collected {
         Ok(c) => c.to_bytes(),
         Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, b"request entity too large"),
     };
@@ -350,9 +439,10 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
     };
     match dispatched {
         // SYNC handler: its body already ran inside `build_result` (GIL scope)
-        // and its result is already serialized — no await, just emit the bytes.
-        // Mirrors the `Dispatched::Value` success branch (`json_ok(json)`).
-        Dispatched::Ready(json) => json_ok(json),
+        // and its result is already rendered — no await, just emit it (status +
+        // content-type + headers + body). Mirrors the `Dispatched::Value`
+        // success branch (`rendered_response`).
+        Dispatched::Ready(rendered) => rendered_response(rendered),
         // R3: async-gen → chunked streaming body (no per-chunk thread/GIL).
         Dispatched::Stream(gen, content_type) => {
             let body = crate::stream::stream_body(app.locals.clone(), gen, app.shutdown.clone());
@@ -370,7 +460,7 @@ async fn handle(app: Arc<App>, req: HReq<Incoming>) -> HResp<RespBody> {
                 .catch_unwind()
                 .await;
             match done {
-                Ok(Ok(json)) => json_ok(json),
+                Ok(Ok(rendered)) => rendered_response(rendered),
                 _ => plain(StatusCode::INTERNAL_SERVER_ERROR, b"internal error"),
             }
         }
