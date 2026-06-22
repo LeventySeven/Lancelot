@@ -26,6 +26,7 @@ Error semantics: if the user handler raises, every waiter in that batch
 sees the same exception (no half-success). If the handler returns the
 wrong-length list, every waiter sees `RuntimeError` (contract failure)."""
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -41,6 +42,16 @@ class BatchOverloadError(Exception):
     def __init__(self, message: str, *, retry_after: int = 1):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class BatchItemTimeout(Exception):
+    """Raised to a SINGLE waiter whose item aged past `request_timeout_ms`
+    before its batch ran (T1.4). The ASGI seam maps it to 504 Gateway
+    Timeout — a per-request deadline, not whole-server backpressure (that's
+    BatchOverloadError -> 503). We set the waiter's future to THIS exception
+    rather than silently dropping the item: a dropped-but-never-resolved
+    future hangs the client forever — the exact M4 failure class this whole
+    completion bundle is tested against (the awaiting handler path)."""
 
 
 @dataclass
@@ -66,7 +77,9 @@ class _BatchGroup:
     max_batch: int
     size_fn: Callable[[list], int] | None = None
     max_size: int = 0
-    pending: list = field(default_factory=list)  # list[(payload, Future)]
+    request_timeout_s: float = 0.0  # T1.4: per-item queue-age deadline (0=off)
+    dedup_key: Callable[..., Any] | None = None  # T1.1: identical-key collapse (off)
+    pending: list = field(default_factory=list)  # (payload, [Future,...], enq_monotonic)
     timer_task: asyncio.Task | None = None
     lock: asyncio.Lock | None = None
 
@@ -83,17 +96,18 @@ class _BatchGroup:
         item must still be processed.)"""
         if self.size_fn is None or not self.pending:
             return False
-        prospective = [p for p, _ in self.pending] + [payload]
+        prospective = [e[0] for e in self.pending] + [payload]
         return self.size_fn(prospective) > self.max_size
 
     def _budget_full(self) -> bool:
         """Has the current pending REACHED the byte budget (flush trigger)?"""
         if self.size_fn is None or not self.pending:
             return False
-        return self.size_fn([p for p, _ in self.pending]) >= self.max_size
+        return self.size_fn([e[0] for e in self.pending]) >= self.max_size
 
     async def submit(self, payload):
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        enq = time.monotonic()  # T1.4: queue-age clock for request_timeout
         # `deferred_batch` is a snapshot of a pending list that this submit
         # decided to flush BEFORE appending its own item (the defer-to-tail
         # path). It's run OUTSIDE the lock, exactly once — the swapped-out
@@ -101,19 +115,31 @@ class _BatchGroup:
         deferred_batch = None
         flush_now = False
         async with self.lock:
-            # Defer-to-tail: if this item would blow the budget for the
-            # current (non-empty) pending, flush what's already there first,
-            # then this item starts a fresh batch. Atomic list-swap under the
-            # lock guarantees the deferred items are owned by exactly one
-            # flush (this one) — exactly-once fanout.
-            if self._over_budget_with(payload):
-                deferred_batch = self.pending
-                self.pending = []
-                # The timer (if any) was armed for the now-deferred batch;
-                # leave it — it'll fire on the fresh pending or find it
-                # flushed-empty (→ early return). We re-arm below for the
-                # new item if needed.
-            self.pending.append((payload, fut))
+            # T1.1 dedup (opt-in): if an identical key is already pending in
+            # THIS window, attach this waiter to that entry so ONE upstream
+            # call serves every identical request (retry storms / identical
+            # polls / repeated-prompt RAG). dedup_key=None → every item is its
+            # own entry (today's behavior). Linear scan; pending ≤ max_batch.
+            matched = False
+            if self.dedup_key is not None and self.pending:
+                dk = self.dedup_key(payload)
+                for entry in self.pending:
+                    if self.dedup_key(entry[0]) == dk:
+                        entry[1].append(fut)
+                        matched = True
+                        break
+            if not matched:
+                # Defer-to-tail: if this NEW payload would blow the budget for
+                # the current (non-empty) pending, flush what's already there
+                # first, then this item starts a fresh batch. Atomic list-swap
+                # under the lock = exactly-once fanout of the deferred items.
+                if self._over_budget_with(payload):
+                    deferred_batch = self.pending
+                    self.pending = []
+                    # The timer (if any) was armed for the now-deferred batch;
+                    # leave it — it'll fire on the fresh pending or find it
+                    # flushed-empty (→ early return). Re-armed below if needed.
+                self.pending.append((payload, [fut], enq))
             if len(self.pending) >= self.max_batch or self._budget_full():
                 flush_now = True
             elif self.timer_task is None or self.timer_task.done():
@@ -157,7 +183,31 @@ class _BatchGroup:
         await self._run_batch(batch)
 
     async def _run_batch(self, batch):
-        payloads = [p for p, _ in batch]
+        # T1.4: drop waiters whose item aged past request_timeout_s BEFORE
+        # the handler runs — fan a BatchItemTimeout (504) to each, never a
+        # silent skip (an unresolved future hangs the client: the M4 bug).
+        # Disabled when request_timeout_s == 0 (the default — no behavior
+        # change). Saves the upstream call from carrying dead items, and
+        # the slot is freed for live traffic.
+        if self.request_timeout_s > 0.0 and batch:
+            now = time.monotonic()
+            fresh = []
+            for entry in batch:
+                if now - entry[2] > self.request_timeout_s:
+                    for f in entry[1]:
+                        if not f.done():
+                            f.set_exception(BatchItemTimeout(
+                                f"@app.batch item exceeded request_timeout_ms "
+                                f"({int(self.request_timeout_s * 1000)}ms) "
+                                f"waiting for a batch slot"))
+                else:
+                    fresh.append(entry)
+            batch = fresh
+            if not batch:
+                return
+        # Each entry is (payload, [waiter_future, ...], enq): ONE upstream call
+        # per UNIQUE payload (T1.1 dedup), result fanned to all its waiters.
+        payloads = [e[0] for e in batch]
         try:
             results = await self.handler(payloads)
         except BaseException as exc:  # noqa: BLE001 — fanout, see below
@@ -165,9 +215,10 @@ class _BatchGroup:
             # We deliberately catch BaseException too: CancelledError
             # propagating to a SINGLE waiter would leave the rest
             # hanging forever, which is the real data-integrity bug.
-            for _, f in batch:
-                if not f.done():
-                    f.set_exception(exc)
+            for entry in batch:
+                for f in entry[1]:
+                    if not f.done():
+                        f.set_exception(exc)
             return
         if not isinstance(results, list) or len(results) != len(batch):
             err = RuntimeError(
@@ -176,13 +227,15 @@ class _BatchGroup:
                 f"{len(results) if hasattr(results, '__len__') else '?'}; "
                 f"expected list of len {len(batch)}"
             )
-            for _, f in batch:
-                if not f.done():
-                    f.set_exception(err)
+            for entry in batch:
+                for f in entry[1]:
+                    if not f.done():
+                        f.set_exception(err)
             return
-        for i, (_, f) in enumerate(batch):
-            if not f.done():
-                f.set_result(results[i])
+        for i, entry in enumerate(batch):
+            for f in entry[1]:
+                if not f.done():
+                    f.set_result(results[i])
 
 
 class _BatchRegistry:
@@ -203,7 +256,8 @@ class _BatchRegistry:
     def __init__(self, handler, window_s: float, max_batch: int,
                  key_fn: Callable | None, max_keys: int = 1024,
                  size_fn: Callable[[list], int] | None = None,
-                 max_size: int = 0):
+                 max_size: int = 0, request_timeout_s: float = 0.0,
+                 dedup_key: Callable | None = None):
         self.handler = handler
         self.window_s = window_s
         self.max_batch = max_batch
@@ -211,6 +265,8 @@ class _BatchRegistry:
         self.max_keys = max_keys
         self.size_fn = size_fn
         self.max_size = max_size
+        self.request_timeout_s = request_timeout_s
+        self.dedup_key = dedup_key
         self._groups: dict = {}
         # Eager construction (see _BatchGroup.__post_init__ rationale).
         self._mu: asyncio.Lock = asyncio.Lock()
@@ -231,6 +287,8 @@ class _BatchRegistry:
                 # at construction — a later live retune of THIS registry
                 # can't retroactively change a group's trigger (T9).
                 grp = _BatchGroup(self.handler, self.window_s, self.max_batch,
-                                  size_fn=self.size_fn, max_size=self.max_size)
+                                  size_fn=self.size_fn, max_size=self.max_size,
+                                  request_timeout_s=self.request_timeout_s,
+                                  dedup_key=self.dedup_key)
                 self._groups[k] = grp
         return await grp.submit(payload)

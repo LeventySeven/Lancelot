@@ -252,7 +252,13 @@ def _json_default(obj):
     if isinstance(obj, _enum.Enum):
         return obj.value
     if isinstance(obj, _dcm.Decimal):
-        return float(obj)
+        # FastAPI encoders.py:84 parity: a Decimal with no fractional part
+        # (exponent >= 0) encodes as int, else float — prevents silent
+        # Decimal("2") -> 2.0 corruption for money / Numeric(_, 0) APIs.
+        # Special values (NaN/Inf) have a str exponent; guard so we never
+        # raise here (allow_nan=False rejects them upstream anyway).
+        exp = obj.as_tuple().exponent
+        return int(obj) if isinstance(exp, int) and exp >= 0 else float(obj)
     if isinstance(obj, _pl.PurePath):
         return str(obj)
     if isinstance(obj, (set, frozenset)):
