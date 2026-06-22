@@ -574,6 +574,43 @@ def _is_gen_dep(call):
 
 
 @contextlib.asynccontextmanager
+async def _sync_cm_in_threadpool(cm):
+    """A-T2.1: wrap a sync contextmanager so its __exit__ runs off the event
+    loop on the default executor (unbounded, stdlib asyncio — no new runtime
+    dep). This prevents the classic deadlock where 40+ concurrent requests
+    each hold a DB connection / lock inside a sync yield-dep and their
+    __exit__ teardowns all queue on the default anyio thread pool (cap 40),
+    stalling the reactor.
+
+    FastAPI concurrency.py:17-41 solves this identically with
+    anyio.to_thread.run_sync(..., limiter=CapacityLimiter(math.inf)).
+    We use asyncio.get_running_loop().run_in_executor(None, ...) which is
+    semantically equivalent — the default executor is also uncapped (Python
+    ThreadPoolExecutor default max_workers=min(32, os.cpu_count()+4) per
+    PEP 3155, but critically it never REFUSES to accept work the way the
+    anyio 40-slot limiter does — it queues indefinitely like math.inf).
+    __enter__ is safe to run synchronously on the loop (same as before);
+    only __exit__ moves off-loop to avoid blocking during cleanup."""
+    import asyncio as _asyncio
+
+    loop = _asyncio.get_running_loop()
+    try:
+        val = cm.__enter__()
+        yield val
+    except BaseException as exc:
+        # Error path: run __exit__ with exc_info off-loop too.
+        _tp = type(exc)
+        _tb = exc.__traceback__
+        suppressed = await loop.run_in_executor(
+            None, lambda: cm.__exit__(_tp, exc, _tb))
+        if not suppressed:
+            raise
+    else:
+        # Clean path: run __exit__(None, None, None) off the event loop.
+        await loop.run_in_executor(None, lambda: cm.__exit__(None, None, None))
+
+
+@contextlib.asynccontextmanager
 async def solve_async(plan: Plan, request, _cache=None, _stack=None,
                       _func_stack=None, _parent_scopes=()):
     """Like solve(), but `yield`-dependencies are entered as (async) context
@@ -693,10 +730,16 @@ async def solve_async(plan: Plan, request, _cache=None, _stack=None,
                         contextlib.asynccontextmanager(target)(**sr.kwargs)
                     )
                 elif inspect.isgeneratorfunction(_probe):
-                    # stdlib @contextmanager.__exit__ does gen.throw(exc) on
-                    # error → the dep's `except:`/`finally:` rollback runs (B4).
-                    val = _target_stack.enter_context(
-                        contextlib.contextmanager(target)(**sr.kwargs)
+                    # A-T2.1: run __exit__ off the event loop via
+                    # _sync_cm_in_threadpool so 40+ concurrent sync yield-deps
+                    # can't queue behind each other and stall the reactor
+                    # (FastAPI concurrency.py:17-41 pattern; we use stdlib
+                    # asyncio run_in_executor instead of anyio CapacityLimiter
+                    # to stay pydantic-only at runtime). __enter__ is safe
+                    # on the loop (same as before); only __exit__ moves off.
+                    val = await _target_stack.enter_async_context(
+                        _sync_cm_in_threadpool(
+                            contextlib.contextmanager(target)(**sr.kwargs))
                     )
                 elif inspect.iscoroutinefunction(_probe):
                     val = await target(**sr.kwargs)

@@ -83,6 +83,48 @@ class Response:
         clean = str(key).replace("\r", "").replace("\n", "")
         self.headers["x-session-affinity"] = clean
 
+    def _render_native(self):
+        """Render this Response into the tuple the NATIVE Rust server emits:
+        ``(status_code:int, content_type:str|None, headers:list[(str,str)],
+        body:bytes)``.
+
+        This keeps all Response internals (status / media_type / headers dict /
+        set-cookie list expansion) on the PYTHON side — the Rust value path
+        (`serialize::render_result`) calls this only when the handler returned a
+        `Response`, then carries the tuple back out to hyper. The header
+        construction MIRRORS the ASGI seam's `_emit_response_object`
+        (asgi.py: media_type→content-type, list values one-per-header, str
+        coercion) so native and ASGI deploys are byte-identical.
+
+        Header values are already CR/LF-sanitized at construction time
+        (`_strip_ctl` on cookies, the media_type strip) so no extra sanitation
+        is needed here — same guarantee the ASGI seam relies on. Rust adds
+        content-length (it knows the final body length); we do NOT add it here
+        (the body may still be empty for a 204/304 — the server decides)."""
+        # M1: StreamingResponse keeps its content in `body_iterator` (self.body
+        # is always b""); the native value path can't drive an iterator, so fail
+        # LOUDLY (→ 500 + logged) rather than silently emit an empty 200. Use
+        # @app.stream (async-gen) for streaming on the native server.
+        if hasattr(self, "body_iterator"):
+            raise TypeError(
+                "StreamingResponse cannot be returned to the native server "
+                "(app.run()); use @app.stream for streaming, or run under "
+                "uvicorn (ASGI).")
+        body = self.body if isinstance(self.body, (bytes, bytearray)) else (
+            str(self.body).encode() if self.body is not None else b"")
+        status = self.status_code or 200
+        content_type = self.media_type or "application/json"
+        out_headers: list = []
+        user_hdrs = self.headers or {}
+        for k, v in user_hdrs.items():
+            kk = str(k).lower()
+            if isinstance(v, list):
+                for vv in v:
+                    out_headers.append((kk, str(vv)))
+            else:
+                out_headers.append((kk, str(v)))
+        return (int(status), content_type, out_headers, bytes(body))
+
     def set_retry_hint(self, should_retry: bool) -> None:
         """M7 T4.9 (Turbopuffer pattern): tell the client whether THIS
         specific response is retry-safe. Server-controlled retry overrides

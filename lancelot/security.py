@@ -213,3 +213,104 @@ class OAuth2PasswordRequestForm:
         self.scopes = scope.split()
         self.client_id = client_id
         self.client_secret = client_secret
+
+
+class OAuth2PasswordRequestFormStrict(OAuth2PasswordRequestForm):
+    """A-T1.3 / A-T3.3: variant of OAuth2PasswordRequestForm that requires
+    grant_type to equal "password" (strict OAuth2 spec). Apps that import
+    this from FastAPI are byte-import-compatible via `from lancelot.security
+    import OAuth2PasswordRequestFormStrict`."""
+
+    def __init__(self, *, grant_type: str = "password", username="",
+                 password="", scope="", client_id=None, client_secret=None):
+        if grant_type != "password":
+            from lancelot.exceptions import HTTPException
+
+            raise HTTPException(
+                status_code=422,
+                detail=[{"msg": "grant_type must be 'password'",
+                          "type": "value_error", "loc": ["body", "grant_type"]}],
+            )
+        super().__init__(grant_type=grant_type, username=username,
+                         password=password, scope=scope,
+                         client_id=client_id, client_secret=client_secret)
+
+
+class OAuth2AuthorizationCodeBearer(OAuth2):
+    """A-T1.3: Authorization Code flow — the standard for Auth0, Okta,
+    Cognito, and every OIDC provider. Extracts the Bearer token from the
+    Authorization header and registers the correct OpenAPI
+    oauth2 / authorizationCode security scheme.
+
+    Mirrors FastAPI `security/oauth2.py:547–650` exactly:
+    - `authorizationUrl` and `tokenUrl` are required.
+    - `scopes` is an optional dict (scope → description).
+    - `refreshUrl` is optional.
+    - `auto_error=True` (default) → 401 when no valid Bearer token.
+    - `auto_error=False` → returns None on missing credential.
+    """
+
+    def __init__(self, authorizationUrl: str, tokenUrl: str, *,
+                 refreshUrl: str | None = None,
+                 scopes: dict | None = None,
+                 scheme_name: str | None = None,
+                 description: str | None = None,
+                 auto_error: bool = True):
+        flow: dict = {
+            "authorizationUrl": authorizationUrl,
+            "tokenUrl": tokenUrl,
+            "scopes": scopes or {},
+        }
+        if refreshUrl is not None:
+            flow["refreshUrl"] = refreshUrl
+        super().__init__(flows={"authorizationCode": flow},
+                         scheme_name=scheme_name or self.__class__.__name__,
+                         description=description,
+                         auto_error=auto_error)
+
+    async def __call__(self, request):
+        """Extract Bearer token; 401 (or None) on missing/non-Bearer auth."""
+        auth = _auth_header(request)
+        scheme, param = _scheme_param(auth)
+        if not auth or scheme.lower() != "bearer":
+            if self.auto_error:
+                raise self._401()
+            return None
+        return param  # token string only
+
+
+class OpenIdConnect(SecurityBase):
+    """A-T1.3 / A-T3.2: OpenID Connect discovery-URL stub. Registers the
+    correct OpenAPI `openIdConnect` security scheme so the generated spec
+    points clients at the OIDC discovery document.
+
+    No token validation is done here — validation is user-side (the
+    positioning lock: Lancelot owns the byte path, not the auth logic).
+    Mirrors FastAPI `security/open_id_connect_url.py`.
+    """
+
+    def __init__(self, *, openIdConnectUrl: str,
+                 scheme_name: str | None = None,
+                 description: str | None = None,
+                 auto_error: bool = True):
+        self.auto_error = auto_error
+        self.scheme_name = scheme_name or self.__class__.__name__
+        m: dict = {"type": "openIdConnect",
+                   "openIdConnectUrl": openIdConnectUrl}
+        if description is not None:
+            m["description"] = description
+        self.model = m
+
+    def _401(self):
+        return HTTPException(401, "Not authenticated",
+                             {"WWW-Authenticate": "Bearer"})
+
+    async def __call__(self, request):
+        """Extract the raw Authorization header value; 401 (or None) when
+        absent — consistent with the other OAuth2 / Bearer schemes."""
+        auth = _auth_header(request)
+        if not auth:
+            if self.auto_error:
+                raise self._401()
+            return None
+        return auth  # raw Authorization header (scheme + credential)

@@ -214,8 +214,15 @@ def _collect_security(plan):
 
 
 def responses_for(route) -> dict:
-    resp = {"200": {"description": "Successful Response",
-                    "content": {"application/json": {"schema": {}}}}}
+    # A-T1.1: @app.stream routes serve text/event-stream, not application/json.
+    # SDK codegen (Speakeasy, openapi-typescript, Stainless) would otherwise
+    # generate a broken one-shot JSON client for a streaming endpoint.
+    if getattr(route, "is_stream", False):
+        resp = {"200": {"description": "Successful Response",
+                        "content": {"text/event-stream": {"schema": {"type": "string"}}}}}
+    else:
+        resp = {"200": {"description": "Successful Response",
+                        "content": {"application/json": {"schema": {}}}}}
     if _has_params_or_body(route):  # MUST-20/36
         resp["422"] = {"description": "Validation Error",
                        "content": {"application/json": {"schema": {
@@ -311,7 +318,8 @@ def _resolve_operation_id(app, r) -> str:
     return operation_id(r)
 
 
-def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
+def build_openapi(app, title="Lancelot", version="0.1.0",  # noqa: PLR0912
+                  description=None, servers=None, openapi_tags=None) -> dict:
     paths: dict = {}
     sec_schemes: dict = {}  # route-iteration order, NOT sorted (deep/03 §3.1.8)
     for r in app.routes:
@@ -339,11 +347,23 @@ def build_openapi(app, title="Lancelot", version="0.1.0") -> dict:
         if extra:
             op.update(extra)
         paths.setdefault(r.path, {})[r.method.lower()] = op
+    # A-T1.2: build the info dict; add description only when set so the key
+    # is absent (not null) when unset — byte-compatible with the existing spec.
+    _info: dict = {"title": title, "version": version}
+    if description:
+        _info["description"] = description
     doc = {  # MUST-28: wire key order = pydantic OpenAPI model field order
         "openapi": "3.1.0",
-        "info": {"title": title, "version": version},
+        "info": _info,
         "paths": paths,
     }
+    # A-T1.2: servers list (e.g. base URL for SDK codegen). Omit when unset.
+    if servers:
+        doc["servers"] = servers
+    # A-T1.2: tags (operation grouping in Swagger UI + readme pages). Omit
+    # when unset so existing specs remain byte-identical.
+    if openapi_tags:
+        doc["tags"] = openapi_tags
     schemas = components_schemas(app)
     components = {}
     if schemas:

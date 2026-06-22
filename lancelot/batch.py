@@ -32,16 +32,26 @@ from typing import Any, Callable
 
 
 class BatchOverloadError(Exception):
-    """Raised when the batch registry's `max_keys` cap is hit. The ASGI
-    seam maps this to a sheddable 503 + Retry-After (a load signal the
-    client can back off on) rather than a 500 — a full registry is
-    transient back-pressure, not a server bug.
+    """Raised when a batch registry sheds a NEW arrival. Two distinct
+    saturations both map here (the ASGI seam → a sheddable 503 +
+    Retry-After, a load signal the client backs off on, not a 500 — both
+    are transient back-pressure, not a server bug):
 
-    `retry_after` is the integer seconds for the Retry-After header."""
+      - the `max_keys` cap (too many distinct key-values) — `shed_reason`
+        `"batch-keys"`;
+      - the `max_concurrent_batches` compute cap is saturated (T1.5) —
+        `shed_reason` `"batch-overload"`.
 
-    def __init__(self, message: str, *, retry_after: int = 1):
+    `retry_after` is the integer seconds for the Retry-After header.
+    `shed_reason` (T3.4) names WHICH cap fired so the operator can tell a
+    key-explosion from a compute pile-up at the `X-Lancelot-Shed-Reason`
+    seam — without leaking the internal limit number (info-disclosure)."""
+
+    def __init__(self, message: str, *, retry_after: int = 1,
+                 shed_reason: str = "batch-overload"):
         super().__init__(message)
         self.retry_after = retry_after
+        self.shed_reason = shed_reason
 
 
 class BatchItemTimeout(Exception):
@@ -79,6 +89,13 @@ class _BatchGroup:
     max_size: int = 0
     request_timeout_s: float = 0.0  # T1.4: per-item queue-age deadline (0=off)
     dedup_key: Callable[..., Any] | None = None  # T1.1: identical-key collapse (off)
+    # T1.3: shared-across-the-registry pipeline limiter. `sema` bounds the
+    # number of handler awaits that may run AT ONCE (None = unbounded =
+    # today's behavior); `inflight` is the registry's running-batch counter
+    # (a 1-element list so every group of one registry mutates the SAME int —
+    # read by the T1.5 submit-time shed). Both default to "off".
+    sema: "asyncio.Semaphore | None" = None
+    inflight: list | None = None  # [int]; shared registry counter
     pending: list = field(default_factory=list)  # (payload, [Future,...], enq_monotonic)
     timer_task: asyncio.Task | None = None
     lock: asyncio.Lock | None = None
@@ -208,8 +225,37 @@ class _BatchGroup:
         # Each entry is (payload, [waiter_future, ...], enq): ONE upstream call
         # per UNIQUE payload (T1.1 dedup), result fanned to all its waiters.
         payloads = [e[0] for e in batch]
+        # T1.3 pipeline gate: count this batch as in-flight the moment it
+        # commits to running (BEFORE the semaphore await, so a batch BLOCKED
+        # waiting for a slot still registers — the T1.5 submit-time shed reads
+        # this counter and must see queued-but-not-yet-running batches too).
+        # `inflight`/`sema` are None on the default unbounded path → ZERO extra
+        # work (no counter math, no acquire), byte-identical to before T1.3.
+        # The `finally` ALWAYS decrements so a frozen counter can't wedge the
+        # pipeline closed (the M4 hangs-forever class, applied to the slot).
+        if self.inflight is not None:
+            self.inflight[0] += 1
         try:
-            results = await self.handler(payloads)
+            await self._call_and_fanout(batch, payloads)
+        finally:
+            if self.inflight is not None:
+                self.inflight[0] -= 1
+
+    async def _call_and_fanout(self, batch, payloads):
+        """Run the handler ONCE for `batch` (under the T1.3 semaphore when
+        set) and fan its result/exception to every waiter. Split out of
+        `_run_batch` so the in-flight accounting wraps it in a single
+        `try/finally` regardless of which fanout branch returns."""
+        try:
+            if self.sema is not None:
+                # Hold the slot ACROSS the handler await so window k+1 fills
+                # while batch k is upstream (Ray Serve batching.py:439). The
+                # M4 lesson lives here: a bug holding this across the await
+                # deadlocks/poisons waiters → the awaiting-handler load test.
+                async with self.sema:
+                    results = await self.handler(payloads)
+            else:
+                results = await self.handler(payloads)
         except BaseException as exc:  # noqa: BLE001 — fanout, see below
             # Whole-batch failure → every waiter sees the same exception.
             # We deliberately catch BaseException too: CancelledError
@@ -257,7 +303,8 @@ class _BatchRegistry:
                  key_fn: Callable | None, max_keys: int = 1024,
                  size_fn: Callable[[list], int] | None = None,
                  max_size: int = 0, request_timeout_s: float = 0.0,
-                 dedup_key: Callable | None = None):
+                 dedup_key: Callable | None = None,
+                 max_concurrent_batches: int = 0):
         self.handler = handler
         self.window_s = window_s
         self.max_batch = max_batch
@@ -267,6 +314,22 @@ class _BatchRegistry:
         self.max_size = max_size
         self.request_timeout_s = request_timeout_s
         self.dedup_key = dedup_key
+        # T1.3/T1.5: pipeline concurrency cap, SHARED across every group of
+        # this registry. 0 (or negative) → UNBOUNDED = today's behavior: no
+        # semaphore, no in-flight counter, no compute shed (sema/inflight stay
+        # None and the hot path is byte-identical to pre-T1.3).
+        self.max_concurrent_batches = (
+            max_concurrent_batches if max_concurrent_batches and
+            max_concurrent_batches > 0 else 0)
+        if self.max_concurrent_batches:
+            # asyncio.Semaphore/Lock construct without a running loop on 3.10+
+            # (same rationale as _BatchGroup.__post_init__ eager lock).
+            self._sema: asyncio.Semaphore | None = asyncio.Semaphore(
+                self.max_concurrent_batches)
+            self._inflight: list | None = [0]  # registry-wide running-batch count
+        else:
+            self._sema = None
+            self._inflight = None
         self._groups: dict = {}
         # Eager construction (see _BatchGroup.__post_init__ rationale).
         self._mu: asyncio.Lock = asyncio.Lock()
@@ -274,6 +337,24 @@ class _BatchRegistry:
     async def submit(self, payload):
         k = self.key_fn(payload) if self.key_fn else "_default_"
         async with self._mu:
+            # T1.5 compute-overload shed: when a concurrency cap is set AND
+            # every slot is taken (N batches already running-or-queued upstream),
+            # shed THIS NEW arrival with a sheddable 503 (BatchOverloadError →
+            # Retry-After + X-Lancelot-Shed-Reason). We shed the new arrival ONLY
+            # — items already attached to a pending/in-flight batch are never
+            # touched (they keep their slot and complete). Checked under `_mu`
+            # against the registry-wide counter, so the read is race-free vs the
+            # group flushes that increment it. Default (cap=0) → never sheds.
+            if self.max_concurrent_batches and \
+                    self._inflight[0] >= self.max_concurrent_batches:
+                raise BatchOverloadError(
+                    f"@app.batch pipeline saturated "
+                    f"({self.max_concurrent_batches} concurrent batches "
+                    "in flight); retry shortly or raise "
+                    "max_concurrent_batches.",
+                    retry_after=1,
+                    shed_reason="batch-overload",
+                )
             grp = self._groups.get(k)
             if grp is None:
                 if len(self._groups) >= self.max_keys:
@@ -282,13 +363,17 @@ class _BatchRegistry:
                         f"({self.max_keys} distinct keys); "
                         "increase max_keys or coarsen the key function.",
                         retry_after=1,
+                        shed_reason="batch-keys",
                     )
                 # SNAPSHOT window_s / max_batch / size budget into the group
                 # at construction — a later live retune of THIS registry
-                # can't retroactively change a group's trigger (T9).
+                # can't retroactively change a group's trigger (T9). The
+                # pipeline semaphore + in-flight counter are SHARED (not
+                # snapshotted) so the cap is registry-wide across all keys.
                 grp = _BatchGroup(self.handler, self.window_s, self.max_batch,
                                   size_fn=self.size_fn, max_size=self.max_size,
                                   request_timeout_s=self.request_timeout_s,
-                                  dedup_key=self.dedup_key)
+                                  dedup_key=self.dedup_key,
+                                  sema=self._sema, inflight=self._inflight)
                 self._groups[k] = grp
         return await grp.submit(payload)

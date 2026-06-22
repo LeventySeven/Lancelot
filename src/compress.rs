@@ -40,6 +40,7 @@ pub fn gzip_encode(py: Python<'_>, data: &[u8], level: u8) -> PyResult<Py<PyByte
             out
         })
     });
-    let out = compressed.map_err(|e| PyValueError::new_err(format!("gzip compress failed: {e:?}")))?;
+    let out =
+        compressed.map_err(|e| PyValueError::new_err(format!("gzip compress failed: {e:?}")))?;
     Ok(PyBytes::new(py, &out).unbind())
 }
