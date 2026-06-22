@@ -387,7 +387,34 @@ class TransportPool:
                 return float(h["retry-after-ms"]) / 1000.0
             except ValueError:
                 return None
+        # T3.3: Azure OpenAI (a top-3 backend) sends its own header; without
+        # this it silently fell back to exponential backoff and over-waited.
+        if "x-ms-retry-after-ms" in h:
+            try:
+                return float(h["x-ms-retry-after-ms"]) / 1000.0
+            except ValueError:
+                return None
         return None
+
+    @staticmethod
+    def _is_retryable(resp) -> bool:
+        """T3.5: honor the provider's `x-should-retry` hint (Anthropic/OpenAI
+        send it to override the status heuristic) — `false` means do NOT retry a
+        429/5xx, `true` means retry an otherwise-final status. Absent = the
+        default status-based decision, so behavior is unchanged with no header."""
+        hint = resp.headers.get("x-should-retry")
+        if hint is not None:
+            return hint.strip().lower() == "true"
+        return resp.status_code in (429, 500, 502, 503, 504)
+
+    def _backoff_wait(self, attempt: int) -> float:
+        """T1.9: equal-jitter backoff. The old `base*2**n + base*rand` term was
+        dominated by the exponential floor, so a @app.batch fanout of N retriers
+        re-fired near-lockstep at a rate-limited LLM (a thundering herd). Spread
+        them uniformly across [cap/2, cap] instead — decorrelated, with a floor,
+        capped at backoff_max."""
+        cap = min(self.backoff_max, self.backoff_base * (2 ** attempt))
+        return cap / 2.0 + random.uniform(0.0, cap / 2.0)
 
     @staticmethod
     def _maybe_emit_cost(resp) -> None:
@@ -467,8 +494,8 @@ class TransportPool:
             if not idempotent:
                 self._maybe_emit_cost(resp)
                 return resp
-            # Idempotent verbs retry on 5xx + 429 only.
-            if resp.status_code not in (429, 500, 502, 503, 504):
+            # Idempotent verbs retry on 5xx + 429 (or per x-should-retry — T3.5).
+            if not self._is_retryable(resp):
                 self._maybe_emit_cost(resp)
                 return resp
             if attempt >= self.max_retries:
@@ -476,9 +503,7 @@ class TransportPool:
                 return resp
             wait = self._retry_after_seconds(resp)
             if wait is None:
-                wait = min(self.backoff_max,
-                           self.backoff_base * (2 ** attempt)
-                           + random.random() * self.backoff_base)
+                wait = self._backoff_wait(attempt)  # T1.9 equal-jitter
             # T1: bail if this sleep would push the total retry wall-clock past
             # the budget — return the last response instead of holding the call
             # open (e.g. a 30s Retry-After under a 1s budget never sleeps).
