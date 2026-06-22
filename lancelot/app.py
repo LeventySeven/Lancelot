@@ -442,6 +442,7 @@ class App:
     def batch(self, path: str, *, batch_window_ms: int = 50,
               max_batch: int = 16, max_keys: int = 1024,
               key=None, size_fn=None, max_size: int = 0,
+              request_timeout_ms: int = 0,
               **route_kwargs):
         """Tier-C.C5 (marquee): prefix-aware request grouping for AI
         workloads. The HTTP route accepts ONE payload per request; the
@@ -482,6 +483,10 @@ class App:
         from lancelot.batch import _BatchRegistry
 
         window_s = batch_window_ms / 1000.0
+        # T1.4: per-item queue-age deadline (0 = off, the default). An item
+        # waiting longer than this for a batch slot is dropped with a 504
+        # instead of being served stale or stuck — overload protection.
+        request_timeout_s = request_timeout_ms / 1000.0
 
         def deco(fn):
             # The user handler is `(items: list[T]) -> list[U]`. The HTTP
@@ -507,7 +512,8 @@ class App:
 
             registry = _BatchRegistry(fn, window_s, max_batch, key,
                                       max_keys=max_keys, size_fn=size_fn,
-                                      max_size=max_size)
+                                      max_size=max_size,
+                                      request_timeout_s=request_timeout_s)
 
             # Synthesize an HTTP-level handler with one-payload signature.
             # The body name `item` becomes the JSON-body field; matches

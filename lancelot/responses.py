@@ -162,3 +162,26 @@ class ORJSONResponse(JSONResponse):
 
 class UJSONResponse(JSONResponse):
     media_type = "application/json"
+
+
+# FastAPI-compat lazy re-exports. `FileResponse` / `RedirectResponse` are
+# Starlette ASGI-callable responses Lancelot already delegates to (M2 push2);
+# re-export them here so `from lancelot.responses import FileResponse` works
+# for drop-in FastAPI migration WITHOUT making `import lancelot` pull
+# starlette (pydantic-only runtime, cardinal rule 3 — kept lazy per PEP 562).
+_STARLETTE_RESPONSES = {"FileResponse", "RedirectResponse"}
+
+
+def __getattr__(name):
+    if name in _STARLETTE_RESPONSES:
+        try:
+            import starlette.responses as _sr
+        except ImportError as e:  # pragma: no cover - depends on optional dep
+            raise AttributeError(
+                f"lancelot.responses.{name} delegates to Starlette, which "
+                f"isn't installed ({e}). Install starlette (a FastAPI-compat "
+                f"optional dependency) to import it."
+            ) from e
+        return getattr(_sr, name)
+    raise AttributeError(
+        f"module 'lancelot.responses' has no attribute {name!r}")
